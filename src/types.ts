@@ -369,6 +369,8 @@ export interface OverlayConfig {
 	capability: string;
 	/** Full content of the base agent definition file (Layer 1: role-specific HOW). */
 	baseDefinition: string;
+	/** Rendered profile content from canopy (Layer 2: deployment-specific WHAT KIND). Inserted between base definition and assignment. */
+	profileContent?: string;
 	/** Pre-fetched mulch expertise output to embed directly in the overlay. */
 	mulchExpertise?: string;
 	/** When true, lead agents should skip Phase 1 (scout) and go straight to Phase 2 (build). */
