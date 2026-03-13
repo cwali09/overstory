@@ -1,0 +1,124 @@
+graph TB
+    subgraph CLI["CLI Entry Point (src/index.ts)"]
+        CMD["Commander.js Program<br/>ov &lt;command&gt; [args...]"]
+    end
+
+    subgraph Commands["Commands (src/commands/)"]
+        direction LR
+        INIT["init"] --> SLING["sling"]
+        SLING --> STOP["stop"]
+        COORD["coordinator"] --> MAIL_CMD["mail"]
+        MAIL_CMD --> NUDGE["nudge"]
+        MERGE_CMD["merge"] --> STATUS["status"]
+        STATUS --> DASHBOARD["dashboard"]
+        INSPECT["inspect"] --> TRACE["trace"]
+        DOCTOR["doctor"] --> COSTS["costs"]
+        HOOKS_CMD["hooks"] --> PRIME["prime"]
+    end
+
+    subgraph AgentSystem["Agent Lifecycle (src/agents/)"]
+        MANIFEST["manifest.ts<br/>Agent Registry"]
+        OVERLAY["overlay.ts<br/>Dynamic CLAUDE.md"]
+        IDENTITY["identity.ts<br/>Persistent CVs"]
+        CHECKPOINT["checkpoint.ts<br/>Session Save/Restore"]
+        LIFECYCLE["lifecycle.ts<br/>Handoff Orchestration"]
+        HOOKS_DEPLOY["hooks-deployer.ts<br/>Guard Enforcement"]
+        GUARDS["guard-rules.ts<br/>Tool/Bash Constraints"]
+    end
+
+    subgraph WorktreeSystem["Worktree Management (src/worktree/)"]
+        WT_MGR["manager.ts<br/>Git Worktree CRUD"]
+        TMUX["tmux.ts<br/>Session Management"]
+        PROCESS["process.ts<br/>Headless Subprocess"]
+    end
+
+    subgraph MailSystem["Mail System (src/mail/)"]
+        MAIL_STORE["store.ts<br/>SQLite WAL"]
+        MAIL_CLIENT["client.ts<br/>Send/Check/List/Reply"]
+        BROADCAST["broadcast.ts<br/>Group Addresses"]
+    end
+
+    subgraph MergeSystem["Merge System (src/merge/)"]
+        QUEUE["queue.ts<br/>FIFO Merge Queue"]
+        RESOLVER["resolver.ts<br/>4-Tier Conflict Resolution"]
+    end
+
+    subgraph Runtimes["Runtime Adapters (src/runtimes/)"]
+        REGISTRY["registry.ts<br/>getRuntime() Factory"]
+        CLAUDE_RT["claude.ts"]
+        PI_RT["pi.ts"]
+        COPILOT_RT["copilot.ts"]
+        CODEX_RT["codex.ts"]
+        GEMINI_RT["gemini.ts"]
+        SAPLING_RT["sapling.ts"]
+        CURSOR_RT["cursor.ts"]
+        OPENCODE_RT["opencode.ts"]
+    end
+
+    subgraph Observability["Observability"]
+        LOGGING["logging/<br/>Logger + Sanitizer"]
+        METRICS["metrics/<br/>SQLite Metrics + Pricing"]
+        SESSIONS["sessions/<br/>SessionStore + RunStore"]
+        EVENTS["events/<br/>EventStore + Tailer"]
+    end
+
+    subgraph Watchdog["Health Monitoring (src/watchdog/)"]
+        DAEMON["daemon.ts<br/>Tier 0: Mechanical"]
+        TRIAGE["triage.ts<br/>Tier 1: AI-Assisted"]
+        HEALTH["health.ts<br/>State Machine"]
+    end
+
+    subgraph External["External Dependencies"]
+        GIT["git"]
+        TMUX_EXT["tmux"]
+        SQLITE["bun:sqlite"]
+        TRACKER["bd/sd<br/>Issue Tracker"]
+        MULCH["mulch<br/>Expertise"]
+    end
+
+    CMD --> Commands
+    Commands --> AgentSystem
+    Commands --> WorktreeSystem
+    Commands --> MailSystem
+    Commands --> MergeSystem
+    Commands --> Observability
+
+    SLING --> MANIFEST
+    SLING --> OVERLAY
+    SLING --> WT_MGR
+    SLING --> REGISTRY
+
+    REGISTRY --> CLAUDE_RT
+    REGISTRY --> PI_RT
+    REGISTRY --> COPILOT_RT
+    REGISTRY --> CODEX_RT
+    REGISTRY --> GEMINI_RT
+    REGISTRY --> SAPLING_RT
+    REGISTRY --> CURSOR_RT
+    REGISTRY --> OPENCODE_RT
+
+    WT_MGR --> GIT
+    WT_MGR --> TMUX
+    TMUX --> TMUX_EXT
+    MAIL_STORE --> SQLITE
+    QUEUE --> SQLITE
+    SESSIONS --> SQLITE
+    EVENTS --> SQLITE
+    METRICS --> SQLITE
+
+    HOOKS_DEPLOY --> GUARDS
+    COORD --> MAIL_CLIENT
+    COORD --> TMUX
+
+    DAEMON --> HEALTH
+    TRIAGE --> HEALTH
+
+    classDef entry fill:#4CAF50,color:#fff
+    classDef core fill:#2196F3,color:#fff
+    classDef external fill:#FF9800,color:#fff
+    classDef data fill:#9C27B0,color:#fff
+
+    class CMD entry
+    class SLING,COORD,MERGE_CMD core
+    class GIT,TMUX_EXT,SQLITE,TRACKER,MULCH external
+    class MAIL_STORE,QUEUE,SESSIONS,EVENTS,METRICS data
