@@ -84,17 +84,18 @@ Every command supports `--json` where noted. Global flags: `-q`/`--quiet`, `--ti
 | Command | Description |
 |---------|-------------|
 | `ov init` | Initialize `.overstory/` and bootstrap os-eco tools (`--yes`, `--name`, `--tools`, `--skip-mulch`, `--skip-seeds`, `--skip-canopy`, `--skip-onboard`, `--json`) |
-| `ov sling <task-id>` | Spawn a worker agent (`--capability`, `--name`, `--spec`, `--files`, `--parent`, `--depth`, `--skip-scout`, `--skip-review`, `--max-agents`, `--dispatch-max-agents`, `--skip-task-check`, `--no-scout-check`, `--runtime`, `--base-branch`, `--json`) |
+| `ov sling <task-id>` | Spawn a worker agent (`--capability`, `--name`, `--spec`, `--files`, `--parent`, `--depth`, `--skip-scout`, `--skip-review`, `--max-agents`, `--dispatch-max-agents`, `--skip-task-check`, `--no-scout-check`, `--runtime`, `--base-branch`, `--profile`, `--json`) |
 | `ov stop <agent-name>` | Terminate a running agent (`--clean-worktree`, `--json`) |
 | `ov prime` | Load context for orchestrator/agent (`--agent`, `--compact`) |
 | `ov spec write <task-id>` | Write a task specification (`--body`) |
+| `ov discover` | Discover a brownfield codebase via coordinator-driven scout swarm (`--skip`, `--name`, `--attach`, `--watchdog`, `--json`) |
 | `ov update` | Refresh `.overstory/` managed files from installed package (`--agents`, `--manifest`, `--hooks`, `--dry-run`, `--json`) |
 
 ### Coordination
 
 | Command | Description |
 |---------|-------------|
-| `ov coordinator start` | Start persistent coordinator agent (`--attach`/`--no-attach`, `--watchdog`, `--monitor`) |
+| `ov coordinator start` | Start persistent coordinator agent (`--attach`/`--no-attach`, `--watchdog`, `--monitor`, `--profile`) |
 | `ov coordinator stop` | Stop coordinator |
 | `ov coordinator status` | Show coordinator state |
 | `ov coordinator send` | Fire-and-forget message to coordinator (`--subject`) |
@@ -236,7 +237,7 @@ overstory/
     config.ts                     Config loader + validation
     errors.ts                     Custom error types
     json.ts                       Standardized JSON envelope helpers
-    commands/                     One file per CLI subcommand (35 commands)
+    commands/                     One file per CLI subcommand (36 commands)
       agents.ts                   Agent discovery and querying
       coordinator.ts              Persistent orchestrator lifecycle
       supervisor.ts               Team lead management [DEPRECATED]
@@ -270,7 +271,10 @@ overstory/
       ecosystem.ts                os-eco tool dashboard
       update.ts                   Refresh managed files
       upgrade.ts                  npm version upgrades
+      discover.ts                 Brownfield codebase discovery via coordinator-driven scout swarm
       completions.ts              Shell completion generation (bash/zsh/fish)
+    canopy/
+      client.ts                   Canopy client (prompt rendering, listing, emission)
     agents/                       Agent lifecycle management
       manifest.ts                 Agent registry (load + query)
       overlay.ts                  Dynamic CLAUDE.md overlay generator

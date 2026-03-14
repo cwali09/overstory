@@ -62,6 +62,7 @@ describe("SQL schema consistency", () => {
 				"parent_agent",
 				"pid",
 				"run_id",
+				"prompt_version",
 				"stalled_since",
 				"started_at",
 				"state",

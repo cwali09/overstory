@@ -83,9 +83,10 @@ function migrateSchema(db: Database): void {
 	const hasCheckConstraints = row.sql.includes("CHECK");
 	const hasPayloadColumn = row.sql.includes("payload");
 	const hasProtocolTypes = row.sql.includes("worker_done");
+	const hasDecisionGate = row.sql.includes("decision_gate");
 
 	// If schema is fully up to date, nothing to do
-	if (hasCheckConstraints && hasPayloadColumn && hasProtocolTypes) {
+	if (hasCheckConstraints && hasPayloadColumn && hasProtocolTypes && hasDecisionGate) {
 		return;
 	}
 

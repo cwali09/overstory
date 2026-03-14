@@ -1060,7 +1060,7 @@ async function executeDashboard(opts: DashboardOpts): Promise<void> {
 		closeDashboardStores(stores);
 		process.stdout.write(CURSOR.showCursor);
 		process.stdout.write(CURSOR.clear);
-		process.exit(0);
+		process.exitCode = 0;
 	});
 
 	// Poll loop — errors are caught per-tick so transient DB failures never crash the dashboard.

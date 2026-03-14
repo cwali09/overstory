@@ -16,6 +16,7 @@ import { createCompletionsCommand } from "./commands/completions.ts";
 import { createCoordinatorCommand } from "./commands/coordinator.ts";
 import { createCostsCommand } from "./commands/costs.ts";
 import { createDashboardCommand } from "./commands/dashboard.ts";
+import { createDiscoverCommand } from "./commands/discover.ts";
 import { createDoctorCommand } from "./commands/doctor.ts";
 import { createEcosystemCommand } from "./commands/ecosystem.ts";
 import { createErrorsCommand } from "./commands/errors.ts";
@@ -49,7 +50,7 @@ import { ConfigError, OverstoryError, WorktreeError } from "./errors.ts";
 import { jsonError } from "./json.ts";
 import { brand, chalk, muted, setQuiet } from "./logging/color.ts";
 
-export const VERSION = "0.8.7";
+export const VERSION = "0.9.1";
 
 const rawArgs = process.argv.slice(2);
 
@@ -76,6 +77,7 @@ const COMMANDS = [
 	"stop",
 	"status",
 	"dashboard",
+	"discover",
 	"inspect",
 	"clean",
 	"doctor",
@@ -286,6 +288,7 @@ program
 	.option("--dispatch-max-agents <n>", "Per-lead max agents ceiling (injected into overlay)")
 	.option("--runtime <name>", "Runtime adapter (default: config or claude)")
 	.option("--base-branch <branch>", "Base branch for worktree creation (default: current HEAD)")
+	.option("--profile <name>", "Canopy profile to apply to agent overlay")
 	.option("--json", "Output result as JSON")
 	.action(async (taskId, opts) => {
 		await slingCommand(taskId, opts);
@@ -328,6 +331,8 @@ program
 program.addCommand(createStatusCommand());
 
 program.addCommand(createDashboardCommand());
+
+program.addCommand(createDiscoverCommand());
 
 program.addCommand(createInspectCommand());
 
