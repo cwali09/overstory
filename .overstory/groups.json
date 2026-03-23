@@ -943,8 +943,21 @@
 			"overstory-1f08",
 			"overstory-cf52"
 		],
-		"status": "active",
+		"status": "completed",
 		"createdAt": "2026-03-20T18:25:55.034Z",
+		"completedAt": "2026-03-20T18:56:12.037Z"
+	},
+	{
+		"id": "group-2dc90255",
+		"name": "bugfix-batch-1",
+		"memberIssueIds": [
+			"overstory-17d5",
+			"overstory-8156",
+			"overstory-a655",
+			"overstory-ee23"
+		],
+		"status": "active",
+		"createdAt": "2026-03-23T19:57:17.357Z",
 		"completedAt": null
 	}
 ]
