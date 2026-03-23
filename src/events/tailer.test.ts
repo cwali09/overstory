@@ -330,6 +330,31 @@ describe("startEventTailer", () => {
 		}
 	});
 
+	test("returns no-op handle immediately when EventStore cannot be created", async () => {
+		const logPath = await createAgentLogDir(tmpDir, "agent-noop");
+
+		// Point to a path whose parent directory does not exist — createEventStore throws.
+		const badDbPath = join(tmpDir, "nonexistent-subdir", "events.db");
+
+		// Do NOT inject _eventStore so the real createEventStore path is exercised.
+		const handle = startEventTailer({
+			stdoutLogPath: logPath,
+			agentName: "agent-noop",
+			runId: null,
+			eventsDbPath: badDbPath,
+			pollIntervalMs: 50,
+		});
+
+		// No polling should have started — wait a couple intervals to confirm.
+		await new Promise((resolve) => setTimeout(resolve, 150));
+
+		// stop() on a no-op handle must not throw.
+		expect(() => handle.stop()).not.toThrow();
+		handle.stop(); // idempotent
+		expect(handle.agentName).toBe("agent-noop");
+		expect(handle.logPath).toBe(logPath);
+	});
+
 	test("does not crash when log file does not exist yet", async () => {
 		// Non-existent log path — tailer should silently poll without errors.
 		const logPath = join(tmpDir, "logs", "agent-h", "2026-03-05T00-00-00-000Z", "stdout.log");

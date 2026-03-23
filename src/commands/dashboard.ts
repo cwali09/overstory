@@ -46,6 +46,7 @@ import type {
 	MailMessage,
 	OverstoryConfig,
 	StoredEvent,
+	TaskTrackerBackend,
 } from "../types.ts";
 import { evaluateHealth } from "../watchdog/health.ts";
 import { isProcessAlive } from "../worktree/tmux.ts";
@@ -59,10 +60,13 @@ const PKG_VERSION: string = JSON.parse(await Bun.file(pkgPath).text()).version ?
  * These are not colors, so they stay separate from the color module.
  */
 const CURSOR = {
-	clear: "\x1b[2J\x1b[H", // Clear screen and home cursor
+	clear: "\x1b[H\x1b[J", // Home cursor then clear from cursor to end
+	home: "\x1b[H", // Home cursor only (for redraw without full clear)
 	cursorTo: (row: number, col: number) => `\x1b[${row};${col}H`,
 	hideCursor: "\x1b[?25l",
 	showCursor: "\x1b[?25h",
+	enterAltScreen: "\x1b[?1049h", // Enter alternate screen buffer
+	leaveAltScreen: "\x1b[?1049l", // Leave alternate screen buffer
 } as const;
 
 /**
@@ -353,6 +357,7 @@ async function loadDashboardData(
 	thresholds?: { staleMs: number; zombieMs: number },
 	eventBuffer?: EventBuffer,
 	runtimeConfig?: OverstoryConfig["runtime"],
+	taskTrackerBackend?: TaskTrackerBackend,
 ): Promise<DashboardData> {
 	// Get all sessions from the pre-opened session store — fall back to cache on SQLite errors.
 	let allSessions: AgentSession[];
@@ -513,7 +518,7 @@ async function loadDashboardData(
 	const now2 = Date.now();
 	if (!trackerCache || now2 - trackerCache.fetchedAt > TRACKER_CACHE_TTL_MS) {
 		try {
-			const backend = await resolveBackend("auto", root);
+			const backend = await resolveBackend(taskTrackerBackend ?? "auto", root);
 			const tracker = createTrackerClient(backend, root);
 			tasks = await tracker.list({ limit: 10 });
 			trackerCache = { tasks, fetchedAt: now2 };
@@ -960,11 +965,13 @@ function renderMetricsPanel(
 /**
  * Render the full dashboard.
  */
-function renderDashboard(data: DashboardData, interval: number): void {
+function renderDashboard(data: DashboardData, interval: number, isFirstRender: boolean): void {
 	const width = process.stdout.columns ?? 100;
 	const height = process.stdout.rows ?? 30;
 
-	let output = CURSOR.clear;
+	// First render: clear entire alt screen. Subsequent: just home cursor
+	// and overwrite in-place (avoids Warp's block-per-clear issue).
+	let output = isFirstRender ? CURSOR.clear : CURSOR.home;
 
 	// Header (rows 1-2)
 	output += renderHeader(width, interval, data.currentRunId);
@@ -1050,20 +1057,44 @@ async function executeDashboard(opts: DashboardOpts): Promise<void> {
 		zombieMs: config.watchdog.zombieThresholdMs,
 	};
 
-	// Hide cursor
+	// Enter alternate screen buffer (like vim/htop) + hide cursor + raw stdin
+	process.stdout.write(CURSOR.enterAltScreen);
 	process.stdout.write(CURSOR.hideCursor);
+	if (process.stdin.isTTY) {
+		process.stdin.setRawMode(true);
+		process.stdin.resume();
+	}
 
-	// Clean exit on Ctrl+C
+	// Clean exit on Ctrl+C or 'q': restore original screen
 	let running = true;
-	process.on("SIGINT", () => {
+	const cleanup = () => {
 		running = false;
+		if (process.stdin.isTTY) {
+			process.stdin.setRawMode(false);
+			process.stdin.pause();
+		}
 		closeDashboardStores(stores);
 		process.stdout.write(CURSOR.showCursor);
-		process.stdout.write(CURSOR.clear);
+		process.stdout.write(CURSOR.leaveAltScreen);
+	};
+
+	process.on("SIGINT", () => {
+		cleanup();
 		process.exitCode = 0;
 	});
 
+	// Allow 'q' to quit the dashboard
+	process.stdin.on("data", (data: Buffer) => {
+		const key = data.toString();
+		if (key === "q" || key === "\x03") {
+			// 'q' or Ctrl+C
+			cleanup();
+			process.exitCode = 0;
+		}
+	});
+
 	// Poll loop — errors are caught per-tick so transient DB failures never crash the dashboard.
+	let isFirstRender = true;
 	let lastGoodData: DashboardData | null = null;
 	let lastErrorMsg: string | null = null;
 	while (running) {
@@ -1075,14 +1106,23 @@ async function executeDashboard(opts: DashboardOpts): Promise<void> {
 				thresholds,
 				eventBuffer,
 				config.runtime,
+				config.taskTracker.backend,
 			);
 			lastGoodData = data;
+			// If recovering from an error, clear the stale error line at the bottom
+			if (lastErrorMsg !== null) {
+				const w = process.stdout.columns ?? 100;
+				const h = process.stdout.rows ?? 30;
+				process.stdout.write(`${CURSOR.cursorTo(h, 1)}${" ".repeat(w)}`);
+			}
 			lastErrorMsg = null;
-			renderDashboard(data, interval);
+			renderDashboard(data, interval, isFirstRender);
+			isFirstRender = false;
 		} catch (err) {
 			// Render last good frame so the TUI stays alive, then show the error inline.
 			if (lastGoodData) {
-				renderDashboard(lastGoodData, interval);
+				renderDashboard(lastGoodData, interval, isFirstRender);
+				isFirstRender = false;
 			}
 			lastErrorMsg = err instanceof Error ? err.message : String(err);
 			const w = process.stdout.columns ?? 100;

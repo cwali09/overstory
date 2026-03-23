@@ -152,7 +152,7 @@ export interface AgentRuntime {
 	/** Stability level of this runtime adapter. */
 	readonly stability: "stable" | "beta" | "experimental";
 
-	/** Relative path to the instruction file within a worktree (e.g. ".claude/CLAUDE.md"). */
+	/** Relative path to the instruction file within a worktree (e.g. "AGENTS.md"). */
 	readonly instructionPath: string;
 
 	/** Build the shell command string to spawn an interactive agent in a tmux pane. */
@@ -168,7 +168,7 @@ export interface AgentRuntime {
 	 * Deploy per-agent instructions and guards to a worktree.
 	 * Claude Code writes .claude/CLAUDE.md + settings.local.json hooks.
 	 * Codex writes AGENTS.md (no hook deployment needed).
-	 * Pi writes .claude/CLAUDE.md + a guard extension in .pi/extensions/.
+	 * Pi writes AGENTS.md + a guard extension in .pi/extensions/.
 	 * When overlay is undefined, only hooks are deployed (no instruction file written).
 	 */
 	deployConfig(
@@ -246,4 +246,11 @@ export interface AgentRuntime {
 	 * The caller provides the raw stdout ReadableStream from Bun.spawn().
 	 */
 	parseEvents?(stream: ReadableStream<Uint8Array>): AsyncIterable<AgentEvent>;
+
+	/**
+	 * Prepare a worktree path before spawning an agent.
+	 * Called by sling.ts after worktree creation but before agent spawn.
+	 * Used by runtimes that need environment setup (e.g., Copilot folder trust).
+	 */
+	prepareWorktree?(worktreePath: string): Promise<void>;
 }

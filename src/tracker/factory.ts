@@ -38,7 +38,8 @@ export async function resolveBackend(
 ): Promise<TrackerBackend> {
 	if (configBackend === "beads") return "beads";
 	if (configBackend === "seeds") return "seeds";
-	// "auto" detection: check for .seeds/ directory first (newer tool), then .beads/
+	// "auto" detection: check for .beads/ first (never auto-scaffolded by ov init,
+	// so its presence signals explicit user setup), then .seeds/.
 	const dirExists = async (path: string): Promise<boolean> => {
 		try {
 			const s = await stat(path);
@@ -47,8 +48,8 @@ export async function resolveBackend(
 			return false;
 		}
 	};
-	if (await dirExists(join(cwd, ".seeds"))) return "seeds";
 	if (await dirExists(join(cwd, ".beads"))) return "beads";
+	if (await dirExists(join(cwd, ".seeds"))) return "seeds";
 	// Default fallback — seeds is the preferred tracker
 	return "seeds";
 }

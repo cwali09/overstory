@@ -51,7 +51,7 @@ Purpose-built messaging via `bun:sqlite` in `.overstory/mail.db`. WAL mode for c
 ```
 overstory/                        # This repo (the overstory tool itself)
   src/
-    index.ts                      # CLI entry point (Commander.js program, 36 commands)
+    index.ts                      # CLI entry point (Commander.js program, 37 commands)
     types.ts                      # ALL shared types and interfaces
     config.ts                     # Config loader + defaults + validation
     errors.ts                     # Custom error types (extend OverstoryError)
@@ -91,6 +91,7 @@ overstory/                        # This repo (the overstory tool itself)
       update.ts                   # ov update (refresh managed files)
       upgrade.ts                  # ov upgrade (npm version upgrades)
       discover.ts                 # ov discover (brownfield codebase discovery)
+      orchestrator.ts             # ov orchestrator (multi-repo coordination)
       completions.ts              # ov --completions (shell completions)
     canopy/
       client.ts                   # Canopy client (prompt rendering, listing, emission)
@@ -99,6 +100,7 @@ overstory/                        # This repo (the overstory tool itself)
       overlay.ts                  # Dynamic CLAUDE.md overlay generator
       identity.ts                 # Persistent agent identity (CVs)
       hooks-deployer.ts           # Deploy hooks config to worktree
+      copilot-hooks-deployer.ts   # Deploy hooks config to Copilot worktrees
       guard-rules.ts              # Shared guard constants (tool lists, bash patterns)
       lifecycle.ts                # Session handoff (checkpoint/resume/complete)
       checkpoint.ts               # Session checkpoint save/load/clear
@@ -136,6 +138,9 @@ overstory/                        # This repo (the overstory tool itself)
       sapling.ts                  # Sapling runtime adapter (headless coding agent)
       opencode.ts                 # OpenCode runtime adapter (SST OpenCode coding agent)
       cursor.ts                   # Cursor CLI runtime adapter (Cursor's `agent` binary)
+      aider.ts                    # Aider runtime adapter (Paul Gauthier's AI pair programmer)
+      goose.ts                    # Goose runtime adapter (Block's AI developer agent)
+      amp.ts                      # Amp runtime adapter (Sourcegraph's AI coding agent)
       connections.ts              # Module-level RuntimeConnection registry for RPC agents
     mulch/
       client.ts                   # mulch client (programmatic API for record/search/query, CLI wrapper for rest)
@@ -159,7 +164,13 @@ overstory/                        # This repo (the overstory tool itself)
       pricing.ts                  # Runtime-agnostic pricing + cost estimation
       transcript.ts               # Claude Code transcript JSONL parser
     doctor/                       # Modular health check system
-      *.ts                        # 11 check categories (see `ov doctor --help`)
+      *.ts                        # 12 check categories (see `ov doctor --help`)
+    utils/
+      bin.ts                      # Resolve overstory binary for re-launch
+      fs.ts                       # Filesystem cleanup (SQLite wipe, JSON reset, directory clear)
+      pid.ts                      # PID file read/write/remove
+      time.ts                     # Parse relative time formats (1h, 30m, 2d, 10s)
+      version.ts                  # Version detection (current, npm registry, CLI tools)
   agents/                         # Base agent definitions (the HOW)
     scout.md                      # Read-only exploration (leaf, depth 2)
     builder.md                    # Implementation (leaf, depth 2)
@@ -174,6 +185,7 @@ overstory/                        # This repo (the overstory tool itself)
     CLAUDE.md.tmpl                # Template for orchestrator CLAUDE.md
     overlay.md.tmpl               # Template for per-worker overlay
     hooks.json.tmpl               # Template for settings.local.json
+    copilot-hooks.json.tmpl       # Template for Copilot hooks config
   # Tests colocated: src/config.test.ts, src/mail/store.test.ts, etc.
 ```
 
@@ -352,6 +364,22 @@ ov coordinator <sub>            Persistent coordinator agent
   check-complete                         Evaluate exit triggers, return completion status
   --json                                 JSON output
 
+ov orchestrator <sub>           Multi-repo coordinator of coordinators
+  start                                  Start orchestrator (spawns Claude Code at root)
+    --attach / --no-attach               Control tmux attach (default: attach on TTY)
+    --watchdog                           Auto-start watchdog daemon
+    --profile <name>                     Named profile for canopy prompt overlay
+  stop                                   Stop orchestrator (kills tmux session)
+  status                                 Show orchestrator state
+  send <body>                            Fire-and-forget message to orchestrator (mail + auto-nudge)
+    --subject <text>                     Message subject (required)
+  ask <body>                             Synchronous request/response to orchestrator
+    --subject <text>                     Message subject (required)
+    --timeout <seconds>                  Reply timeout (default: 120)
+  output                                 Show recent orchestrator output (tmux pane content)
+    --lines <n>                          Number of lines to capture (default: 100)
+  --json                                 JSON output
+
 ov supervisor <sub>             [DEPRECATED] Per-project supervisor agent
   start                                  Start supervisor
     --task <task-id>                     Task ID (required)
@@ -523,7 +551,7 @@ ov doctor                        Run health checks on overstory setup
   --json                                 JSON output
   Categories: dependencies, config, structure, databases,
               consistency, agents, merge, logs, version,
-              ecosystem, providers
+              ecosystem, providers, watchdog
 
 ov ecosystem                     Show os-eco tool versions and health
   --json                                 JSON output

@@ -87,6 +87,9 @@ export const DEFAULT_CONFIG: OverstoryConfig = {
 		staleThresholdMs: 300_000, // 5 minutes
 		zombieThresholdMs: 600_000, // 10 minutes
 		nudgeIntervalMs: 60_000, // 1 minute between progressive nudge stages
+		rpcTimeoutMs: 5_000, // 5 seconds for RPC getState() calls
+		triageTimeoutMs: 30_000, // 30 seconds for Tier 1 AI triage calls
+		maxEscalationLevel: 3, // Maximum escalation level before termination
 	},
 	coordinator: {
 		exitTriggers: {
@@ -588,6 +591,46 @@ function validateConfig(config: OverstoryConfig): void {
 			field: "watchdog.zombieThresholdMs",
 			value: config.watchdog.zombieThresholdMs,
 		});
+	}
+
+	if (config.watchdog.rpcTimeoutMs !== undefined) {
+		if (config.watchdog.rpcTimeoutMs < 1000 || config.watchdog.rpcTimeoutMs > 30000) {
+			throw new ValidationError("watchdog.rpcTimeoutMs must be between 1000 and 30000", {
+				field: "watchdog.rpcTimeoutMs",
+				value: config.watchdog.rpcTimeoutMs,
+			});
+		}
+	}
+
+	if (config.watchdog.triageTimeoutMs !== undefined) {
+		if (config.watchdog.triageTimeoutMs < 5000 || config.watchdog.triageTimeoutMs > 120000) {
+			throw new ValidationError("watchdog.triageTimeoutMs must be between 5000 and 120000", {
+				field: "watchdog.triageTimeoutMs",
+				value: config.watchdog.triageTimeoutMs,
+			});
+		}
+
+		if (
+			config.watchdog.tier1Enabled &&
+			config.watchdog.triageTimeoutMs >= config.watchdog.tier0IntervalMs
+		) {
+			throw new ValidationError(
+				"watchdog.triageTimeoutMs must be less than tier0IntervalMs when tier1 is enabled",
+				{
+					field: "watchdog.triageTimeoutMs",
+					value: config.watchdog.triageTimeoutMs,
+				},
+			);
+		}
+	}
+
+	if (config.watchdog.maxEscalationLevel !== undefined) {
+		if (config.watchdog.maxEscalationLevel < 1 || config.watchdog.maxEscalationLevel > 5) {
+			throw new ValidationError("watchdog.maxEscalationLevel must be between 1 and 5", {
+				field: "watchdog.maxEscalationLevel",
+				value: config.watchdog.maxEscalationLevel,
+			});
+		}
 	}
 
 	// mulch.primeFormat must be one of the valid options

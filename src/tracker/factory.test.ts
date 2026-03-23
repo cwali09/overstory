@@ -68,6 +68,16 @@ describe("resolveBackend", () => {
 			await rm(tempDir, { recursive: true });
 		}
 	});
+	test("returns beads for auto when both .seeds/ and .beads/ exist", async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "tracker-test-"));
+		try {
+			await mkdir(join(tempDir, ".beads"));
+			await mkdir(join(tempDir, ".seeds"));
+			expect(await resolveBackend("auto", tempDir)).toBe("beads");
+		} finally {
+			await rm(tempDir, { recursive: true });
+		}
+	});
 });
 
 describe("trackerCliName", () => {

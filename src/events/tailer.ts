@@ -98,7 +98,14 @@ export function startEventTailer(opts: TailerOptions): TailerHandle {
 			eventStore = createEventStore(eventsDbPath);
 			ownedEventStore = true;
 		} catch {
-			// If we can't open the event store, the tailer becomes a no-op.
+			// EventStore creation failed — return a no-op handle immediately.
+			// Scheduling a poll loop that silently discards every event would
+			// burn CPU and file descriptors for zero benefit.
+			return {
+				agentName,
+				logPath: stdoutLogPath,
+				stop() {},
+			};
 		}
 	}
 

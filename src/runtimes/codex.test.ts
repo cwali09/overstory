@@ -203,7 +203,7 @@ describe("CodexRuntime", () => {
 			expect(cmd1).toBe(cmd2);
 		});
 
-		test("all model names pass through unchanged", () => {
+		test("all bare model names pass through unchanged", () => {
 			for (const model of ["gpt-5-codex", "gpt-4o", "o3", "custom-model-v2"]) {
 				const opts: SpawnOpts = {
 					model,
@@ -214,6 +214,30 @@ describe("CodexRuntime", () => {
 				const cmd = runtime.buildSpawnCommand(opts);
 				expect(cmd).toContain(`--model ${model}`);
 			}
+		});
+
+		test("provider-prefixed model strips prefix (openai/gpt-5.4 → gpt-5.4)", () => {
+			const opts: SpawnOpts = {
+				model: "openai/gpt-5.4",
+				permissionMode: "bypass",
+				cwd: "/tmp",
+				env: {},
+			};
+			const cmd = runtime.buildSpawnCommand(opts);
+			expect(cmd).toContain("--model gpt-5.4");
+			expect(cmd).not.toContain("openai/");
+		});
+
+		test("provider-prefixed model with other providers strips prefix", () => {
+			const opts: SpawnOpts = {
+				model: "azure/gpt-4o",
+				permissionMode: "bypass",
+				cwd: "/tmp",
+				env: {},
+			};
+			const cmd = runtime.buildSpawnCommand(opts);
+			expect(cmd).toContain("--model gpt-4o");
+			expect(cmd).not.toContain("azure/");
 		});
 
 		test("systemPrompt field is ignored", () => {
@@ -244,6 +268,19 @@ describe("CodexRuntime", () => {
 				"--ephemeral",
 				"--model",
 				"gpt-5-codex",
+				"Classify this error",
+			]);
+		});
+
+		test("provider-prefixed model strips prefix (openai/gpt-5.4 → gpt-5.4)", () => {
+			const argv = runtime.buildPrintCommand("Classify this error", "openai/gpt-5.4");
+			expect(argv).toEqual([
+				"codex",
+				"exec",
+				"--full-auto",
+				"--ephemeral",
+				"--model",
+				"gpt-5.4",
 				"Classify this error",
 			]);
 		});

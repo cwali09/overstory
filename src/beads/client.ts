@@ -194,9 +194,37 @@ export function createBeadsClient(cwd: string): BeadsClient {
 			if (options?.limit !== undefined) {
 				args.push("--limit", String(options.limit));
 			}
-			const { stdout } = await runBd(args, "list");
-			const raw = parseJsonOutput<RawBeadIssue[]>(stdout, "list");
-			return raw.map(normalizeIssue);
+			try {
+				const { stdout } = await runBd(args, "list");
+				const trimmed = stdout.trim();
+				if (trimmed === "") return [];
+				const parsed: unknown = JSON.parse(trimmed);
+				if (Array.isArray(parsed)) {
+					// Flat format: RawBeadIssue[]
+					return (parsed as RawBeadIssue[]).map(normalizeIssue);
+				}
+				if (typeof parsed === "object" && parsed !== null) {
+					// Tree format: { mol: RawBeadIssue[] } — flatten all groups
+					const tree = parsed as Record<string, unknown>;
+					const issues: BeadIssue[] = [];
+					for (const group of Object.values(tree)) {
+						if (Array.isArray(group)) {
+							for (const item of group) {
+								issues.push(normalizeIssue(item as RawBeadIssue));
+							}
+						}
+					}
+					if (issues.length > 0) return issues;
+				}
+			} catch {
+				// fall through to ready fallback
+			}
+			// Fallback: bd ready --json always returns a flat array
+			const { stdout: readyStdout } = await runBd(["ready", "--json"], "ready (list fallback)");
+			const readyTrimmed = readyStdout.trim();
+			if (readyTrimmed === "") return [];
+			const readyRaw = parseJsonOutput<RawBeadIssue[]>(readyTrimmed, "ready (list fallback)");
+			return readyRaw.map(normalizeIssue);
 		},
 	};
 }

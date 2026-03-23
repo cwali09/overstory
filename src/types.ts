@@ -105,6 +105,9 @@ export interface OverstoryConfig {
 		staleThresholdMs: number; // When to consider agent stale
 		zombieThresholdMs: number; // When to kill
 		nudgeIntervalMs: number; // Time between progressive nudge stages (default 60_000)
+		rpcTimeoutMs?: number; // Timeout for RPC getState() calls (default 5_000)
+		triageTimeoutMs?: number; // Timeout for Tier 1 AI triage calls (default 30_000)
+		maxEscalationLevel?: number; // Maximum escalation level before termination (default 3)
 	};
 	models: Partial<Record<string, ModelRef>>;
 	logging: {
@@ -165,6 +168,7 @@ export const SUPPORTED_CAPABILITIES = [
 	"reviewer",
 	"lead",
 	"merger",
+	"orchestrator",
 	"coordinator",
 	"supervisor",
 	"monitor",

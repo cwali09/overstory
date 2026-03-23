@@ -925,8 +925,39 @@
 			"overstory-4203",
 			"overstory-1d17"
 		],
-		"status": "active",
+		"status": "completed",
 		"createdAt": "2026-03-12T01:16:06.710Z",
+		"completedAt": "2026-03-12T01:36:55.253Z"
+	},
+	{
+		"id": "group-875c5ab1",
+		"name": "watchdog-batch",
+		"memberIssueIds": [
+			"overstory-9da0",
+			"overstory-8013",
+			"overstory-d14f",
+			"overstory-2b0e",
+			"overstory-0fa6",
+			"overstory-a1a0",
+			"overstory-f1a1",
+			"overstory-1f08",
+			"overstory-cf52"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-20T18:25:55.034Z",
+		"completedAt": "2026-03-20T18:56:12.037Z"
+	},
+	{
+		"id": "group-2dc90255",
+		"name": "bugfix-batch-1",
+		"memberIssueIds": [
+			"overstory-17d5",
+			"overstory-8156",
+			"overstory-a655",
+			"overstory-ee23"
+		],
+		"status": "active",
+		"createdAt": "2026-03-23T19:57:17.357Z",
 		"completedAt": null
 	}
 ]

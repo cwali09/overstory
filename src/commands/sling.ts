@@ -371,11 +371,11 @@ export function checkParentAgentLimit(
 }
 
 /**
- * Validate hierarchy constraints: the coordinator (no parent) may only spawn leads.
+ * Validate hierarchy constraints for direct coordinator/human spawns.
  *
  * When parentAgent is null, the caller is the coordinator or a human.
- * Only "lead" capability is allowed in that case. All other capabilities
- * (builder, scout, reviewer, merger) must be spawned by a lead
+ * Direct spawns are allowed for "lead", "scout", and "builder".
+ * Other capabilities (reviewer, merger, etc.) must be spawned by a lead
  * that passes --parent.
  *
  * @param parentAgent - The --parent flag value (null = coordinator/human)
@@ -805,6 +805,11 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 
 			// Resolve runtime before overlayConfig so we can pass runtime.instructionPath
 			const runtime = getRuntime(opts.runtime, config, capability);
+
+			// Runtime-specific worktree preparation (e.g., Copilot folder trust)
+			if (runtime.prepareWorktree) {
+				await runtime.prepareWorktree(worktreePath);
+			}
 
 			const overlayConfig: OverlayConfig = {
 				agentName: name,

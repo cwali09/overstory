@@ -50,6 +50,21 @@ export class CodexRuntime implements AgentRuntime {
 	private static readonly MANIFEST_ALIASES = new Set(["sonnet", "opus", "haiku"]);
 
 	/**
+	 * Strip a provider prefix from a model ID.
+	 *
+	 * Codex CLI expects bare model names. The orchestrator may resolve a model to
+	 * a provider-qualified form (e.g. `"openai/gpt-5.4"`) — strip the `"openai/"`
+	 * prefix before passing to the CLI.
+	 *
+	 * @param model - Possibly provider-qualified model ID
+	 * @returns Bare model name (everything after the first `/`, or unchanged if no `/`)
+	 */
+	private static stripProviderPrefix(model: string): string {
+		const slashIdx = model.indexOf("/");
+		return slashIdx !== -1 ? model.slice(slashIdx + 1) : model;
+	}
+
+	/**
 	 * Escape a directory path for use in a single-quoted shell argument.
 	 *
 	 * @param path - Absolute directory path
@@ -75,11 +90,14 @@ export class CodexRuntime implements AgentRuntime {
 	 * @returns Shell command string suitable for tmux new-session -c
 	 */
 	buildSpawnCommand(opts: SpawnOpts): string {
+		// Strip provider prefix before alias check and model flag injection.
+		// Codex CLI expects bare model names (e.g. "gpt-5.4", not "openai/gpt-5.4").
+		const bareModel = CodexRuntime.stripProviderPrefix(opts.model);
 		// When model comes from default manifest aliases (sonnet/opus/haiku),
 		// omit --model so Codex uses the user's configured default model.
 		let cmd = "codex --full-auto";
-		if (!CodexRuntime.MANIFEST_ALIASES.has(opts.model)) {
-			cmd += ` --model ${opts.model}`;
+		if (!CodexRuntime.MANIFEST_ALIASES.has(bareModel)) {
+			cmd += ` --model ${bareModel}`;
 		}
 		for (const dir of opts.sharedWritableDirs ?? []) {
 			cmd += ` --add-dir '${CodexRuntime.shellEscape(dir)}'`;
@@ -119,7 +137,8 @@ export class CodexRuntime implements AgentRuntime {
 	buildPrintCommand(prompt: string, model?: string): string[] {
 		const cmd = ["codex", "exec", "--full-auto", "--ephemeral"];
 		if (model !== undefined) {
-			cmd.push("--model", model);
+			// Strip provider prefix — Codex CLI expects bare model names.
+			cmd.push("--model", CodexRuntime.stripProviderPrefix(model));
 		}
 		cmd.push(prompt);
 		return cmd;

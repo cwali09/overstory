@@ -6,7 +6,7 @@ Multi-agent orchestration for AI coding agents.
 [![CI](https://github.com/jayminwest/overstory/actions/workflows/ci.yml/badge.svg)](https://github.com/jayminwest/overstory/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Overstory turns a single coding session into a multi-agent team by spawning worker agents in git worktrees via tmux, coordinating them through a custom SQLite mail system, and merging their work back with tiered conflict resolution. A pluggable `AgentRuntime` interface lets you swap between runtimes — Claude Code, [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or your own adapter.
+Overstory turns a single coding session into a multi-agent team by spawning worker agents in git worktrees via tmux, coordinating them through a custom SQLite mail system, and merging their work back with tiered conflict resolution. A pluggable `AgentRuntime` interface lets you swap between 11 runtimes — Claude Code, [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Aider](https://aider.chat), [Goose](https://github.com/block/goose), [Amp](https://amp.dev), or your own adapter.
 
 > **Warning: Agent swarms are not a universal solution.** Do not deploy Overstory without understanding the risks of multi-agent orchestration — compounding error rates, cost amplification, debugging complexity, and merge conflicts are the normal case, not edge cases. Read [STEELMAN.md](STEELMAN.md) for a full risk analysis and the [Agentic Engineering Book](https://github.com/jayminwest/agentic-engineering-book) ([web version](https://jayminwest.com/agentic-engineering-book)) before using this tool in production.
 
@@ -22,6 +22,9 @@ Requires [Bun](https://bun.sh) v1.0+, git, and tmux. At least one supported agen
 - [Cursor CLI](https://cursor.com/docs/cli/overview) (`agent` CLI)
 - [Sapling](https://github.com/jayminwest/sapling) (`sp` CLI)
 - [OpenCode](https://opencode.ai) (`opencode` CLI)
+- [Aider](https://aider.chat) (`aider` CLI)
+- [Goose](https://github.com/block/goose) (`goose` CLI)
+- [Amp](https://amp.dev) (`amp` CLI)
 
 ```bash
 bun install -g @os-eco/overstory-cli
@@ -102,6 +105,12 @@ Every command supports `--json` where noted. Global flags: `-q`/`--quiet`, `--ti
 | `ov coordinator ask` | Synchronous request/response to coordinator (`--subject`, `--timeout`) |
 | `ov coordinator output` | Show recent coordinator output (`--lines`) |
 | `ov coordinator check-complete` | Evaluate exit triggers, return completion status |
+| `ov orchestrator start` | Start multi-repo orchestrator agent (`--attach`/`--no-attach`, `--watchdog`, `--profile`) |
+| `ov orchestrator stop` | Stop orchestrator |
+| `ov orchestrator status` | Show orchestrator state |
+| `ov orchestrator send` | Fire-and-forget message to orchestrator (`--subject`) |
+| `ov orchestrator ask` | Synchronous request/response to orchestrator (`--subject`, `--timeout`) |
+| `ov orchestrator output` | Show recent orchestrator output (`--lines`) |
 | `ov supervisor start` | **[DEPRECATED]** Start per-project supervisor agent |
 | `ov supervisor stop` | **[DEPRECATED]** Stop supervisor |
 | `ov supervisor status` | **[DEPRECATED]** Show supervisor state |
@@ -165,7 +174,7 @@ Every command supports `--json` where noted. Global flags: `-q`/`--quiet`, `--ti
 | `ov monitor status` | Show monitor state |
 | `ov log <event>` | Log a hook event (`--agent`) |
 | `ov clean` | Clean up worktrees, sessions, artifacts (`--completed`, `--all`, `--run`) |
-| `ov doctor` | Run health checks on overstory setup — 11 categories (`--category`, `--fix`, `--json`) |
+| `ov doctor` | Run health checks on overstory setup — 12 categories (`--category`, `--fix`, `--json`) |
 | `ov ecosystem` | Show os-eco tool versions and health (`--json`) |
 | `ov upgrade` | Upgrade overstory to latest npm version (`--check`, `--all`, `--json`) |
 | `ov agents discover` | Discover agents by capability/state/parent (`--capability`, `--state`, `--parent`, `--json`) |
@@ -188,6 +197,9 @@ Overstory is runtime-agnostic. The `AgentRuntime` interface (`src/runtimes/types
 | Cursor | `agent` | (none — `--yolo`) | Experimental |
 | Codex | `codex` | OS-level sandbox (Seatbelt/Landlock) | Experimental |
 | Gemini | `gemini` | `--sandbox` flag | Experimental |
+| Aider | `aider` | (none — `--yes-always`) | Experimental |
+| Goose | `goose` | Profile-based permissions | Experimental |
+| Amp | `amp` | Built-in approval system | Experimental |
 | OpenCode | `opencode` | (none) | Experimental |
 
 ## How It Works
@@ -237,7 +249,7 @@ overstory/
     config.ts                     Config loader + validation
     errors.ts                     Custom error types
     json.ts                       Standardized JSON envelope helpers
-    commands/                     One file per CLI subcommand (36 commands)
+    commands/                     One file per CLI subcommand (37 commands)
       agents.ts                   Agent discovery and querying
       coordinator.ts              Persistent orchestrator lifecycle
       supervisor.ts               Team lead management [DEPRECATED]
@@ -260,7 +272,7 @@ overstory/
       run.ts                      Orchestration run lifecycle
       trace.ts                    Agent/task timeline viewing
       clean.ts                    Worktree/session cleanup
-      doctor.ts                   Health check runner (11 check modules)
+      doctor.ts                   Health check runner (12 check modules)
       inspect.ts                  Deep per-agent inspection
       spec.ts                     Task spec management
       errors.ts                   Aggregated error view
@@ -272,6 +284,7 @@ overstory/
       update.ts                   Refresh managed files
       upgrade.ts                  npm version upgrades
       discover.ts                 Brownfield codebase discovery via coordinator-driven scout swarm
+      orchestrator.ts             Multi-repo coordination (PersistentAgentSpec)
       completions.ts              Shell completion generation (bash/zsh/fish)
     canopy/
       client.ts                   Canopy client (prompt rendering, listing, emission)
@@ -282,6 +295,7 @@ overstory/
       checkpoint.ts               Session checkpoint save/restore
       lifecycle.ts                Handoff orchestration
       hooks-deployer.ts           Deploy hooks + tool enforcement
+      copilot-hooks-deployer.ts   Deploy hooks config to Copilot worktrees
       guard-rules.ts              Shared guard constants (tool lists, bash patterns)
     worktree/                     Git worktree + tmux management
     mail/                         SQLite mail system (typed protocol, broadcast)
@@ -289,9 +303,10 @@ overstory/
     watchdog/                     Tiered health monitoring (daemon, triage, health)
     logging/                      Multi-format logger + sanitizer + reporter + color control + shared theme/format
     metrics/                      SQLite metrics + pricing + transcript parsing
-    doctor/                       Health check modules (11 checks)
+    doctor/                       Health check modules (12 checks)
+    utils/                        Shared utilities (bin, fs, pid, time, version)
     insights/                     Session insight analyzer for auto-expertise
-    runtimes/                     AgentRuntime abstraction (registry + adapters: Claude, Pi, Copilot, Codex, Gemini, Sapling, OpenCode, Cursor)
+    runtimes/                     AgentRuntime abstraction (registry + adapters: Claude, Pi, Copilot, Codex, Gemini, Sapling, OpenCode, Cursor, Aider, Goose, Amp)
     tracker/                      Pluggable task tracker (beads + seeds backends)
     mulch/                        mulch client (programmatic API + CLI wrapper)
     e2e/                          End-to-end lifecycle tests

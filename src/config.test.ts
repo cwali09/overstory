@@ -371,6 +371,7 @@ watchdog:
   tier0Enabled: false
   tier0IntervalMs: 20000
   tier1Enabled: true
+  triageTimeoutMs: 15000
 `);
 
 		const config = await loadConfig(tempDir);
@@ -566,6 +567,151 @@ watchdog:
   tier0IntervalMs: 0
 `);
 		await expect(loadConfig(tempDir)).rejects.toThrow(ValidationError);
+	});
+
+	// rpcTimeoutMs tests
+	test("defaults rpcTimeoutMs to 5000", async () => {
+		const config = await loadConfig(tempDir);
+		expect(config.watchdog.rpcTimeoutMs).toBe(5000);
+	});
+
+	test("accepts valid rpcTimeoutMs", async () => {
+		await writeConfig(`
+watchdog:
+  rpcTimeoutMs: 10000
+`);
+		const config = await loadConfig(tempDir);
+		expect(config.watchdog.rpcTimeoutMs).toBe(10000);
+	});
+
+	test("rejects rpcTimeoutMs below 1000", async () => {
+		await writeConfig(`
+watchdog:
+  rpcTimeoutMs: 999
+`);
+		await expect(loadConfig(tempDir)).rejects.toThrow(ValidationError);
+	});
+
+	test("rejects rpcTimeoutMs above 30000", async () => {
+		await writeConfig(`
+watchdog:
+  rpcTimeoutMs: 30001
+`);
+		await expect(loadConfig(tempDir)).rejects.toThrow(ValidationError);
+	});
+
+	// triageTimeoutMs tests
+	test("defaults triageTimeoutMs to 30000", async () => {
+		const config = await loadConfig(tempDir);
+		expect(config.watchdog.triageTimeoutMs).toBe(30000);
+	});
+
+	test("accepts valid triageTimeoutMs", async () => {
+		await writeConfig(`
+watchdog:
+  triageTimeoutMs: 60000
+`);
+		const config = await loadConfig(tempDir);
+		expect(config.watchdog.triageTimeoutMs).toBe(60000);
+	});
+
+	test("rejects triageTimeoutMs below 5000", async () => {
+		await writeConfig(`
+watchdog:
+  triageTimeoutMs: 4999
+`);
+		await expect(loadConfig(tempDir)).rejects.toThrow(ValidationError);
+	});
+
+	test("rejects triageTimeoutMs above 120000", async () => {
+		await writeConfig(`
+watchdog:
+  triageTimeoutMs: 120001
+`);
+		await expect(loadConfig(tempDir)).rejects.toThrow(ValidationError);
+	});
+
+	test("rejects triageTimeoutMs >= tier0IntervalMs when tier1 is enabled", async () => {
+		// Must include tier0Enabled to avoid deprecated-key migration that would remap tier1Enabled
+		await writeConfig(`
+watchdog:
+  tier0Enabled: true
+  tier1Enabled: true
+  tier0IntervalMs: 30000
+  triageTimeoutMs: 30000
+`);
+		await expect(loadConfig(tempDir)).rejects.toThrow(ValidationError);
+	});
+
+	test("accepts triageTimeoutMs < tier0IntervalMs when tier1 is enabled", async () => {
+		await writeConfig(`
+watchdog:
+  tier0Enabled: true
+  tier1Enabled: true
+  tier0IntervalMs: 60000
+  triageTimeoutMs: 30000
+`);
+		const config = await loadConfig(tempDir);
+		expect(config.watchdog.triageTimeoutMs).toBe(30000);
+	});
+
+	test("allows triageTimeoutMs >= tier0IntervalMs when tier1 is disabled", async () => {
+		await writeConfig(`
+watchdog:
+  tier0Enabled: true
+  tier1Enabled: false
+  tier0IntervalMs: 30000
+  triageTimeoutMs: 30000
+`);
+		const config = await loadConfig(tempDir);
+		expect(config.watchdog.triageTimeoutMs).toBe(30000);
+	});
+
+	// maxEscalationLevel tests
+	test("defaults maxEscalationLevel to 3", async () => {
+		const config = await loadConfig(tempDir);
+		expect(config.watchdog.maxEscalationLevel).toBe(3);
+	});
+
+	test("accepts valid maxEscalationLevel", async () => {
+		await writeConfig(`
+watchdog:
+  maxEscalationLevel: 5
+`);
+		const config = await loadConfig(tempDir);
+		expect(config.watchdog.maxEscalationLevel).toBe(5);
+	});
+
+	test("rejects maxEscalationLevel below 1", async () => {
+		await writeConfig(`
+watchdog:
+  maxEscalationLevel: 0
+`);
+		await expect(loadConfig(tempDir)).rejects.toThrow(ValidationError);
+	});
+
+	test("rejects maxEscalationLevel above 5", async () => {
+		await writeConfig(`
+watchdog:
+  maxEscalationLevel: 6
+`);
+		await expect(loadConfig(tempDir)).rejects.toThrow(ValidationError);
+	});
+
+	test("accepts maxEscalationLevel boundary values 1 and 5", async () => {
+		await writeConfig(`
+watchdog:
+  maxEscalationLevel: 1
+`);
+		let config = await loadConfig(tempDir);
+		expect(config.watchdog.maxEscalationLevel).toBe(1);
+
+		await writeConfig(`
+watchdog:
+  maxEscalationLevel: 5
+`);
+		config = await loadConfig(tempDir);
+		expect(config.watchdog.maxEscalationLevel).toBe(5);
 	});
 
 	test("accepts empty models section", async () => {
@@ -1150,6 +1296,110 @@ coordinator:
 		);
 		const config = await loadConfig(tempDir);
 		expect(config.coordinator?.exitTriggers.allAgentsDone).toBe(true);
+	});
+});
+
+describe("YAML parser edge cases", () => {
+	let tempDir: string;
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "overstory-test-"));
+		await mkdir(join(tempDir, ".overstory"), { recursive: true });
+	});
+
+	afterEach(async () => {
+		await cleanupTempDir(tempDir);
+	});
+
+	async function writeConfig(yaml: string): Promise<void> {
+		await Bun.write(join(tempDir, ".overstory", "config.yaml"), yaml);
+	}
+
+	test("inline comments are stripped from values", async () => {
+		await writeConfig(`
+project:
+  canonicalBranch: develop # this is a comment
+`);
+		const config = await loadConfig(tempDir);
+		expect(config.project.canonicalBranch).toBe("develop");
+	});
+
+	test("quoted strings containing # are preserved (not treated as comments)", async () => {
+		await writeConfig(`
+project:
+  canonicalBranch: "feature#branch"
+`);
+		const config = await loadConfig(tempDir);
+		expect(config.project.canonicalBranch).toBe("feature#branch");
+	});
+
+	test("single-quoted strings containing # are preserved", async () => {
+		await writeConfig(`
+project:
+  canonicalBranch: 'feature#branch'
+`);
+		const config = await loadConfig(tempDir);
+		expect(config.project.canonicalBranch).toBe("feature#branch");
+	});
+
+	test("boolean coercion: true/True/TRUE all parse as true", async () => {
+		// Test with three separate configs since they all map to the same field
+		for (const val of ["true", "True", "TRUE"]) {
+			await writeConfig(`mulch:\n  enabled: ${val}\n`);
+			const config = await loadConfig(tempDir);
+			expect(config.mulch.enabled).toBe(true);
+		}
+	});
+
+	test("boolean coercion: false/False/FALSE all parse as false", async () => {
+		for (const val of ["false", "False", "FALSE"]) {
+			await writeConfig(`mulch:\n  enabled: ${val}\n`);
+			const config = await loadConfig(tempDir);
+			expect(config.mulch.enabled).toBe(false);
+		}
+	});
+
+	test("yes/no are treated as plain strings, not booleans", async () => {
+		// The YAML parser does NOT treat yes/no as booleans (unlike YAML 1.1)
+		await writeConfig(`
+project:
+  canonicalBranch: yes
+`);
+		const config = await loadConfig(tempDir);
+		// "yes" is a plain string, not coerced to boolean
+		expect(config.project.canonicalBranch).toBe("yes");
+	});
+
+	test("integer number coercion", async () => {
+		await writeConfig(`
+agents:
+  maxConcurrent: 42
+`);
+		const config = await loadConfig(tempDir);
+		expect(config.agents.maxConcurrent).toBe(42);
+	});
+
+	test("float number coercion", async () => {
+		// maxSessionsPerRun doesn't accept floats, but the parser itself parses them.
+		// Use a field that passes validation as a number.
+		await writeConfig(`
+agents:
+  maxSessionsPerRun: 5
+  staggerDelayMs: 1500
+`);
+		const config = await loadConfig(tempDir);
+		expect(config.agents.staggerDelayMs).toBe(1500);
+	});
+
+	test("underscore-separated numbers are coerced correctly", async () => {
+		await writeConfig(`
+watchdog:
+  staleThresholdMs: 300_000
+  zombieThresholdMs: 600_000
+`);
+		const config = await loadConfig(tempDir);
+		expect(config.watchdog.staleThresholdMs).toBe(300_000);
+		expect(config.watchdog.zombieThresholdMs).toBe(600_000);
 	});
 });
 
