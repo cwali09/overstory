@@ -633,8 +633,55 @@ describe("logCommand", () => {
 		});
 	});
 
-	test("session-end writes pending-nudge marker for coordinator when lead completes", async () => {
-		// Create sessions.db with a lead agent
+	test("session-end does NOT transition lead to completed (persistent agent)", async () => {
+		// Regression test for overstory-49a7:
+		// The lead's Stop hook fires every turn (interactive Claude Code), not just at
+		// true session end. session-end must NOT mark leads completed, or they vanish
+		// from getActive() after their first turn while their tmux is still alive.
+		const dbPath = join(tempDir, ".overstory", "sessions.db");
+		const session: AgentSession = {
+			id: "session-lead",
+			agentName: "lead-alpha",
+			capability: "lead",
+			worktreePath: tempDir,
+			branchName: "lead-alpha-branch",
+			taskId: "bead-lead-001",
+			tmuxSession: "overstory-lead-alpha",
+			state: "working",
+			pid: 33333,
+			parentAgent: null,
+			depth: 0,
+			runId: null,
+			startedAt: new Date().toISOString(),
+			lastActivity: new Date(Date.now() - 60_000).toISOString(),
+			escalationLevel: 0,
+			stalledSince: null,
+			transcriptPath: null,
+		};
+		const store = createSessionStore(dbPath);
+		store.upsert(session);
+		store.close();
+
+		await logCommand(["session-end", "--agent", "lead-alpha"]);
+
+		// Lead should remain 'working', not transition to 'completed'
+		const readStore = createSessionStore(dbPath);
+		const updatedSession = readStore.getByName("lead-alpha");
+		readStore.close();
+
+		expect(updatedSession).toBeDefined();
+		expect(updatedSession?.state).toBe("working");
+		// But lastActivity should be updated
+		expect(new Date(updatedSession?.lastActivity ?? "").getTime()).toBeGreaterThan(
+			new Date(session.lastActivity).getTime(),
+		);
+	});
+
+	test("session-end does NOT write pending-nudge marker for leads (moved to ov stop)", async () => {
+		// Regression test for overstory-49a7:
+		// The lead_completed nudge used to fire from the per-turn Stop hook, spamming
+		// the coordinator with false completion signals every turn. It is now emitted
+		// only by `ov stop <lead>` (the real completion signal).
 		const dbPath = join(tempDir, ".overstory", "sessions.db");
 		const session: AgentSession = {
 			id: "session-lead",
@@ -661,17 +708,10 @@ describe("logCommand", () => {
 
 		await logCommand(["session-end", "--agent", "lead-alpha"]);
 
-		// Verify the pending-nudge marker was written for the coordinator
+		// No pending-nudge marker should be written from session-end
 		const markerPath = join(tempDir, ".overstory", "pending-nudges", "coordinator.json");
 		const markerFile = Bun.file(markerPath);
-		expect(await markerFile.exists()).toBe(true);
-
-		const marker = JSON.parse(await markerFile.text());
-		expect(marker.from).toBe("lead-alpha");
-		expect(marker.reason).toBe("lead_completed");
-		expect(marker.subject).toContain("lead-alpha");
-		expect(marker.messageId).toContain("auto-nudge-lead-alpha-");
-		expect(marker.createdAt).toBeDefined();
+		expect(await markerFile.exists()).toBe(false);
 	});
 
 	test("session-end does NOT write pending-nudge marker for non-lead agents", async () => {

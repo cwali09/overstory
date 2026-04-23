@@ -141,6 +141,30 @@ export async function stopCommand(
 			// Mark session as completed
 			store.updateState(agentName, "completed");
 			store.updateLastActivity(agentName);
+
+			// Auto-nudge coordinator when a lead truly completes so it wakes up
+			// to process merge_ready / worker_done messages without waiting for
+			// user input. Fires from `ov stop` (real completion signal) rather
+			// than the per-turn Stop hook, which was spamming the coordinator
+			// (overstory-49a7).
+			if (session.capability === "lead") {
+				try {
+					const nudgesDir = join(overstoryDir, "pending-nudges");
+					const { mkdir } = await import("node:fs/promises");
+					await mkdir(nudgesDir, { recursive: true });
+					const markerPath = join(nudgesDir, "coordinator.json");
+					const marker = {
+						from: agentName,
+						reason: "lead_completed",
+						subject: `Lead ${agentName} completed — check mail for merge_ready/worker_done`,
+						messageId: `auto-nudge-${agentName}-${Date.now()}`,
+						createdAt: new Date().toISOString(),
+					};
+					await Bun.write(markerPath, `${JSON.stringify(marker, null, "\t")}\n`);
+				} catch {
+					// Non-fatal: nudge failure should not break stop
+				}
+			}
 		}
 
 		// Optionally remove worktree and branch (best-effort, non-fatal)

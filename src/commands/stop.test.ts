@@ -472,6 +472,45 @@ describe("stopCommand stop behavior", () => {
 		store.close();
 		expect(updated?.state).toBe("completed");
 	});
+
+	test("stopping a lead writes lead_completed pending-nudge for coordinator", async () => {
+		// Regression test for overstory-49a7:
+		// The lead_completed nudge now fires from `ov stop` (real completion signal),
+		// not from the per-turn Stop hook, which was spamming the coordinator.
+		const session = makeAgentSession({
+			agentName: "lead-alpha",
+			capability: "lead",
+			state: "working",
+			tmuxSession: "overstory-lead-alpha",
+		});
+		saveSessionsToDb([session]);
+
+		const { deps } = makeDeps({ [session.tmuxSession]: true });
+		await stopCommand("lead-alpha", {}, deps);
+
+		const markerPath = join(overstoryDir, "pending-nudges", "coordinator.json");
+		const markerFile = Bun.file(markerPath);
+		expect(await markerFile.exists()).toBe(true);
+
+		const marker = JSON.parse(await markerFile.text());
+		expect(marker.from).toBe("lead-alpha");
+		expect(marker.reason).toBe("lead_completed");
+		expect(marker.subject).toContain("lead-alpha");
+		expect(marker.messageId).toContain("auto-nudge-lead-alpha-");
+		expect(marker.createdAt).toBeDefined();
+	});
+
+	test("stopping a non-lead agent does NOT write lead_completed pending-nudge", async () => {
+		const session = makeAgentSession({ state: "working", capability: "builder" });
+		saveSessionsToDb([session]);
+
+		const { deps } = makeDeps({ [session.tmuxSession]: true });
+		await stopCommand("my-builder", {}, deps);
+
+		const markerPath = join(overstoryDir, "pending-nudges", "coordinator.json");
+		const markerFile = Bun.file(markerPath);
+		expect(await markerFile.exists()).toBe(false);
+	});
 });
 
 describe("stopCommand --json output", () => {
