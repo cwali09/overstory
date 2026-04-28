@@ -17,6 +17,7 @@ import { Command } from "commander";
 import { loadConfig } from "../config.ts";
 import { jsonError, jsonOutput } from "../json.ts";
 import { printError, printSuccess } from "../logging/color.ts";
+import { installBroadcaster } from "./serve/ws.ts";
 
 // === Extensible route registry ===
 
@@ -28,6 +29,8 @@ export type WsHandler = {
 	open?: (ws: ServerWebSocket) => void;
 	message?: (ws: ServerWebSocket, message: string | Buffer) => void;
 	close?: (ws: ServerWebSocket, code: number, reason: string) => void;
+	/** Return upgrade data (passed to ws.data) or null to reject with HTTP 400. */
+	getUpgradeData?: (req: Request) => unknown | null;
 };
 
 // ServerWebSocket is a Bun built-in — use the global type alias
@@ -110,13 +113,31 @@ export async function createServeServer(
 
 			// /ws — WebSocket upgrade
 			if (path === "/ws") {
-				if (_wsHandler !== undefined) {
-					const upgraded = srv.upgrade(req, { data: undefined });
-					if (upgraded) {
-						return new Response(null, { status: 101 });
-					}
+				if (_wsHandler === undefined) {
+					return new Response(
+						JSON.stringify({ success: false, command: "serve", error: "WebSocket not available" }),
+						{ status: 404, headers: { "Content-Type": "application/json" } },
+					);
 				}
-				return new Response("WebSocket not available", { status: 404 });
+				const upgradeData = _wsHandler.getUpgradeData?.(req);
+				if (upgradeData === null) {
+					return new Response(
+						JSON.stringify({
+							success: false,
+							command: "serve",
+							error: "Missing run or agent query parameter",
+						}),
+						{ status: 400, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				const upgraded = srv.upgrade(req, { data: upgradeData });
+				if (upgraded) {
+					return new Response(null, { status: 101 });
+				}
+				return new Response(
+					JSON.stringify({ success: false, command: "serve", error: "WebSocket upgrade failed" }),
+					{ status: 500, headers: { "Content-Type": "application/json" } },
+				);
 			}
 
 			// /api/* — delegated to registered API handlers
@@ -193,6 +214,15 @@ async function serveStatic(
  * SIGINT/SIGTERM. Handles graceful shutdown.
  */
 export async function runServe(opts: ServeOptions, deps: ServeDeps = {}): Promise<void> {
+	const _cfg = deps._loadConfig ?? loadConfig;
+	const config = await _cfg(process.cwd());
+
+	// Install broadcaster before Bun.serve so handler is ready for the first request
+	const stopBroadcaster = installBroadcaster({
+		eventsDbPath: join(config.project.root, ".overstory", "events.db"),
+		mailDbPath: join(config.project.root, ".overstory", "mail.db"),
+	});
+
 	const server = await createServeServer(opts, deps);
 
 	const useJson = opts.json ?? false;
@@ -212,6 +242,7 @@ export async function runServe(opts: ServeOptions, deps: ServeDeps = {}): Promis
 		if (!useJson) {
 			process.stdout.write("\nShutting down...\n");
 		}
+		stopBroadcaster();
 		server.stop(true);
 		process.exit(0);
 	};
