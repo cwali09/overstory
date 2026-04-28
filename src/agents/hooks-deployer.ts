@@ -341,15 +341,22 @@ export function getTrackerCloseGuards(): HookEntry[] {
 
 /**
  * Build a PreToolUse guard script that enforces the merge_ready gate on lead
- * agents (overstory-3899): a lead may not run `sd/bd close $OVERSTORY_TASK_ID`
- * unless it has sent at least one `merge_ready` mail AND has sent at least
- * one `merge_ready` per `worker_done` it has received.
+ * agents (overstory-3899, overstory-da9b): a lead may not run
+ * `sd/bd close $OVERSTORY_TASK_ID` unless (a) it has sent at least one
+ * `merge_ready` mail AND has sent at least one `merge_ready` per `worker_done`
+ * it has received, AND (b) the lead's branch (worktree HEAD) is reachable
+ * from the merge target (session-branch.txt > "main") via
+ * `git merge-base --is-ancestor`. (a) proves the lead reported completion;
+ * (b) proves the coordinator actually merged the work.
  *
  * Counts are derived by querying `ov mail list --json` and grep-counting
  * `"id":"` occurrences in the JSON response (no jq dependency). The gate
  * is a no-op for non-lead agents because it is only deployed to leads via
  * `getLeadCloseGateGuards()`, but it still self-protects: the script
  * exits early when OVERSTORY_AGENT_NAME or OVERSTORY_TASK_ID is unset.
+ * The merge-ancestor check fails open when OVERSTORY_WORKTREE_PATH is unset
+ * or the target ref cannot be resolved locally — in those cases we cannot
+ * make a definitive claim, so we don't block.
  *
  * Foreign-task closes are caught earlier by `buildTrackerCloseGuardScript`,
  * so this gate only fires when the issue ID matches OVERSTORY_TASK_ID.
@@ -364,6 +371,11 @@ export function buildLeadCloseGateScript(): string {
 		decision: "block",
 		reason:
 			"merge_ready gate: cannot close your task — merge_ready count is less than worker_done received. Send one merge_ready per worker_done before closing.",
+	});
+	const blockNotMerged = JSON.stringify({
+		decision: "block",
+		reason:
+			"merge_ready gate: cannot close your task — your branch is not yet merged into the target (session-branch.txt or main). Wait for the coordinator to merge before closing. The merge step is what makes the work real.",
 	});
 
 	const script = [
@@ -395,6 +407,24 @@ export function buildLeadCloseGateScript(): string {
 		// Block if not enough merge_ready for the worker_done count
 		'if [ "$MR" -lt "$WD" ]; then',
 		`  echo '${escapeForSingleQuotedShell(blockUnderCount)}';`,
+		"  exit 0;",
+		"fi;",
+		// Verify the lead's branch is actually merged into the target (overstory-da9b).
+		// merge_ready alone doesn't prove the work landed — the coordinator may still be
+		// verifying or the merge may have failed.
+		// Skip if worktree path is missing (test envs etc.) — fail open.
+		'[ -z "$OVERSTORY_WORKTREE_PATH" ] && exit 0;',
+		// Resolve target branch: $OVERSTORY_PROJECT_ROOT/.overstory/session-branch.txt > "main"
+		'TARGET="";',
+		'if [ -n "$OVERSTORY_PROJECT_ROOT" ] && [ -f "$OVERSTORY_PROJECT_ROOT/.overstory/session-branch.txt" ]; then',
+		'  TARGET=$(tr -d "[:space:]" < "$OVERSTORY_PROJECT_ROOT/.overstory/session-branch.txt" 2>/dev/null);',
+		"fi;",
+		'[ -z "$TARGET" ] && TARGET=main;',
+		// If the target ref doesn't exist locally, we can't verify — fail open.
+		'if ! git -C "$OVERSTORY_WORKTREE_PATH" rev-parse --verify "$TARGET" >/dev/null 2>&1; then exit 0; fi;',
+		// Block if HEAD is not yet an ancestor of the target.
+		'if ! git -C "$OVERSTORY_WORKTREE_PATH" merge-base --is-ancestor HEAD "$TARGET" >/dev/null 2>&1; then',
+		`  echo '${escapeForSingleQuotedShell(blockNotMerged)}';`,
 		"  exit 0;",
 		"fi;",
 	].join(" ");

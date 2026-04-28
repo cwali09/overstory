@@ -5,7 +5,13 @@ import { join } from "node:path";
 import { AgentError } from "../errors.ts";
 import { createMailClient } from "../mail/client.ts";
 import { createMailStore } from "../mail/store.ts";
-import { cleanupTempDir } from "../test-helpers.ts";
+import {
+	cleanupTempDir,
+	commitFile,
+	createTempGitRepo,
+	getDefaultBranch,
+	runGitInDir,
+} from "../test-helpers.ts";
 import {
 	buildBashFileGuardScript,
 	buildBashPathBoundaryScript,
@@ -2594,7 +2600,7 @@ describe("deployHooks tracker close guard integration", () => {
 	});
 });
 
-describe("buildLeadCloseGateScript (overstory-3899)", () => {
+describe("buildLeadCloseGateScript (overstory-3899, overstory-da9b)", () => {
 	test("returns a string containing key patterns", () => {
 		const script = buildLeadCloseGateScript();
 		expect(typeof script).toBe("string");
@@ -2615,6 +2621,14 @@ describe("buildLeadCloseGateScript (overstory-3899)", () => {
 	test("contains OVERSTORY_TASK_ID early-exit check", () => {
 		const script = buildLeadCloseGateScript();
 		expect(script).toContain('[ -z "$OVERSTORY_TASK_ID" ] && exit 0;');
+	});
+
+	test("contains merge-ancestor verification (overstory-da9b)", () => {
+		const script = buildLeadCloseGateScript();
+		expect(script).toContain("OVERSTORY_WORKTREE_PATH");
+		expect(script).toContain("session-branch.txt");
+		expect(script).toContain("merge-base --is-ancestor");
+		expect(script).toContain("not yet merged");
 	});
 });
 
@@ -2822,6 +2836,184 @@ describe("lead close-gate behavioral tests", () => {
 		const parsed = JSON.parse(r.stdout.trim());
 		expect(parsed.decision).toBe("block");
 		expect(parsed.reason).toContain("not sent");
+	});
+});
+
+describe("lead close-gate merge-ancestor check (overstory-da9b)", () => {
+	let repoDir: string;
+	let defaultBranch: string;
+
+	beforeEach(async () => {
+		repoDir = await createTempGitRepo();
+		defaultBranch = await getDefaultBranch(repoDir);
+		const { mkdir } = await import("node:fs/promises");
+		await mkdir(join(repoDir, ".overstory"), { recursive: true });
+		// Pre-seed merge_ready so the lead clears the count checks and the script
+		// reaches the new merge-ancestor logic.
+		const dbPath = join(repoDir, ".overstory", "mail.db");
+		const store = createMailStore(dbPath);
+		const client = createMailClient(store);
+		try {
+			client.send({
+				from: "lead-x",
+				to: "coordinator",
+				subject: "merge_ready: my-task",
+				body: "test",
+				type: "merge_ready",
+			});
+		} finally {
+			client.close();
+		}
+	});
+
+	afterEach(async () => {
+		await cleanupTempDir(repoDir);
+	});
+
+	async function runMergeGate(opts: {
+		worktreePath?: string | null;
+		projectRoot?: string | null;
+	}): Promise<{ stdout: string; exitCode: number | null }> {
+		const guards = getLeadCloseGateGuards();
+		const script = guards[0]?.hooks[0]?.command ?? "";
+		const input = JSON.stringify({ command: "sd close my-task" });
+		const env = { ...process.env } as Record<string, string>;
+		env.OVERSTORY_AGENT_NAME = "lead-x";
+		env.OVERSTORY_TASK_ID = "my-task";
+		if (opts.worktreePath === null) {
+			delete env.OVERSTORY_WORKTREE_PATH;
+		} else if (opts.worktreePath !== undefined) {
+			env.OVERSTORY_WORKTREE_PATH = opts.worktreePath;
+		}
+		if (opts.projectRoot === null) {
+			delete env.OVERSTORY_PROJECT_ROOT;
+		} else if (opts.projectRoot !== undefined) {
+			env.OVERSTORY_PROJECT_ROOT = opts.projectRoot;
+		}
+		const proc = Bun.spawn(["sh", "-c", script], {
+			cwd: repoDir,
+			stdin: new TextEncoder().encode(input),
+			stdout: "pipe",
+			stderr: "pipe",
+			env,
+		});
+		const stdout = await new Response(proc.stdout).text();
+		const exitCode = await proc.exited;
+		return { stdout, exitCode };
+	}
+
+	test("blocks sd close when lead's branch is not yet merged into default target", async () => {
+		await runGitInDir(repoDir, ["checkout", "-b", "overstory/lead-x/my-task"]);
+		await commitFile(repoDir, "lead-work.txt", "lead's work");
+		// HEAD has a commit not present on `main` — lead is unmerged.
+		const r = await runMergeGate({
+			worktreePath: repoDir,
+			projectRoot: repoDir,
+		});
+		const parsed = JSON.parse(r.stdout.trim());
+		expect(parsed.decision).toBe("block");
+		expect(parsed.reason).toContain("not yet merged");
+	});
+
+	test("allows sd close once the lead's branch has been merged into the default target", async () => {
+		await runGitInDir(repoDir, ["checkout", "-b", "overstory/lead-x/my-task"]);
+		await commitFile(repoDir, "lead-work.txt", "lead's work");
+		// Coordinator merges lead's branch into main.
+		await runGitInDir(repoDir, ["checkout", defaultBranch]);
+		await runGitInDir(repoDir, [
+			"merge",
+			"--no-ff",
+			"overstory/lead-x/my-task",
+			"-m",
+			"merge lead-x",
+		]);
+		// Lead's worktree HEAD remains on its branch tip; target now contains it.
+		await runGitInDir(repoDir, ["checkout", "overstory/lead-x/my-task"]);
+		const r = await runMergeGate({
+			worktreePath: repoDir,
+			projectRoot: repoDir,
+		});
+		expect(r.stdout.trim()).toBe("");
+	});
+
+	test("uses session-branch.txt as the merge target when present", async () => {
+		// Create a non-default branch as the merge target.
+		await runGitInDir(repoDir, ["checkout", "-b", "release/v1"]);
+		await runGitInDir(repoDir, ["checkout", defaultBranch]);
+		await Bun.write(join(repoDir, ".overstory", "session-branch.txt"), "release/v1\n");
+		// Lead works on its own branch with new commits; release/v1 has none of them.
+		await runGitInDir(repoDir, ["checkout", "-b", "overstory/lead-x/my-task"]);
+		await commitFile(repoDir, "lead-work.txt", "lead's work");
+		const r = await runMergeGate({
+			worktreePath: repoDir,
+			projectRoot: repoDir,
+		});
+		const parsed = JSON.parse(r.stdout.trim());
+		expect(parsed.decision).toBe("block");
+		expect(parsed.reason).toContain("not yet merged");
+
+		// Now merge into release/v1; close should be allowed.
+		await runGitInDir(repoDir, ["checkout", "release/v1"]);
+		await runGitInDir(repoDir, [
+			"merge",
+			"--no-ff",
+			"overstory/lead-x/my-task",
+			"-m",
+			"merge lead-x to v1",
+		]);
+		await runGitInDir(repoDir, ["checkout", "overstory/lead-x/my-task"]);
+		const r2 = await runMergeGate({
+			worktreePath: repoDir,
+			projectRoot: repoDir,
+		});
+		expect(r2.stdout.trim()).toBe("");
+	});
+
+	test("fails open (allows close) when OVERSTORY_WORKTREE_PATH is unset", async () => {
+		await runGitInDir(repoDir, ["checkout", "-b", "overstory/lead-x/my-task"]);
+		await commitFile(repoDir, "lead-work.txt", "lead's work");
+		// HEAD is unmerged, but no worktree path means we can't verify — fail open.
+		const r = await runMergeGate({
+			worktreePath: null,
+			projectRoot: repoDir,
+		});
+		expect(r.stdout.trim()).toBe("");
+	});
+
+	test("fails open when the resolved target ref does not exist locally", async () => {
+		await Bun.write(
+			join(repoDir, ".overstory", "session-branch.txt"),
+			"branch-that-does-not-exist\n",
+		);
+		await runGitInDir(repoDir, ["checkout", "-b", "overstory/lead-x/my-task"]);
+		await commitFile(repoDir, "lead-work.txt", "lead's work");
+		const r = await runMergeGate({
+			worktreePath: repoDir,
+			projectRoot: repoDir,
+		});
+		// Target ref unresolvable → can't make a definitive claim → don't block.
+		expect(r.stdout.trim()).toBe("");
+	});
+
+	test("falls back to 'main' when session-branch.txt is missing", async () => {
+		// No session-branch.txt — must fall back to "main".
+		await runGitInDir(repoDir, ["checkout", "-b", "overstory/lead-x/my-task"]);
+		await commitFile(repoDir, "lead-work.txt", "lead's work");
+		// Merge into main.
+		await runGitInDir(repoDir, ["checkout", defaultBranch]);
+		await runGitInDir(repoDir, [
+			"merge",
+			"--no-ff",
+			"overstory/lead-x/my-task",
+			"-m",
+			"merge lead-x",
+		]);
+		await runGitInDir(repoDir, ["checkout", "overstory/lead-x/my-task"]);
+		const r = await runMergeGate({
+			worktreePath: repoDir,
+			projectRoot: repoDir,
+		});
+		expect(r.stdout.trim()).toBe("");
 	});
 });
 
