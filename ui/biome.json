@@ -1,5 +1,9 @@
 {
+	"root": false,
 	"$schema": "https://biomejs.dev/schemas/2.3.15/schema.json",
+	"files": {
+		"includes": ["**", "!dist", "!node_modules"]
+	},
 	"formatter": {
 		"enabled": true,
 		"indentStyle": "tab",

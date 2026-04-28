@@ -1,4 +1,4 @@
- // Claude Code runtime adapter for overstory's AgentRuntime interface.
+// Claude Code runtime adapter for overstory's AgentRuntime interface.
 // Pure extraction — no new behavior. All implementation delegates to existing code.
 // Phase 0: file exists and compiles. Callers are not rewired until Phase 2.
 
