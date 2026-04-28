@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-04-28
+
+### Added
+
+#### Headless Claude Code Execution
+- **`buildDirectSpawn(opts)` on `ClaudeRuntime`** (`src/runtimes/claude.ts`) — returns the exact argv to launch Claude Code as a non-tmux subprocess: `-p --output-format stream-json --input-format stream-json --verbose --strict-mcp-config --permission-mode bypassPermissions [--model <m>]`. Claude Code reads `.claude/CLAUDE.md` from cwd; the initial prompt is the caller's responsibility (overstory-46ad)
+- **`async *parseEvents(stream, opts)` on `ClaudeRuntime`** — parses NDJSON stream-json stdout into typed `AgentEvent` objects (`assistant_message`, `tool_use`, `tool_result`, `status`, `result`). Adjacent assistant text deltas are coalesced into a single `assistant_message` per batch with configurable `flushIntervalMs` (default 500ms) and `flushSizeBytes` (default 4096). Skips malformed lines and unknown message types
+- **Eager `session_id` pinning** — `parseEvents` now invokes `opts.onSessionId` synchronously on the first event carrying a non-empty `sessionId`. New `claudeSessionId` field on `AgentSession` and `claude_session_id` column on the sessions table (with `migrateAddClaudeSessionId` migration), populated via the new `SessionStore.updateClaudeSessionId(agentName, sessionId)` API (overstory-2916)
+- **Text-event batching** — assistant text deltas batch on a timer, size cap, any non-text event, or stream end — whichever comes first. Caller errors in `onSessionId` are swallowed so a buggy consumer cannot crash the parser (overstory-d854)
+- **`ov sling --headless` / `--no-headless` flag** — per-spawn override for the headless path on Claude Code agents. `--headless` is rejected with a `ValidationError` for runtimes without `buildDirectSpawn` (Pi, Codex, Cursor) and is a no-op for runtimes that statically declare `headless: true` (Sapling) (overstory-268b)
+- **`runtime.claudeHeadlessByDefault` config knob** — flips the project-wide default to headless for Claude Code; explicit per-spawn flags still win
+- **`resolveUseHeadless(runtime, flag, config)`** in `src/commands/sling.ts` — single source of truth for the headless decision with explicit precedence: static `runtime.headless` → flag → config knob → tmux default
+
+#### Merge-Ready Enforcement Gate
+- **`buildLeadCloseGateScript()`** in `src/agents/hooks-deployer.ts` — PreToolUse guard that blocks `sd close <task-id>` / `bd close <task-id>` when a lead tries to close its own task without first sending the required `merge_ready` mail to the coordinator. Counts merge_ready outgoing vs worker_done incoming via `ov mail list --json` and grep, requiring ≥ 1 merge_ready and ≥ 1 merge_ready per worker_done (overstory-3899)
+- **Branch-merged ancestor check** — gate also verifies the lead's worktree HEAD is reachable from the merge target (`session-branch.txt` > `main`) via `git merge-base --is-ancestor`. Fails open when worktree path is unset or the target ref is missing locally; otherwise blocks with a descriptive reason instructing the lead to wait for the coordinator to merge (overstory-da9b)
+- **`agents/lead.md` updated** — new `MISSING_MERGE_READY_BEFORE_CLOSE` named failure documents the gate and recovery path. Lead now uses YAML frontmatter and may run `{{TRACKER_CLI}} create` directly (worktree-issue restriction lifted)
+
+#### Concurrent Merge Race Prevention
+- **`src/merge/lock.ts`** — sentinel-file lock at `.overstory/merge-{sanitized-target}.lock` prevents parallel `ov merge` runs against the same canonical branch from producing transient false-conflict reports. Atomic creation via `writeFileSync(..., { flag: "wx" })`, holder PID checked on collision: live → fail fast, dead → take over
+- **`MergeLockHandle`, `mergeLockPath()`, `sanitizeBranchForFilename()`** exported helpers; lock is wired into `mergeCommand` with try/finally release (overstory-9610)
+
+#### UI Scaffold
+- **`ui/`** — new web UI package scaffolded with React 19 + Tailwind v4 + shadcn/ui components (`Layout`, `Home`, `badge`, `card`, `scroll-area`, `tabs`)
+- **Bun-native bundler** — `ui/build.ts` replaces Vite for both dev and production builds; tighter integration with the rest of the Bun-only toolchain
+- **`docs/direction-ui-and-ipc.md`** — direction document outlining UI architecture and IPC plans
+
+### Fixed
+
+- **`ov sling` startup failures now mark the agent as `zombie`** rather than `completed` so the watchdog detects them. `completed` is a terminal success state the watchdog skips entirely (overstory-c40e)
+- **Lead does not auto-complete on per-turn `Stop` hook** — leads now stay alive across turns instead of being torn down on each `Stop` event
+- **`ov doctor` exit-code race eliminated** — `process.exitCode` is no longer set asynchronously inside `doctorCommand`, removing a window where parallel test commands inherited a stale failing exit code
+- **`bun test` clears `process.exitCode` to 0 in `afterEach`** — prevents a single failure from leaking a non-zero exit code through the rest of the suite
+- **Test isolation for `OVERSTORY_PROJECT_ROOT`** — `bun test` no longer inherits an external `OVERSTORY_PROJECT_ROOT` from the parent shell, which previously corrupted multi-DB tests (overstory-6d42)
+- **`agents/coordinator.md` merge step** — wording realigned with the new `merge_ready` contract: coordinators must process `merge_ready` mails before closing tasks (overstory-ad45)
+
+### Changed
+
+- **`agents/lead.md` rewritten** — adopts YAML frontmatter (`name: lead`), simplifies dispatch override handling, lifts the worktree-create-issue restriction, and removes the duplicate role-compression block (kept in overlay generation)
+- **Mulch onboarding refreshed to v2** — `CLAUDE.md` mulch section updated to reflect the v2 record/learn/sync workflow
+- **Biome config cleanup** — `chore(lint)` flattens nested config and resolves leftover format/keys violations
+- **Maintenance cadence documented** — `CONTRIBUTING.md` now states the part-time review cadence (2-week PR batches, 30-day inactivity close)
+
+### Testing
+
+- 3815 tests across 115 files (8907 `expect()` calls)
+- New: `src/merge/lock.test.ts` (149 lines — sentinel acquire/release, stale-PID takeover, branch-name sanitization)
+- New: `src/runtimes/__fixtures__/claude-stream-fixture.ts` (canonical stream-json fixture for parser tests)
+- New: `src/test-setup.ts` + `src/test-setup.test.ts` (shared global test setup; `OVERSTORY_PROJECT_ROOT` isolation; `process.exitCode` reset)
+- Expanded: `src/runtimes/claude.test.ts` (+668 lines — `buildDirectSpawn`, `parseEvents`, text batching, eager session_id pinning, error swallowing)
+- Expanded: `src/agents/hooks-deployer.test.ts` (+505 lines — `buildLeadCloseGateScript` merge_ready / worker_done counting, ancestor checks, fail-open paths)
+- Expanded: `src/commands/merge.test.ts` (+113 lines — concurrent merge lock acquisition, stale-lock takeover, error path cleanup)
+- Expanded: `src/commands/sling.test.ts` (+54 lines — `resolveUseHeadless` precedence, `--headless` validation, headless spawn path)
+- Expanded: `src/sessions/store.test.ts` (+40 lines — `claude_session_id` column migration, update API)
+- Expanded: `src/mail/store.test.ts`, `src/commands/log.test.ts`, `src/commands/mail.test.ts`, `src/commands/stop.test.ts`, `src/watchdog/daemon.test.ts`
+
 ## [0.9.4] - 2026-04-07
 
 ### Fixed
@@ -1724,7 +1780,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Biome configuration for formatting and linting
 - TypeScript strict mode with `noUncheckedIndexedAccess`
 
-[Unreleased]: https://github.com/jayminwest/overstory/compare/v0.9.4...HEAD
+[Unreleased]: https://github.com/jayminwest/overstory/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/jayminwest/overstory/compare/v0.9.4...v0.10.0
 [0.9.4]: https://github.com/jayminwest/overstory/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/jayminwest/overstory/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/jayminwest/overstory/compare/v0.9.1...v0.9.2

@@ -89,7 +89,7 @@ Every command supports `--json` where noted. Global flags: `-q`/`--quiet`, `--ti
 | Command | Description |
 |---------|-------------|
 | `ov init` | Initialize `.overstory/` and bootstrap os-eco tools (`--yes`, `--name`, `--tools`, `--skip-mulch`, `--skip-seeds`, `--skip-canopy`, `--skip-onboard`, `--json`) |
-| `ov sling <task-id>` | Spawn a worker agent (`--capability`, `--name`, `--spec`, `--files`, `--parent`, `--depth`, `--skip-scout`, `--skip-review`, `--max-agents`, `--dispatch-max-agents`, `--skip-task-check`, `--no-scout-check`, `--runtime`, `--base-branch`, `--profile`, `--json`) |
+| `ov sling <task-id>` | Spawn a worker agent (`--capability`, `--name`, `--spec`, `--files`, `--parent`, `--depth`, `--skip-scout`, `--skip-review`, `--max-agents`, `--dispatch-max-agents`, `--skip-task-check`, `--no-scout-check`, `--runtime`, `--base-branch`, `--profile`, `--headless`, `--no-headless`, `--json`) |
 | `ov stop <agent-name>` | Terminate a running agent (`--clean-worktree`, `--json`) |
 | `ov prime` | Load context for orchestrator/agent (`--agent`, `--compact`) |
 | `ov spec write <task-id>` | Write a task specification (`--body`) |
@@ -189,6 +189,8 @@ Overstory uses instruction overlays and tool-call guards to turn agent sessions 
 ### Runtime Adapters
 
 Overstory is runtime-agnostic. The `AgentRuntime` interface (`src/runtimes/types.ts`) defines the contract — each adapter handles spawning, config deployment, guard enforcement, readiness detection, and transcript parsing for its runtime. Set the default in `config.yaml` or override per-agent with `ov sling --runtime <name>`.
+
+Claude Code agents can run in **tmux mode** (the default — operator can `tmux attach` to watch and steer mid-session) or **headless mode** (`-p --output-format stream-json` subprocess, NDJSON events parsed by `ClaudeRuntime.parseEvents`, ideal for UI-driven swarms or CI environments without tmux/DBus). Toggle per-spawn with `ov sling --headless` / `--no-headless`, or set `runtime.claudeHeadlessByDefault: true` in `.overstory/config.yaml` for project-wide headless. Sapling is statically headless; Pi, Codex, and Cursor have no `buildDirectSpawn` and reject `--headless`.
 
 | Runtime | CLI | Guard Mechanism | Stability |
 |---------|-----|-----------------|-----------|
@@ -301,7 +303,7 @@ overstory/
       guard-rules.ts              Shared guard constants (tool lists, bash patterns)
     worktree/                     Git worktree + tmux management
     mail/                         SQLite mail system (typed protocol, broadcast)
-    merge/                        FIFO queue + conflict resolution
+    merge/                        FIFO queue + conflict resolution + sentinel-file lock
     watchdog/                     Tiered health monitoring (daemon, triage, health)
     logging/                      Multi-format logger + sanitizer + reporter + color control + shared theme/format
     metrics/                      SQLite metrics + pricing + transcript parsing

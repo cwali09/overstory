@@ -170,6 +170,7 @@ overstory/                        # This repo (the overstory tool itself)
     merge/
       queue.ts                    # FIFO merge queue
       resolver.ts                 # Tiered conflict resolution (4 tiers)
+      lock.ts                     # Sentinel-file lock (prevents concurrent ov merge against same target)
     watchdog/
       daemon.ts                   # Tier 0: mechanical process monitoring
       triage.ts                   # Tier 1: AI-assisted failure classification
@@ -329,6 +330,8 @@ ov sling <task-id>              Spawn a worker agent
   --runtime <name>                       Runtime adapter (default: config or claude)
   --base-branch <branch>                 Base branch for worktree creation (default: current HEAD)
   --profile <name>                       Named profile for canopy prompt overlay
+  --headless                             Force headless (non-tmux) spawn for runtimes with buildDirectSpawn (Claude Code)
+  --no-headless                          Force tmux spawn (overrides runtime.claudeHeadlessByDefault)
   --json                                 JSON output
 
 ov discover                      Discover a brownfield codebase via coordinator-driven scout swarm
