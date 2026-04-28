@@ -11,12 +11,15 @@
  * support by calling the exported register*() helpers — no changes to this file needed.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Command } from "commander";
 import { loadConfig } from "../config.ts";
-import { jsonError, jsonOutput } from "../json.ts";
+import { ValidationError } from "../errors.ts";
+import { apiJson, jsonError, jsonOutput } from "../json.ts";
 import { printError, printSuccess } from "../logging/color.ts";
+import { type RestApiDeps, registerRestApi } from "./serve/rest.ts";
+import { serveStatic } from "./serve/static.ts";
 import { installBroadcaster } from "./serve/ws.ts";
 
 // === Extensible route registry ===
@@ -76,7 +79,20 @@ export interface ServeDeps {
 	_loadConfig?: typeof loadConfig;
 	_existsSync?: typeof existsSync;
 	_readFile?: (path: string) => Promise<Uint8Array>;
+	/** REST store deps. Pass false to skip REST registration (test isolation). */
+	_restDeps?: RestApiDeps | false;
 }
+
+/** Read the package version once at module load to avoid circular imports with index.ts. */
+const _pkgVersion = (): string => {
+	try {
+		const raw = readFileSync(new URL("../../package.json", import.meta.url).pathname, "utf-8");
+		return (JSON.parse(raw) as { version: string }).version;
+	} catch {
+		return "unknown";
+	}
+};
+const SERVE_VERSION = _pkgVersion();
 
 /**
  * Build and return a Bun server instance without binding to process signals.
@@ -95,6 +111,12 @@ export async function createServeServer(
 	const port = opts.port ?? 8080;
 	const hostname = opts.host ?? "127.0.0.1";
 	const uiDistPath = join(config.project.root, "ui", "dist");
+	const startTime = performance.now();
+
+	// Register REST handlers before Bun.serve() — skip only for test isolation
+	if (deps._restDeps !== false) {
+		registerRestApi({ _projectRoot: config.project.root, ...(deps._restDeps ?? {}) });
+	}
 
 	const server = Bun.serve({
 		port,
@@ -105,9 +127,10 @@ export async function createServeServer(
 
 			// /healthz — always handled here
 			if (path === "/healthz") {
-				return new Response(JSON.stringify({ success: true, command: "serve", status: "ok" }), {
-					status: 200,
-					headers: { "Content-Type": "application/json" },
+				return apiJson({
+					status: "ok",
+					uptimeMs: Math.round(performance.now() - startTime),
+					version: SERVE_VERSION,
 				});
 			}
 
@@ -157,7 +180,7 @@ export async function createServeServer(
 				);
 			}
 
-			// Static files from ui/dist/ with SPA fallback
+			// Static files from ui/dist/ with SPA fallback and path-traversal guard
 			return serveStatic(path, uiDistPath, _exists);
 		},
 		websocket: {
@@ -174,39 +197,6 @@ export async function createServeServer(
 	});
 
 	return server;
-}
-
-/**
- * Serve a static file from uiDistPath, falling back to index.html for SPA routes.
- */
-async function serveStatic(
-	path: string,
-	uiDistPath: string,
-	_exists: typeof existsSync,
-): Promise<Response> {
-	if (!_exists(uiDistPath)) {
-		return new Response("UI not built — run the UI build first", { status: 503 });
-	}
-
-	// Normalise path: strip leading slash, default to index.html
-	const stripped = path.replace(/^\//, "") || "index.html";
-	const filePath = join(uiDistPath, stripped);
-
-	const file = Bun.file(filePath);
-	if (await file.exists()) {
-		return new Response(file);
-	}
-
-	// SPA fallback: any unknown path → index.html
-	const indexPath = join(uiDistPath, "index.html");
-	const indexFile = Bun.file(indexPath);
-	if (await indexFile.exists()) {
-		return new Response(indexFile, {
-			headers: { "Content-Type": "text/html; charset=utf-8" },
-		});
-	}
-
-	return new Response("Not found", { status: 404 });
 }
 
 /**
@@ -265,17 +255,13 @@ export function createServeCommand(): Command {
 		.option("--json", "Output startup info as JSON")
 		.action(async (opts: { port?: string; host?: string; json?: boolean }) => {
 			const port = opts.port !== undefined ? Number.parseInt(opts.port, 10) : 8080;
-			if (Number.isNaN(port) || port < 1 || port > 65535) {
-				if (opts.json) {
-					jsonError("serve", `Invalid port: ${opts.port}`);
-				} else {
-					printError(`Invalid port: ${opts.port}`);
-				}
-				process.exitCode = 1;
-				return;
-			}
-
 			try {
+				if (Number.isNaN(port) || port < 1 || port > 65535) {
+					throw new ValidationError(`Invalid port: ${opts.port ?? "undefined"}`, {
+						field: "port",
+						value: opts.port,
+					});
+				}
 				await runServe({ port, host: opts.host ?? "127.0.0.1", json: opts.json });
 			} catch (err: unknown) {
 				const msg = err instanceof Error ? err.message : String(err);

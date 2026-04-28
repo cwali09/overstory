@@ -45,10 +45,10 @@ describe("createServeServer", () => {
 		const origCwd = process.cwd;
 		// Swap cwd so loadConfig resolves to tempDir
 		process.cwd = () => tempDir;
-		const server = await createServeServer({
-			port: opts.port ?? 0,
-			host: opts.host ?? "127.0.0.1",
-		});
+		const server = await createServeServer(
+			{ port: opts.port ?? 0, host: opts.host ?? "127.0.0.1" },
+			{ _restDeps: false },
+		);
 		process.cwd = origCwd;
 		servers.push(server);
 		return server;
@@ -58,9 +58,9 @@ describe("createServeServer", () => {
 		const server = await startServer();
 		const res = await fetch(`http://127.0.0.1:${server.port}/healthz`);
 		expect(res.status).toBe(200);
-		const body = (await res.json()) as Record<string, unknown>;
+		const body = (await res.json()) as { success: boolean; data?: { status: string } };
 		expect(body.success).toBe(true);
-		expect(body.status).toBe("ok");
+		expect(body.data?.status).toBe("ok");
 	});
 
 	test("/healthz Content-Type is application/json", async () => {
@@ -116,6 +116,9 @@ describe("createServeServer", () => {
 		const server = await startServer();
 		const res = await fetch(`http://127.0.0.1:${server.port}/`);
 		expect(res.status).toBe(503);
+		// Now returns JSON envelope instead of plain text
+		const ct = res.headers.get("content-type");
+		expect(ct).toContain("application/json");
 	});
 
 	test("static files: serves index.html when present", async () => {
