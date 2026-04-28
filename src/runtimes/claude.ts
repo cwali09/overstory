@@ -9,7 +9,9 @@ import { estimateCost } from "../metrics/pricing.ts";
 import { parseTranscriptUsage } from "../metrics/transcript.ts";
 import type { ResolvedModel } from "../types.ts";
 import type {
+	AgentEvent,
 	AgentRuntime,
+	DirectSpawnOpts,
 	HooksDef,
 	OverlayContent,
 	ReadyState,
@@ -215,6 +217,170 @@ export class ClaudeRuntime implements AgentRuntime {
 			};
 		} catch {
 			return null;
+		}
+	}
+
+	/**
+	 * Build the argv array for Bun.spawn() to launch a Claude Code agent in headless mode.
+	 *
+	 * Returns the exact flags Multica uses for headless Claude Code sessions:
+	 * `-p --output-format stream-json --input-format stream-json --verbose
+	 * --strict-mcp-config --permission-mode bypassPermissions [--model <m>]`
+	 *
+	 * Claude Code reads `.claude/CLAUDE.md` from cwd automatically — do NOT
+	 * pass `--append-system-prompt` or consume `opts.instructionPath`.
+	 * The initial stdin prompt is the caller's responsibility.
+	 *
+	 * @param opts - Direct spawn options; only `model` is consumed
+	 * @returns Argv array for Bun.spawn — do not shell-interpolate
+	 */
+	buildDirectSpawn(opts: DirectSpawnOpts): string[] {
+		const argv = [
+			"claude",
+			"-p",
+			"--output-format",
+			"stream-json",
+			"--input-format",
+			"stream-json",
+			"--verbose",
+			"--strict-mcp-config",
+			"--permission-mode",
+			"bypassPermissions",
+		];
+		if (opts.model !== undefined) {
+			argv.push("--model", opts.model);
+		}
+		return argv;
+	}
+
+	/**
+	 * Parse stream-json stdout from a Claude Code headless subprocess into typed AgentEvent objects.
+	 *
+	 * Reads the ReadableStream from Bun.spawn() stdout, buffers partial lines,
+	 * and yields a typed AgentEvent for each complete JSON line. Malformed lines
+	 * and unknown message types are silently skipped.
+	 *
+	 * Event mapping (Claude stream-json → AgentEvent):
+	 * - assistant/text     → { type: "assistant_message", text, model?, usage? }
+	 * - assistant/tool_use → { type: "tool_use", callId, name, input }
+	 * - assistant/thinking → (skipped)
+	 * - user/tool_result   → { type: "tool_result", toolUseId, content }
+	 * - system             → { type: "status", sessionId, subtype }
+	 * - result             → { type: "result", sessionId, result, isError, durationMs, numTurns }
+	 *
+	 * @param stream - ReadableStream<Uint8Array> from Bun.spawn stdout
+	 * @yields Parsed AgentEvent objects in emission order
+	 */
+	async *parseEvents(stream: ReadableStream<Uint8Array>): AsyncIterable<AgentEvent> {
+		const reader = stream.getReader();
+		const decoder = new TextDecoder();
+		let buffer = "";
+
+		const emitLine = (line: string): AgentEvent[] => {
+			const trimmed = line.trim();
+			if (!trimmed) return [];
+
+			let msg: Record<string, unknown>;
+			try {
+				msg = JSON.parse(trimmed) as Record<string, unknown>;
+			} catch {
+				return [];
+			}
+
+			const timestamp = new Date().toISOString();
+			const events: AgentEvent[] = [];
+
+			if (msg.type === "assistant") {
+				const message =
+					typeof msg.message === "object" && msg.message !== null
+						? (msg.message as Record<string, unknown>)
+						: null;
+				if (!message) return events;
+				const content = Array.isArray(message.content) ? message.content : [];
+				const model = typeof message.model === "string" ? message.model : undefined;
+				const usage = message.usage !== undefined ? message.usage : undefined;
+
+				for (const block of content) {
+					if (typeof block !== "object" || block === null) continue;
+					const b = block as Record<string, unknown>;
+					if (b.type === "text") {
+						const event: AgentEvent = { type: "assistant_message", timestamp, text: b.text };
+						if (model !== undefined) event.model = model;
+						if (usage !== undefined) event.usage = usage;
+						events.push(event);
+					} else if (b.type === "tool_use") {
+						events.push({
+							type: "tool_use",
+							timestamp,
+							callId: b.id,
+							name: b.name,
+							input: b.input,
+						});
+					}
+					// thinking and other block types → skip
+				}
+			} else if (msg.type === "user") {
+				const message =
+					typeof msg.message === "object" && msg.message !== null
+						? (msg.message as Record<string, unknown>)
+						: null;
+				if (!message) return events;
+				const content = Array.isArray(message.content) ? message.content : [];
+
+				for (const block of content) {
+					if (typeof block !== "object" || block === null) continue;
+					const b = block as Record<string, unknown>;
+					if (b.type === "tool_result") {
+						events.push({
+							type: "tool_result",
+							timestamp,
+							toolUseId: b.tool_use_id,
+							content: b.content,
+						});
+					}
+				}
+			} else if (msg.type === "system") {
+				events.push({ type: "status", timestamp, sessionId: msg.session_id, subtype: msg.subtype });
+			} else if (msg.type === "result") {
+				events.push({
+					type: "result",
+					timestamp,
+					sessionId: msg.session_id,
+					result: msg.result,
+					isError: msg.is_error,
+					durationMs: msg.duration_ms,
+					numTurns: msg.num_turns,
+				});
+			}
+
+			return events;
+		};
+
+		try {
+			while (true) {
+				const chunk = await reader.read();
+				if (chunk.done) break;
+
+				buffer += decoder.decode(chunk.value, { stream: true });
+				const lines = buffer.split("\n");
+				// Last element is either empty or an incomplete line — keep in buffer.
+				buffer = lines.pop() ?? "";
+
+				for (const line of lines) {
+					for (const event of emitLine(line)) {
+						yield event;
+					}
+				}
+			}
+
+			// Flush remaining buffer on clean stream end (no trailing newline).
+			if (buffer.trim()) {
+				for (const event of emitLine(buffer)) {
+					yield event;
+				}
+			}
+		} finally {
+			reader.releaseLock();
 		}
 	}
 
