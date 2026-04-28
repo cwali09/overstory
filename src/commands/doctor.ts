@@ -16,6 +16,7 @@ import { checkEcosystem } from "../doctor/ecosystem.ts";
 import { checkLogs } from "../doctor/logs.ts";
 import { checkMergeQueue } from "../doctor/merge-queue.ts";
 import { checkProviders } from "../doctor/providers.ts";
+import { checkServe } from "../doctor/serve.ts";
 import { checkStructure } from "../doctor/structure.ts";
 import type { DoctorCategory, DoctorCheck, DoctorCheckFn } from "../doctor/types.ts";
 import { checkVersion } from "../doctor/version.ts";
@@ -39,6 +40,7 @@ const ALL_CHECKS: Array<{ category: DoctorCategory; fn: DoctorCheckFn }> = [
 	{ category: "ecosystem", fn: checkEcosystem },
 	{ category: "providers", fn: checkProviders },
 	{ category: "watchdog", fn: checkWatchdog },
+	{ category: "serve", fn: checkServe },
 ];
 
 /**
@@ -241,7 +243,7 @@ function buildDoctorCommand(
 		.option("--fix", "Attempt to auto-fix issues")
 		.addHelpText(
 			"after",
-			"\nCategories: dependencies, structure, config, databases, consistency, agents, merge, logs, version, ecosystem, providers, watchdog",
+			"\nCategories: dependencies, structure, config, databases, consistency, agents, merge, logs, version, ecosystem, providers, watchdog, serve",
 		)
 		.action(async (opts: DoctorActionOpts) => {
 			onResult(await runDoctorChecks(opts, checkRunners));

@@ -36,6 +36,7 @@ import { createOrchestratorCommand } from "./commands/orchestrator.ts";
 import { primeCommand } from "./commands/prime.ts";
 import { createReplayCommand } from "./commands/replay.ts";
 import { createRunCommand } from "./commands/run.ts";
+import { createServeCommand } from "./commands/serve.ts";
 import { slingCommand } from "./commands/sling.ts";
 import { specWriteCommand } from "./commands/spec.ts";
 import { createStatusCommand } from "./commands/status.ts";
@@ -103,6 +104,7 @@ const COMMANDS = [
 	"run",
 	"costs",
 	"metrics",
+	"serve",
 	"update",
 	"upgrade",
 	"completions",
@@ -246,6 +248,7 @@ program.addCommand(createWorktreeCommand());
 program.addCommand(createLogCommand());
 program.addCommand(createWatchCommand());
 program.addCommand(createGroupCommand());
+program.addCommand(createServeCommand());
 program.addCommand(createCompletionsCommand());
 
 // Unmigrated commands — passthrough pattern
