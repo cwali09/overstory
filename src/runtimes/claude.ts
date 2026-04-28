@@ -260,8 +260,12 @@ export class ClaudeRuntime implements AgentRuntime {
 	 * and yields a typed AgentEvent for each complete JSON line. Malformed lines
 	 * and unknown message types are silently skipped.
 	 *
+	 * Adjacent assistant_text deltas are coalesced into a single assistant_message
+	 * event using a batching window. The batch flushes on timer expiry, size cap,
+	 * any non-text event, or stream end — whichever comes first.
+	 *
 	 * Event mapping (Claude stream-json → AgentEvent):
-	 * - assistant/text     → { type: "assistant_message", text, model?, usage? }
+	 * - assistant/text     → buffered; emitted as one assistant_message per batch
 	 * - assistant/tool_use → { type: "tool_use", callId, name, input }
 	 * - assistant/thinking → (skipped)
 	 * - user/tool_result   → { type: "tool_result", toolUseId, content }
@@ -269,33 +273,68 @@ export class ClaudeRuntime implements AgentRuntime {
 	 * - result             → { type: "result", sessionId, result, isError, durationMs, numTurns }
 	 *
 	 * @param stream - ReadableStream<Uint8Array> from Bun.spawn stdout
+	 * @param opts.flushIntervalMs - Max ms to buffer text before emitting (default 500)
+	 * @param opts.flushSizeBytes  - Max UTF-8 byte size of a text batch (default 4096)
 	 * @yields Parsed AgentEvent objects in emission order
 	 */
-	async *parseEvents(stream: ReadableStream<Uint8Array>): AsyncIterable<AgentEvent> {
+	async *parseEvents(
+		stream: ReadableStream<Uint8Array>,
+		opts?: { flushIntervalMs?: number; flushSizeBytes?: number },
+	): AsyncIterable<AgentEvent> {
+		const flushIntervalMs = opts?.flushIntervalMs ?? 500;
+		const flushSizeBytes = opts?.flushSizeBytes ?? 4096;
+
 		const reader = stream.getReader();
 		const decoder = new TextDecoder();
 		let buffer = "";
 
-		const emitLine = (line: string): AgentEvent[] => {
+		// Batch state for adjacent assistant_text deltas.
+		let pendingText: string[] = [];
+		let pendingByteSize = 0;
+		let pendingStartTs: string | null = null;
+		let pendingModel: string | undefined;
+		let pendingUsage: unknown;
+
+		// Returns batched assistant_message event and resets state; null when buffer is empty.
+		const flushText = (): AgentEvent | null => {
+			if (pendingText.length === 0) return null;
+			const text = pendingText.join("");
+			const event: AgentEvent = {
+				type: "assistant_message",
+				timestamp: pendingStartTs ?? new Date().toISOString(),
+				text,
+			};
+			if (pendingModel !== undefined) event.model = pendingModel;
+			if (pendingUsage !== undefined) event.usage = pendingUsage;
+			pendingText = [];
+			pendingByteSize = 0;
+			pendingStartTs = null;
+			pendingModel = undefined;
+			pendingUsage = undefined;
+			return event;
+		};
+
+		// Sync generator: parses one JSON line, yielding AgentEvents in order.
+		// Mutates batch state via closure — do not call concurrently.
+		function* processLine(line: string): Generator<AgentEvent> {
 			const trimmed = line.trim();
-			if (!trimmed) return [];
+			if (!trimmed) return;
 
 			let msg: Record<string, unknown>;
 			try {
 				msg = JSON.parse(trimmed) as Record<string, unknown>;
 			} catch {
-				return [];
+				return;
 			}
 
 			const timestamp = new Date().toISOString();
-			const events: AgentEvent[] = [];
 
 			if (msg.type === "assistant") {
 				const message =
 					typeof msg.message === "object" && msg.message !== null
 						? (msg.message as Record<string, unknown>)
 						: null;
-				if (!message) return events;
+				if (!message) return;
 				const content = Array.isArray(message.content) ? message.content : [];
 				const model = typeof message.model === "string" ? message.model : undefined;
 				const usage = message.usage !== undefined ? message.usage : undefined;
@@ -304,18 +343,40 @@ export class ClaudeRuntime implements AgentRuntime {
 					if (typeof block !== "object" || block === null) continue;
 					const b = block as Record<string, unknown>;
 					if (b.type === "text") {
-						const event: AgentEvent = { type: "assistant_message", timestamp, text: b.text };
-						if (model !== undefined) event.model = model;
-						if (usage !== undefined) event.usage = usage;
-						events.push(event);
+						const text = typeof b.text === "string" ? b.text : String(b.text);
+						const textByteSize = new TextEncoder().encode(text).byteLength;
+
+						// Size-cap: if appending would exceed cap and buffer is non-empty, flush first.
+						if (pendingByteSize > 0 && pendingByteSize + textByteSize > flushSizeBytes) {
+							const ev = flushText();
+							if (ev) yield ev;
+						}
+
+						// Record the start-of-batch timestamp on the first fragment.
+						if (pendingByteSize === 0) pendingStartTs = timestamp;
+
+						pendingText.push(text);
+						pendingByteSize += textByteSize;
+						// Latest contributing message wins for model/usage.
+						if (model !== undefined) pendingModel = model;
+						if (usage !== undefined) pendingUsage = usage;
+
+						// Immediate flush when a single fragment meets or exceeds the size cap.
+						if (pendingByteSize >= flushSizeBytes) {
+							const ev = flushText();
+							if (ev) yield ev;
+						}
 					} else if (b.type === "tool_use") {
-						events.push({
+						// Non-text block: flush pending text first to preserve in-order delivery.
+						const ev = flushText();
+						if (ev) yield ev;
+						yield {
 							type: "tool_use",
 							timestamp,
 							callId: b.id,
 							name: b.name,
 							input: b.input,
-						});
+						};
 					}
 					// thinking and other block types → skip
 				}
@@ -324,25 +385,32 @@ export class ClaudeRuntime implements AgentRuntime {
 					typeof msg.message === "object" && msg.message !== null
 						? (msg.message as Record<string, unknown>)
 						: null;
-				if (!message) return events;
+				if (!message) return;
 				const content = Array.isArray(message.content) ? message.content : [];
+
+				const flushEv = flushText();
+				if (flushEv) yield flushEv;
 
 				for (const block of content) {
 					if (typeof block !== "object" || block === null) continue;
 					const b = block as Record<string, unknown>;
 					if (b.type === "tool_result") {
-						events.push({
+						yield {
 							type: "tool_result",
 							timestamp,
 							toolUseId: b.tool_use_id,
 							content: b.content,
-						});
+						};
 					}
 				}
 			} else if (msg.type === "system") {
-				events.push({ type: "status", timestamp, sessionId: msg.session_id, subtype: msg.subtype });
+				const flushEv = flushText();
+				if (flushEv) yield flushEv;
+				yield { type: "status", timestamp, sessionId: msg.session_id, subtype: msg.subtype };
 			} else if (msg.type === "result") {
-				events.push({
+				const flushEv = flushText();
+				if (flushEv) yield flushEv;
+				yield {
 					type: "result",
 					timestamp,
 					sessionId: msg.session_id,
@@ -350,35 +418,79 @@ export class ClaudeRuntime implements AgentRuntime {
 					isError: msg.is_error,
 					durationMs: msg.duration_ms,
 					numTurns: msg.num_turns,
-				});
+				};
 			}
-
-			return events;
-		};
+		}
 
 		try {
+			// Use the inferred return type of reader.read() to stay compatible with
+			// both the standard Web Streams API and Bun's slightly divergent typings.
+			type ReadResult = Awaited<ReturnType<typeof reader.read>>;
+			type Race = { kind: "read"; result: ReadResult } | { kind: "timeout" };
+
+			let readPromise = reader.read();
+
 			while (true) {
-				const chunk = await reader.read();
-				if (chunk.done) break;
+				if (pendingText.length > 0 && pendingStartTs !== null) {
+					// Race the next read chunk against the flush timer.
+					const elapsed = Date.now() - new Date(pendingStartTs).getTime();
+					const remaining = Math.max(0, flushIntervalMs - elapsed);
 
-				buffer += decoder.decode(chunk.value, { stream: true });
-				const lines = buffer.split("\n");
-				// Last element is either empty or an incomplete line — keep in buffer.
-				buffer = lines.pop() ?? "";
+					let timerId: ReturnType<typeof setTimeout> | undefined;
+					const wrappedRead: Promise<Race> = readPromise.then((result) => ({
+						kind: "read" as const,
+						result,
+					}));
+					const wrappedTimer = new Promise<Race>((resolve) => {
+						timerId = setTimeout(() => resolve({ kind: "timeout" }), remaining);
+					});
 
-				for (const line of lines) {
-					for (const event of emitLine(line)) {
-						yield event;
+					const winner = await Promise.race([wrappedRead, wrappedTimer]);
+					if (timerId !== undefined) clearTimeout(timerId);
+
+					if (winner.kind === "timeout") {
+						const ev = flushText();
+						if (ev) yield ev;
+						continue; // readPromise still in flight — re-enter loop without refreshing
 					}
+
+					const result = winner.result;
+					if (result.done) break;
+					buffer += decoder.decode(result.value, { stream: true });
+					const lines = buffer.split("\n");
+					buffer = lines.pop() ?? "";
+					for (const line of lines) {
+						for (const event of processLine(line)) {
+							yield event;
+						}
+					}
+					readPromise = reader.read();
+				} else {
+					const result = await readPromise;
+					if (result.done) break;
+					buffer += decoder.decode(result.value, { stream: true });
+					const lines = buffer.split("\n");
+					// Last element is either empty or an incomplete line — keep in buffer.
+					buffer = lines.pop() ?? "";
+					for (const line of lines) {
+						for (const event of processLine(line)) {
+							yield event;
+						}
+					}
+					readPromise = reader.read();
 				}
 			}
 
 			// Flush remaining buffer on clean stream end (no trailing newline).
 			if (buffer.trim()) {
-				for (const event of emitLine(buffer)) {
+				for (const event of processLine(buffer)) {
 					yield event;
 				}
 			}
+
+			// Drain any remaining buffered text after the read loop exits.
+			const finalEv = flushText();
+			if (finalEv) yield finalEv;
 		} finally {
 			reader.releaseLock();
 		}
