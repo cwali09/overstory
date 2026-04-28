@@ -998,8 +998,23 @@
 			"overstory-d854",
 			"overstory-268b"
 		],
-		"status": "active",
+		"status": "completed",
 		"createdAt": "2026-04-28T16:09:38.851Z",
+		"completedAt": "2026-04-28T17:54:17.676Z"
+	},
+	{
+		"id": "group-5b487137",
+		"name": "phase1-ui-shell-pipeline",
+		"memberIssueIds": [
+			"overstory-ba9c",
+			"overstory-9e8b",
+			"overstory-22ac",
+			"overstory-6c4f",
+			"overstory-fc04",
+			"overstory-0ddb"
+		],
+		"status": "active",
+		"createdAt": "2026-04-28T20:56:04.355Z",
 		"completedAt": null
 	}
 ]
