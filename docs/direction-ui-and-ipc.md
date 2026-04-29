@@ -133,6 +133,13 @@ session-introspection primitives makes the case.
 
 ## Operator surface: the UI is primary, tmux is opt-in
 
+> **Status (2026-04-29):** Shipped. Phase 3 landed (overstory-1c32 / 32cd
+> / 1f66) and `ov init` now writes `runtime.claudeHeadlessByDefault: true`
+> for new projects (overstory-caec at commit a55fce3). Onboarding surfaces
+> were brought into alignment in overstory-9cee. Legacy projects keep tmux
+> on upgrade until they edit config — the resolver fallback in `sling.ts`
+> is unchanged.
+
 The architectural diagram puts the browser on top for a reason. As
 Phase 1 + 2 land, **the web UI is the operator's primary window into
 a swarm**, and `tmux attach` becomes the niche escape hatch. This is

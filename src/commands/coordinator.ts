@@ -629,6 +629,7 @@ export async function startCoordinatorSession(
 			process.stdout.write(`  Tmux:    ${tmuxSession}\n`);
 			process.stdout.write(`  Root:    ${projectRoot}\n`);
 			process.stdout.write(`  PID:     ${pid}\n`);
+			printHint("Open the UI: `ov serve` then http://localhost:8080 — primary operator surface");
 		}
 
 		if (shouldAttach) {

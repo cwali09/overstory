@@ -1,6 +1,6 @@
 # Overstory
 
-Project-agnostic swarm system for Claude Code agent orchestration. Overstory turns a single Claude Code session into a multi-agent team by spawning worker agents in git worktrees via tmux, coordinating them through a custom SQLite mail system, and merging their work back with tiered conflict resolution.
+Project-agnostic swarm system for Claude Code agent orchestration. Overstory turns a single Claude Code session into a multi-agent team by spawning worker agents in isolated git worktrees, coordinating them through a custom SQLite mail system, and merging their work back with tiered conflict resolution. New projects ship with Claude workers headless by default — `ov serve`'s web UI is the primary operator surface, and `tmux attach` is the opt-in escape hatch for live steering.
 
 **Your Claude Code session IS the orchestrator.** There is no separate daemon. CLAUDE.md + hooks + the `ov` CLI provide everything.
 
@@ -42,21 +42,27 @@ Orchestrator (your Claude Code session)
 
 Depth limit is configurable (default 2). Prevents runaway spawning.
 
-### Runtime Modes: tmux vs headless (Claude Code)
+### Runtime Modes: headless vs tmux (Claude Code)
 
-Claude Code agents can run in two modes:
+Claude Code agents can run in two modes. **Headless is the shipped default for new
+projects** (`ov init` writes `runtime.claudeHeadlessByDefault: true`); tmux is the
+escape hatch for live attach. Legacy projects on upgrade keep tmux until they
+edit their config — the resolver fallback at `src/commands/sling.ts:499` is
+unchanged.
 
 | Mode | Spawn path | I/O | Visibility | When to use |
 |------|------------|-----|------------|-------------|
-| **tmux** (default) | `src/worktree/tmux.ts` -> `tmux new-session` | Pane content (capture-pane) | `tmux attach` from operator shell | Default. Operator wants to attach and watch / steer mid-session. Hooks fire normally. |
-| **headless** | `src/worktree/process.ts` -> `Bun.spawn` | NDJSON stream-json on stdout, redirected to log file | `ov logs --agent <name>` and `ov feed` | UI-driven swarms (`ov serve`), CI environments, containers without tmux/DBus, when structured per-tool-call event fidelity is needed. |
+| **headless** (default, new projects) | `src/worktree/process.ts` -> `Bun.spawn` | NDJSON stream-json on stdout, redirected to log file | `ov serve` web UI (primary), `ov logs --agent <name>`, `ov feed` | Default. UI-driven swarms, CI environments, containers without tmux/DBus, structured per-tool-call event fidelity. |
+| **tmux** (opt-in escape hatch) | `src/worktree/tmux.ts` -> `tmux new-session` | Pane content (capture-pane) | `tmux attach` from operator shell | Operator wants to attach and watch / steer a single agent mid-session. Legacy projects pre-default-flip. |
 
 Selection is per-spawn:
 
-- `ov sling --headless <task-id>` — force headless for this spawn.
-- `ov sling --no-headless <task-id>` — force tmux (overrides the config knob).
-- Otherwise, the project default applies: `runtime.claudeHeadlessByDefault: true` in
-  `.overstory/config.yaml` flips the default to headless. When unset, the default is tmux.
+- `ov sling --no-headless <task-id>` — force tmux for this spawn (override the new default).
+- `ov sling --headless <task-id>` — force headless (override a project still set to tmux).
+- Otherwise, the project default applies: `runtime.claudeHeadlessByDefault` in
+  `.overstory/config.yaml` controls the default (`true` for new projects). When the
+  field is absent — the case for legacy projects upgrading from earlier overstory
+  versions — the resolver falls back to tmux.
 
 The flag is a no-op for runtimes that statically declare `headless: true` (e.g. Sapling).
 Passing `--headless` with a runtime that has no `buildDirectSpawn` (Codex, Pi, Cursor) is

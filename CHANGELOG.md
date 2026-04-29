@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ov init` now writes `runtime.claudeHeadlessByDefault: true`** into the freshly-generated `.overstory/config.yaml` (`src/commands/init.ts`). New projects spawn Claude agents headless out of the box; the web UI (`ov serve`, then open http://localhost:8080) is the primary operator surface and tmux is opt-in via `ov sling --no-headless` (overstory-caec).
 - **Existing projects keep tmux behavior on upgrade.** The fallback default in `resolveUseHeadless` (`src/commands/sling.ts`) remains `false`, so projects that already have a `config.yaml` without the field continue to spawn into tmux until they explicitly add `runtime.claudeHeadlessByDefault: true` (or pass `--headless` per spawn). To opt in: edit `.overstory/config.yaml` and add the field under `runtime:`, or re-run `ov init --yes` to regenerate the config from the new template.
 - **CLAUDE.md template updated** (`templates/CLAUDE.md.tmpl`) to describe the headless-default + UI-first workflow with `--no-headless` documented as the tmux escape hatch.
+- **Onboarding docs sweep** to align with the default flip (overstory-9cee):
+  - `README.md` — Quick Start now leads with `ov coordinator start && ov serve` (http://localhost:8080); architecture and runtime-adapters paragraphs invert the tmux/headless framing; `tmux` is documented as an optional install dependency for live attach.
+  - `CLAUDE.md` — Runtime Modes section reorders headless first as the shipped default for new projects, with tmux flagged as the opt-in escape hatch and the legacy-fallback behavior called out explicitly.
+  - `ov init` post-init hint and `ov coordinator start` post-start hint both point operators at `ov serve` first.
+  - `templates/CLAUDE.md.tmpl` — adds a top-level "web UI is your primary operator surface" paragraph and reframes "Checking Status" to lead with the UI before listing the CLI alternatives.
+  - `docs/direction-ui-and-ipc.md` — "Operator surface" section gains a shipped-status callout (Phase 3 + default flip both landed).
 
 ## [0.10.1] - 2026-04-28
 
