@@ -4,7 +4,8 @@ import { useParams } from "react-router-dom";
 
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { useAutoScroll } from "@/lib/use-auto-scroll";
+import { useScrollFade } from "@/lib/use-scroll-fade";
 import { type Frame, type StoredEvent, useWebSocket, type WsStatus } from "@/lib/ws";
 import { EventRow } from "@/routes/agent/EventRow";
 
@@ -133,35 +134,11 @@ export function AgentDetail() {
 			.sort((a, b) => a.id - b.id);
 	}, [query.data, liveEvents]);
 
-	// ── Auto-scroll ──────────────────────────────────────────────────────────
+	// ── Auto-scroll + scroll fade on the timeline viewport ──────────────────
 
-	const containerRef = useRef<HTMLDivElement>(null);
-	const isAtBottomRef = useRef(true);
-
-	const getViewport = useCallback((): HTMLElement | null => {
-		return (
-			containerRef.current?.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]') ?? null
-		);
-	}, []);
-
-	// Track whether the user has scrolled away from the bottom.
-	useEffect(() => {
-		const viewport = getViewport();
-		if (!viewport) return;
-		const onScroll = () => {
-			const { scrollHeight, scrollTop, clientHeight } = viewport;
-			isAtBottomRef.current = scrollHeight - scrollTop - clientHeight < 50;
-		};
-		viewport.addEventListener("scroll", onScroll, { passive: true });
-		return () => viewport.removeEventListener("scroll", onScroll);
-	}, [getViewport]);
-
-	// Scroll to bottom when new events arrive (if user is already at bottom).
-	useEffect(() => {
-		if (!isAtBottomRef.current || allEvents.length === 0) return;
-		const viewport = getViewport();
-		if (viewport) viewport.scrollTop = viewport.scrollHeight;
-	}, [allEvents, getViewport]);
+	const viewportRef = useRef<HTMLDivElement>(null);
+	useAutoScroll(viewportRef, { dependency: allEvents.length });
+	useScrollFade(viewportRef);
 
 	// ── Render ───────────────────────────────────────────────────────────────
 
@@ -176,25 +153,28 @@ export function AgentDetail() {
 			</div>
 
 			{/* Timeline */}
-			<div ref={containerRef} className="flex-1 min-h-0">
-				<ScrollArea className="h-full">
-					<div className="px-4 py-4 flex flex-col gap-2">
-						{query.isLoading && <p className="text-sm text-muted-foreground">Loading...</p>}
-						{!query.isLoading && allEvents.length === 0 && (
-							<Card>
-								<CardHeader>
-									<CardTitle className="text-sm font-normal text-muted-foreground">
-										No events for {agentLabel}
-									</CardTitle>
-								</CardHeader>
-								<CardContent />
-							</Card>
-						)}
-						{allEvents.map((event) => (
-							<EventRow key={event.id} event={event} />
-						))}
-					</div>
-				</ScrollArea>
+			<div ref={viewportRef} className="flex-1 min-h-0 overflow-auto">
+				<div className="px-4 py-4 flex flex-col gap-2">
+					{query.isLoading && <p className="text-sm text-muted-foreground">Loading...</p>}
+					{!query.isLoading && allEvents.length === 0 && (
+						<Card>
+							<CardHeader>
+								<CardTitle className="text-sm font-normal text-muted-foreground">
+									No events for {agentLabel}
+								</CardTitle>
+							</CardHeader>
+							<CardContent>
+								<p className="text-sm text-muted-foreground">
+									Nudge the agent to wake it up:{" "}
+									<code className="font-mono">{`ov nudge ${agentLabel} "Status check"`}</code>
+								</p>
+							</CardContent>
+						</Card>
+					)}
+					{allEvents.map((event) => (
+						<EventRow key={event.id} event={event} />
+					))}
+				</div>
 			</div>
 		</div>
 	);

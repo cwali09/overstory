@@ -1,5 +1,7 @@
+import { useRef } from "react";
+
 import { Badge } from "@/components/ui/badge";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { useScrollFade } from "@/lib/use-scroll-fade";
 import type { MailMessage, MailMessageType } from "./types.ts";
 
 function typeVariant(type: MailMessageType): "default" | "secondary" | "destructive" | "outline" {
@@ -25,16 +27,26 @@ interface ThreadListProps {
 }
 
 export function ThreadList({ items, selectedId, onSelect }: ThreadListProps) {
+	const viewportRef = useRef<HTMLDivElement>(null);
+	useScrollFade(viewportRef);
+
 	if (items.length === 0) {
 		return (
-			<div className="flex-1 flex items-center justify-center p-6 text-sm text-muted-foreground">
-				No messages
+			<div className="flex-1 flex flex-col items-center justify-center gap-2 p-6 text-sm text-muted-foreground text-center">
+				<p>No messages.</p>
+				<p>
+					Send one with{" "}
+					<code className="font-mono">
+						{`ov mail send --to coordinator --subject "..." --body "..." --type status`}
+					</code>
+					.
+				</p>
 			</div>
 		);
 	}
 
 	return (
-		<ScrollArea className="flex-1">
+		<div ref={viewportRef} className="flex-1 min-h-0 overflow-auto">
 			<div className="flex flex-col">
 				{items.map((msg) => (
 					<button
@@ -59,6 +71,6 @@ export function ThreadList({ items, selectedId, onSelect }: ThreadListProps) {
 					</button>
 				))}
 			</div>
-		</ScrollArea>
+		</div>
 	);
 }
