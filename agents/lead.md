@@ -304,4 +304,4 @@ Good decomposition follows these principles:
    A PreToolUse harness gate (overstory-3899) blocks `{{TRACKER_CLI}} close <your-task-id>` until your sent-`merge_ready` count is ≥ your received-`worker_done` count AND ≥ 1. If the close is blocked, send the missing `merge_ready` mail(s), then retry.
 6. Run `{{TRACKER_CLI}} close <task-id> --reason "<summary of what was accomplished>"`.
 7. Send a `status` mail to the coordinator confirming all subtasks are complete.
-8. Stop. Do not spawn additional workers after closing.
+8. **Self-terminate:** run `ov stop "$OVERSTORY_AGENT_NAME"`. This is your clean exit primitive: headless leads otherwise stay alive indefinitely because the mail-injection FIFO never closes their stdin, and tmux leads keep their pane open until manually killed. The detached exit watcher catches your process death and finalizes session state, so any race between `ov stop`'s kill and its own state write is handled. Do NOT spawn additional workers, send more mail, or run other commands after this — the lead's job is over once the merge_ready signals are sent and the task is closed.
