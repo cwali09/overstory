@@ -131,6 +131,44 @@ So the order is: stream-json subprocess first, prove the UI on top,
 then migrate Claude specifically to the SDK once the UI's hunger for
 session-introspection primitives makes the case.
 
+## Operator surface: the UI is primary, tmux is opt-in
+
+The architectural diagram puts the browser on top for a reason. As
+Phase 1 + 2 land, **the web UI is the operator's primary window into
+a swarm**, and `tmux attach` becomes the niche escape hatch. This is
+a direction call, not a side effect of removing tmux assumptions from
+subsystems.
+
+The hierarchy:
+
+- **Default.** New projects spawn Claude agents headless. Operators
+  open `ov serve` and watch the swarm in the UI.
+- **Opt-in.** `--no-headless` per-spawn (or `claudeHeadlessByDefault:
+  false` in config) keeps tmux available for "I want to attach right
+  now." The tmux runtime, watchdog tmux path, and `ov coordinator
+  output` continue to work — they're not removed, just no longer the
+  default operator path.
+
+Why commit to this hierarchy:
+
+- **One mental model.** Today operators think in terms of "which tmux
+  pane is this agent in." That model breaks at 25+ workers, in CI, in
+  a container, or with non-Claude runtimes (already always headless).
+  The UI is the only model that works in all four cases.
+- **Honest fidelity.** Pane-scraping is lossy; stream-json is not. The
+  UI sees the agent better than `tmux attach` ever could.
+- **Steering by attach is already broken.** Mid-session steering via
+  the pane is fragile in tmux (stdin polling under streaming). The
+  UI's *abort + fork + resume* path is a stronger primitive and works
+  for headless agents too.
+
+The flip is gated on Phase 3 landing. Until watchdog, nudge, and the
+hooks-equivalent are runtime-aware, shipping headless-by-default
+would silently regress the watchdog and nudge surfaces for everyone.
+The default flip is a small code change at
+`src/commands/sling.ts:499` plus the `ov init` template; it's the
+timing — not the diff — that matters.
+
 ## Phases
 
 ### Phase 1 — UI shell over the existing event surface
