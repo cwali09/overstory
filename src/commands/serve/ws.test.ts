@@ -313,6 +313,26 @@ describe("WebSocket broadcaster", () => {
 		expect(_getRoomCount()).toBe(0);
 	});
 
+	// Test 6b: ?mail=true upgrades and an inserted mail row is delivered to subscriber
+	test("?mail=true upgrades and inserted mail row is delivered to subscriber", async () => {
+		const server = await startWithBroadcaster();
+		const ws = new WebSocket(`ws://127.0.0.1:${server.port}/ws?mail=true`);
+		wsConnections.push(ws);
+		await waitForOpen(ws);
+
+		const pending = collectMessages(ws, 1, 1000);
+		insertMail(mailDb, "msg-mail-room-1", "alpha", "beta");
+
+		const msgs = await pending;
+		expect(msgs.length).toBe(1);
+		const frame = msgs[0] as Record<string, unknown>;
+		expect(frame.type).toBe("mail");
+		const payload = frame.payload as Record<string, unknown>;
+		const message = payload.message as Record<string, unknown>;
+		expect(message.from).toBe("alpha");
+		expect(message.to).toBe("beta");
+	});
+
 	// Test 7: /ws with no run/agent → 400 JSON
 	test("/ws with no run or agent query param returns 400 JSON envelope", async () => {
 		const server = await startWithBroadcaster();

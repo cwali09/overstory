@@ -7,6 +7,7 @@
 		"dev": "bun --hot ./index.html",
 		"build": "tsc -b && bun run build.ts",
 		"preview": "bun ./dist/index.html",
+		"lint": "biome check .",
 		"typecheck": "tsc -b --noEmit"
 	},
 	"dependencies": {
@@ -19,6 +20,7 @@
 		"lucide-react": "^0.446.0",
 		"react": "^19.0.0",
 		"react-dom": "^19.0.0",
+		"react-resizable-panels": "^2.1.0",
 		"react-router-dom": "^7.0.0",
 		"tailwind-merge": "^2.5.2"
 	},

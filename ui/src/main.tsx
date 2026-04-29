@@ -5,6 +5,7 @@ import { BrowserRouter, Route, Routes } from "react-router-dom";
 
 import { Layout } from "@/components/Layout";
 import { Home } from "@/routes/Home";
+import { Mail } from "@/routes/Mail";
 
 import "./index.css";
 
@@ -26,6 +27,7 @@ createRoot(rootEl).render(
 				<Routes>
 					<Route path="/" element={<Layout />}>
 						<Route index element={<Home />} />
+						<Route path="mail" element={<Mail />} />
 						<Route
 							path="*"
 							element={
