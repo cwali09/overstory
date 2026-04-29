@@ -9,8 +9,8 @@
  * management already exist in src/worktree/tmux.ts — not duplicated here.
  */
 
-import { registerHeadlessConnection } from "../runtimes/connections.ts";
 import { AgentError } from "../errors.ts";
+import { registerHeadlessConnection } from "../runtimes/connections.ts";
 
 /**
  * Handle to a spawned headless agent subprocess.
