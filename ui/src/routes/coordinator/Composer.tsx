@@ -1,4 +1,4 @@
-import { type KeyboardEvent, useMemo, useRef, useState } from "react";
+import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 
@@ -49,14 +49,29 @@ export function Composer({
 	isPending,
 }: ComposerProps) {
 	const taRef = useRef<HTMLTextAreaElement>(null);
+	const containerRef = useRef<HTMLDivElement>(null);
 	const [askArmed, setAskArmed] = useState<{ subject: string } | null>(null);
+	const [dismissed, setDismissed] = useState(false);
 
-	const showSlashMenu = useMemo(() => isSlashOnly(value), [value]);
+	const showSlashMenu = useMemo(() => isSlashOnly(value) && !dismissed, [value, dismissed]);
 	const slashEntries = useMemo(() => matchSlashEntries(value), [value]);
+
+	useEffect(() => {
+		if (!showSlashMenu) return;
+		function handleMouseDown(e: MouseEvent) {
+			if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+				setDismissed(true);
+			}
+		}
+		document.addEventListener("mousedown", handleMouseDown);
+		return () => document.removeEventListener("mousedown", handleMouseDown);
+	}, [showSlashMenu]);
 
 	function dispatchSubmit(opts: { askMode: boolean }) {
 		const trimmed = value.trim();
 		if (trimmed === "") return;
+
+		setDismissed(true);
 
 		// Built-in slash commands fire immediately on submit.
 		if (
@@ -99,6 +114,11 @@ export function Composer({
 	}
 
 	function handleKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+		if (e.key === "Escape" && showSlashMenu) {
+			e.preventDefault();
+			setDismissed(true);
+			return;
+		}
 		const meta = e.metaKey || e.ctrlKey;
 		if (e.key === "Enter" && meta) {
 			e.preventDefault();
@@ -110,10 +130,12 @@ export function Composer({
 		if (entry.cmd === "/ask") {
 			onChange("/ask ");
 			taRef.current?.focus();
+			setDismissed(true);
 			return;
 		}
 		onSlashCommand(entry.cmd);
 		onChange("");
+		setDismissed(true);
 	}
 
 	function handleSendClick() {
@@ -129,7 +151,7 @@ export function Composer({
 		: 'Type a message. "/" for commands. Cmd+Enter to send.';
 
 	return (
-		<div className="border-t bg-background shrink-0">
+		<div ref={containerRef} className="border-t bg-background shrink-0">
 			{askArmed !== null && (
 				<div className="px-4 pt-2 text-xs text-muted-foreground flex items-center gap-2">
 					<span>Ask mode armed:</span>
@@ -151,6 +173,7 @@ export function Composer({
 								key={e.cmd}
 								type="button"
 								className="w-full text-left px-3 py-2 hover:bg-accent flex items-baseline gap-3 first:rounded-t-md last:rounded-b-md"
+								onMouseDown={(ev) => ev.preventDefault()}
 								onClick={() => handleSelectSlash(e)}
 							>
 								<span className="font-mono text-xs">{e.cmd}</span>
@@ -162,8 +185,12 @@ export function Composer({
 				<textarea
 					ref={taRef}
 					value={value}
-					onChange={(e) => onChange(e.target.value)}
+					onChange={(e) => {
+						onChange(e.target.value);
+						setDismissed(false);
+					}}
 					onKeyDown={handleKeyDown}
+					onBlur={() => setDismissed(true)}
 					placeholder={placeholder}
 					rows={2}
 					className="flex-1 resize-none border rounded-md px-3 py-2 text-sm bg-background focus:outline-none focus:ring-2 focus:ring-ring"
