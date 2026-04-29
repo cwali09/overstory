@@ -79,11 +79,7 @@ describe("buildInitialHeadlessPrompt", () => {
 	});
 
 	test("omits dispatchMail when undefined", () => {
-		const result = buildInitialHeadlessPrompt(
-			"## Prime Context",
-			undefined,
-			"Begin.",
-		);
+		const result = buildInitialHeadlessPrompt("## Prime Context", undefined, "Begin.");
 		const parsed = JSON.parse(result.trim());
 		const text: string = parsed.message.content[0].text;
 		expect(text).toContain("Prime Context");

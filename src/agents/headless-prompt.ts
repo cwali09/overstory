@@ -60,6 +60,9 @@ export function formatMailSection(
 ): string {
 	if (messages.length === 0) return "";
 	return messages
-		.map((m) => `[MAIL] From: ${m.from} | Subject: ${m.subject} | Priority: ${m.priority}\n\n${m.body}`)
+		.map(
+			(m) =>
+				`[MAIL] From: ${m.from} | Subject: ${m.subject} | Priority: ${m.priority}\n\n${m.body}`,
+		)
 		.join("\n\n---\n\n");
 }

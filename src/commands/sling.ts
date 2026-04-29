@@ -21,8 +21,8 @@
 import { mkdirSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { createIdentity, loadIdentity } from "../agents/identity.ts";
 import { buildInitialHeadlessPrompt, formatMailSection } from "../agents/headless-prompt.ts";
+import { createIdentity, loadIdentity } from "../agents/identity.ts";
 import { createManifestLoader, resolveModel } from "../agents/manifest.ts";
 import { writeOverlay } from "../agents/overlay.ts";
 import { createCanopyClient } from "../canopy/client.ts";
@@ -1019,7 +1019,11 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 							depth,
 							instructionPath: runtime.instructionPath,
 						});
-						const initialPrompt = buildInitialHeadlessPrompt(mulchExpertise, mailSection || undefined, beacon);
+						const initialPrompt = buildInitialHeadlessPrompt(
+							mulchExpertise,
+							mailSection || undefined,
+							beacon,
+						);
 						await headlessProc.stdin.write(initialPrompt);
 					} finally {
 						pendingMailStore.close();
