@@ -14,10 +14,12 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Command } from "commander";
+import { startMailInjectionLoop } from "../agents/headless-mail-injector.ts";
 import { loadConfig } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import { apiJson, jsonError, jsonOutput } from "../json.ts";
 import { printError, printSuccess } from "../logging/color.ts";
+import { addHeadlessConnectionListener } from "../runtimes/connections.ts";
 import { type RestApiDeps, registerRestApi } from "./serve/rest.ts";
 import { serveStatic } from "./serve/static.ts";
 import { installBroadcaster } from "./serve/ws.ts";
@@ -200,6 +202,42 @@ export async function createServeServer(
 }
 
 /**
+ * Install a per-agent mail injection loop driven by the headless connection registry.
+ *
+ * Replaces the UserPromptSubmit hook for headless Claude agents: every registered
+ * HeadlessClaudeConnection gets a polling loop that writes new mail as stream-json
+ * user turns to the agent's stdin. Loops are torn down when the agent is removed
+ * or when the returned stop function is called (server shutdown).
+ *
+ * Subscribing via addHeadlessConnectionListener() also catches up on agents that
+ * were registered before runServe() started — they receive an immediate onRegister.
+ */
+export function installMailInjectors(mailDbPath: string): () => void {
+	const activeLoops = new Map<string, () => void>();
+
+	const removeListener = addHeadlessConnectionListener({
+		onRegister(agentName, stdin) {
+			activeLoops.get(agentName)?.();
+			const stop = startMailInjectionLoop(agentName, stdin, mailDbPath);
+			activeLoops.set(agentName, stop);
+		},
+		onRemove(agentName) {
+			const stop = activeLoops.get(agentName);
+			if (stop) {
+				stop();
+				activeLoops.delete(agentName);
+			}
+		},
+	});
+
+	return function stopMailInjectors(): void {
+		removeListener();
+		for (const stop of activeLoops.values()) stop();
+		activeLoops.clear();
+	};
+}
+
+/**
  * Core implementation for `ov serve`. Starts the server and blocks until
  * SIGINT/SIGTERM. Handles graceful shutdown.
  */
@@ -207,11 +245,17 @@ export async function runServe(opts: ServeOptions, deps: ServeDeps = {}): Promis
 	const _cfg = deps._loadConfig ?? loadConfig;
 	const config = await _cfg(process.cwd());
 
+	const mailDbPath = join(config.project.root, ".overstory", "mail.db");
+
 	// Install broadcaster before Bun.serve so handler is ready for the first request
 	const stopBroadcaster = installBroadcaster({
 		eventsDbPath: join(config.project.root, ".overstory", "events.db"),
-		mailDbPath: join(config.project.root, ".overstory", "mail.db"),
+		mailDbPath,
 	});
+
+	// Install per-agent mail injection loops (UserPromptSubmit hook equivalent
+	// for headless Claude agents). Driven by the headless connection registry.
+	const stopMailInjectors = installMailInjectors(mailDbPath);
 
 	const server = await createServeServer(opts, deps);
 
@@ -232,6 +276,7 @@ export async function runServe(opts: ServeOptions, deps: ServeDeps = {}): Promis
 		if (!useJson) {
 			process.stdout.write("\nShutting down...\n");
 		}
+		stopMailInjectors();
 		stopBroadcaster();
 		server.stop(true);
 		process.exit(0);

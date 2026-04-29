@@ -10,7 +10,23 @@
 import { HeadlessClaudeConnection } from "./headless-connection.ts";
 import type { RuntimeConnection } from "./types.ts";
 
+/** Writable handle exposed to headless connection listeners. */
+export type HeadlessStdin = { write(data: string | Uint8Array): number | Promise<number> };
+
+/**
+ * Listener fired on headless Claude connection lifecycle events.
+ * Fires only for connections created via registerHeadlessConnection() — Sapling
+ * and other RuntimeConnection registrants via setConnection() are not surfaced
+ * because their wire format differs from headless Claude's stream-json stdin.
+ */
+export interface HeadlessConnectionListener {
+	onRegister(agentName: string, stdin: HeadlessStdin): void;
+	onRemove?(agentName: string): void;
+}
+
 const connections = new Map<string, RuntimeConnection>();
+const headlessAgents = new Map<string, HeadlessStdin>();
+const listeners = new Set<HeadlessConnectionListener>();
 
 /** Retrieve the active connection for a given agent, or undefined if none. */
 export function getConnection(agentName: string): RuntimeConnection | undefined {
@@ -28,10 +44,14 @@ export function setConnection(agentName: string, conn: RuntimeConnection): void 
  */
 export function removeConnection(agentName: string): void {
 	const conn = connections.get(agentName);
-	if (conn) {
-		conn.close();
-		connections.delete(agentName);
+	if (!conn) return;
+	if (headlessAgents.delete(agentName)) {
+		for (const listener of listeners) {
+			listener.onRemove?.(agentName);
+		}
 	}
+	conn.close();
+	connections.delete(agentName);
 }
 
 /**
@@ -50,9 +70,34 @@ export function removeConnection(agentName: string): void {
  */
 export function registerHeadlessConnection(
 	agentName: string,
-	proc: { pid: number; stdin: { write(data: string | Uint8Array): number | Promise<number> } },
+	proc: { pid: number; stdin: HeadlessStdin },
 ): RuntimeConnection {
 	const conn = new HeadlessClaudeConnection(proc.pid, proc.stdin);
 	setConnection(agentName, conn);
+	headlessAgents.set(agentName, proc.stdin);
+	for (const listener of listeners) {
+		listener.onRegister(agentName, proc.stdin);
+	}
 	return conn;
+}
+
+/**
+ * Subscribe to headless Claude connection lifecycle events.
+ *
+ * onRegister fires synchronously after registerHeadlessConnection() inserts the
+ * connection. onRemove fires synchronously before removeConnection() closes the
+ * connection. Listeners observing already-registered agents at subscribe time
+ * receive an immediate onRegister for each — this lets late subscribers (e.g.,
+ * runServe started after agents already exist) catch up without rescanning.
+ *
+ * @returns Unsubscribe function that removes this listener.
+ */
+export function addHeadlessConnectionListener(listener: HeadlessConnectionListener): () => void {
+	listeners.add(listener);
+	for (const [agentName, stdin] of headlessAgents) {
+		listener.onRegister(agentName, stdin);
+	}
+	return () => {
+		listeners.delete(listener);
+	};
 }

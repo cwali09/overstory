@@ -2,9 +2,17 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createMailClient } from "../mail/client.ts";
+import { createMailStore } from "../mail/store.ts";
+import {
+	getConnection,
+	registerHeadlessConnection,
+	removeConnection,
+} from "../runtimes/connections.ts";
 import {
 	_resetHandlers,
 	createServeServer,
+	installMailInjectors,
 	registerApiHandler,
 	registerWsHandler,
 } from "./serve.ts";
@@ -168,4 +176,162 @@ describe("createServeServer", () => {
 		// No assertion needed — just validates it doesn't throw
 		// The ws handler is exercised via integration if ws tests are added
 	});
+});
+
+describe("installMailInjectors", () => {
+	let tempDir: string;
+	let mailDbPath: string;
+	const usedAgents: string[] = [];
+	const stoppers: Array<() => void> = [];
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(join(tmpdir(), "overstory-mailinject-test-"));
+		mailDbPath = join(tempDir, "mail.db");
+	});
+
+	afterEach(() => {
+		for (const stop of stoppers.splice(0)) stop();
+		for (const name of usedAgents.splice(0)) {
+			if (getConnection(name)) removeConnection(name);
+		}
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	test("delivers mid-session mail to a registered headless agent's stdin", async () => {
+		const writes: string[] = [];
+		const stdin = {
+			write(data: string | Uint8Array) {
+				writes.push(typeof data === "string" ? data : new TextDecoder().decode(data));
+				return Promise.resolve(0);
+			},
+		};
+
+		const stop = installMailInjectors(mailDbPath);
+		stoppers.push(stop);
+
+		usedAgents.push("inject-agent-1");
+		registerHeadlessConnection("inject-agent-1", { pid: 99999, stdin });
+
+		// Send mail after the connection is registered
+		const store = createMailStore(mailDbPath);
+		const client = createMailClient(store);
+		client.send({
+			from: "coordinator",
+			to: "inject-agent-1",
+			subject: "mid-session",
+			body: "Please pivot to task X.",
+			type: "dispatch",
+			priority: "normal",
+		});
+		store.close();
+
+		// Wait for the default 2000ms poll. Use 2200ms to allow for jitter.
+		await new Promise((resolve) => setTimeout(resolve, 2200));
+
+		expect(writes.length).toBeGreaterThan(0);
+		const parsed = JSON.parse(writes[0]?.trimEnd() ?? "");
+		expect(parsed.type).toBe("user");
+		const text: string = parsed.message.content[0].text;
+		expect(text).toContain("mid-session");
+		expect(text).toContain("Please pivot to task X.");
+	}, 10000);
+
+	test("stops loops on shutdown", async () => {
+		let writeCount = 0;
+		const stdin = {
+			write() {
+				writeCount++;
+				return Promise.resolve(0);
+			},
+		};
+
+		const stop = installMailInjectors(mailDbPath);
+		// Don't push to stoppers — we call it manually below
+		usedAgents.push("inject-agent-2");
+		registerHeadlessConnection("inject-agent-2", { pid: 99999, stdin });
+
+		// Send mail and wait for one delivery
+		const store = createMailStore(mailDbPath);
+		const client = createMailClient(store);
+		client.send({
+			from: "coordinator",
+			to: "inject-agent-2",
+			subject: "first",
+			body: "first batch",
+			type: "dispatch",
+			priority: "normal",
+		});
+		store.close();
+
+		await new Promise((resolve) => setTimeout(resolve, 2200));
+		const countAfterFirstWindow = writeCount;
+		expect(countAfterFirstWindow).toBeGreaterThan(0);
+
+		stop();
+
+		// Send more mail post-shutdown — should NOT be delivered
+		const store2 = createMailStore(mailDbPath);
+		const client2 = createMailClient(store2);
+		client2.send({
+			from: "coordinator",
+			to: "inject-agent-2",
+			subject: "after-stop",
+			body: "should not arrive",
+			type: "dispatch",
+			priority: "normal",
+		});
+		store2.close();
+
+		await new Promise((resolve) => setTimeout(resolve, 2200));
+		expect(writeCount).toBe(countAfterFirstWindow);
+	}, 10000);
+
+	test("stops the loop for an agent when its connection is removed", async () => {
+		let writeCount = 0;
+		const stdin = {
+			write() {
+				writeCount++;
+				return Promise.resolve(0);
+			},
+		};
+
+		const stop = installMailInjectors(mailDbPath);
+		stoppers.push(stop);
+
+		usedAgents.push("inject-agent-3");
+		registerHeadlessConnection("inject-agent-3", { pid: 99999, stdin });
+
+		const store = createMailStore(mailDbPath);
+		const client = createMailClient(store);
+		client.send({
+			from: "coordinator",
+			to: "inject-agent-3",
+			subject: "first",
+			body: "before remove",
+			type: "dispatch",
+			priority: "normal",
+		});
+		store.close();
+
+		await new Promise((resolve) => setTimeout(resolve, 2200));
+		const countAfterFirst = writeCount;
+		expect(countAfterFirst).toBeGreaterThan(0);
+
+		removeConnection("inject-agent-3");
+
+		const store2 = createMailStore(mailDbPath);
+		const client2 = createMailClient(store2);
+		client2.send({
+			from: "coordinator",
+			to: "inject-agent-3",
+			subject: "second",
+			body: "after remove",
+			type: "dispatch",
+			priority: "normal",
+		});
+		store2.close();
+
+		await new Promise((resolve) => setTimeout(resolve, 2200));
+		expect(writeCount).toBe(countAfterFirst);
+	}, 10000);
 });
