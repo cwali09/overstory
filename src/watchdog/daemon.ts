@@ -369,20 +369,44 @@ export function startDaemon(options: DaemonOptions & { intervalMs: number }): { 
 /**
  * Kill an agent using the appropriate method based on whether it is headless or TUI.
  *
- * Headless agents (tmuxSession === "" && pid !== null) are killed via PID process tree.
- * TUI agents are killed via their named tmux session (only if tmuxAlive).
+ * Prefers runtime-agnostic `conn.abort()` when a RuntimeConnection is registered.
+ * If abort() succeeds, returns immediately — no PID/tmux kill needed.
+ * If abort() throws (e.g. process already exited), falls through to the
+ * defense-in-depth path: PID kill for headless agents, tmux kill for TUI agents.
  *
- * This prevents the blast-radius bug where killSession("") with tmux prefix matching
- * would kill ALL tmux sessions when a headless agent is terminated.
+ * Headless agents without a connection (tmuxSession === "" && pid !== null) are
+ * killed via PID process tree. TUI agents are killed via their named tmux session
+ * (only if tmuxAlive). This prevents the blast-radius bug where killSession("")
+ * with tmux prefix matching would kill ALL tmux sessions.
  */
 async function killAgent(ctx: {
 	session: AgentSession;
 	tmuxAlive: boolean;
 	tmux: { killSession: (name: string) => Promise<void> };
 	process: { killTree: (pid: number) => Promise<void> };
+	getConnection: (name: string) => RuntimeConnection | undefined;
+	removeConnection: (name: string) => void;
 }): Promise<void> {
-	const { session, tmuxAlive, tmux, process: proc } = ctx;
+	const { session, tmuxAlive, tmux, process: proc, getConnection, removeConnection } = ctx;
 	const isHeadless = session.tmuxSession === "" && session.pid !== null;
+
+	// Prefer runtime-agnostic abort() when a connection is registered.
+	const conn = getConnection(session.agentName);
+	if (conn) {
+		let aborted = false;
+		try {
+			await conn.abort();
+			aborted = true;
+		} catch {
+			// abort() failure — fall through to defense-in-depth path
+		}
+		removeConnection(session.agentName);
+		if (aborted) {
+			return;
+		}
+		// abort() threw — fall through to PID/tmux kill below as defense-in-depth
+	}
+
 	if (isHeadless && session.pid !== null) {
 		try {
 			await proc.killTree(session.pid);
@@ -505,35 +529,42 @@ export async function runDaemonTick(options: DaemonOptions): Promise<void> {
 				}
 			}
 
-			// RPC health check: for headless agents with an active connection,
-			// call getState() to refresh lastActivity before evaluateHealth().
-			// This prevents false-positive stale/zombie classification for agents
-			// that are actively working but haven't updated lastActivity via hooks.
-			//
-			// For non-RPC headless agents, fall back to event-based activity detection:
-			// if events.db has a recent event from this agent within the stale window,
-			// the agent is considered active and lastActivity is refreshed.
-			if (session.tmuxSession === "" && session.pid !== null) {
-				const conn = getConn(session.agentName);
-				if (conn) {
-					try {
-						const state = await Promise.race([
-							conn.getState(),
-							new Promise<never>((_, reject) =>
-								setTimeout(() => reject(new Error("getState timed out")), 5000),
-							),
-						]);
-						if (state.status === "idle" || state.status === "working") {
-							store.updateLastActivity(session.agentName);
-							// Refresh the session object so evaluateHealth sees updated lastActivity
-							session.lastActivity = new Date().toISOString();
-						}
-					} catch {
-						// getState() failed or timed out — remove stale connection
-						removeConn(session.agentName);
+			// === Liveness check ===
+			// Prefer RuntimeConnection.getState() when a connection is registered. Fall
+			// back to tmux liveness when no connection exists. For headless agents without
+			// a connection, use event-based activity detection to refresh lastActivity.
+			const conn = getConn(session.agentName);
+			let tmuxAlive: boolean;
+
+			if (conn) {
+				try {
+					const state = await Promise.race([
+						conn.getState(),
+						new Promise<never>((_, reject) =>
+							setTimeout(() => reject(new Error("getState timed out")), 5000),
+						),
+					]);
+					// Map ConnectionState → liveness:
+					//   idle | working → alive (running)
+					//   error          → not alive (exited)
+					if (state.status === "idle" || state.status === "working") {
+						tmuxAlive = true;
+						store.updateLastActivity(session.agentName);
+						session.lastActivity = new Date().toISOString();
+					} else {
+						tmuxAlive = false;
 					}
-				} else if (eventStore) {
-					// No RPC connection — check events.db for recent activity
+				} catch {
+					// getState() failed/timed out — drop stale connection, fall back to tmux
+					removeConn(session.agentName);
+					tmuxAlive = await tmux.isSessionAlive(session.tmuxSession);
+				}
+			} else {
+				tmuxAlive = await tmux.isSessionAlive(session.tmuxSession);
+
+				// Headless agents without a registered connection (e.g. after a process
+				// restart): event-based activity detection to avoid false-positive stale.
+				if (session.tmuxSession === "" && session.pid !== null && eventStore) {
 					try {
 						const recentEvents = eventStore.getByAgent(session.agentName, {
 							since: new Date(Date.now() - staleThresholdMs).toISOString(),
@@ -548,8 +579,6 @@ export async function runDaemonTick(options: DaemonOptions): Promise<void> {
 					}
 				}
 			}
-
-			const tmuxAlive = await tmux.isSessionAlive(session.tmuxSession);
 			const check = evaluateHealth(session, tmuxAlive, thresholds);
 
 			// Transition state forward only (investigate action holds state)
@@ -568,8 +597,15 @@ export async function runDaemonTick(options: DaemonOptions): Promise<void> {
 				const reason = check.reconciliationNote ?? "Process terminated";
 				await recordFailureFn(root, session, reason, 0);
 
-				// Kill the agent: headless agents are killed via PID, TUI agents via tmux
-				await killAgent({ session, tmuxAlive, tmux, process: proc });
+				// Kill the agent: prefer conn.abort(), fall back to PID/tmux
+				await killAgent({
+					session,
+					tmuxAlive,
+					tmux,
+					process: proc,
+					getConnection: getConn,
+					removeConnection: removeConn,
+				});
 				store.updateState(session.agentName, "zombie");
 				// Reset escalation tracking on terminal state
 				store.updateEscalation(session.agentName, 0, null);
@@ -635,6 +671,8 @@ export async function runDaemonTick(options: DaemonOptions): Promise<void> {
 					recordFailure: recordFailureFn,
 					triageCount,
 					maxTriagePerTick,
+					getConnection: getConn,
+					removeConnection: removeConn,
 				});
 
 				if (actionResult.terminated) {
@@ -741,6 +779,8 @@ async function executeEscalationAction(ctx: {
 		tier: 0 | 1,
 		triageSuggestion?: string,
 	) => Promise<void>;
+	getConnection: (name: string) => RuntimeConnection | undefined;
+	removeConnection: (name: string) => void;
 }): Promise<{ terminated: boolean; stateChanged: boolean }> {
 	const {
 		session,
@@ -756,6 +796,8 @@ async function executeEscalationAction(ctx: {
 		recordFailure,
 		triageCount,
 		maxTriagePerTick,
+		getConnection: getConn,
+		removeConnection: removeConn,
 	} = ctx;
 
 	switch (session.escalationLevel) {
@@ -840,7 +882,14 @@ async function executeEscalationAction(ctx: {
 					result.verdict,
 				);
 
-				await killAgent({ session, tmuxAlive, tmux, process: proc });
+				await killAgent({
+					session,
+					tmuxAlive,
+					tmux,
+					process: proc,
+					getConnection: getConn,
+					removeConnection: removeConn,
+				});
 				return { terminated: true, stateChanged: true };
 			}
 
@@ -876,7 +925,14 @@ async function executeEscalationAction(ctx: {
 			// Record the failure via mulch (Tier 0: progressive escalation to terminal level)
 			await recordFailure(root, session, "Progressive escalation reached terminal level", 0);
 
-			await killAgent({ session, tmuxAlive, tmux, process: proc });
+			await killAgent({
+				session,
+				tmuxAlive,
+				tmux,
+				process: proc,
+				getConnection: getConn,
+				removeConnection: removeConn,
+			});
 			return { terminated: true, stateChanged: true };
 		}
 	}

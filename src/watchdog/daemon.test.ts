@@ -2488,3 +2488,366 @@ describe("triage concurrency limit (_maxTriagePerTick)", () => {
 		expect(triageCallCount).toBe(2);
 	});
 });
+
+// ============================================================
+// RuntimeConnection-aware kill and liveness (overstory-32cd)
+// ============================================================
+
+describe("killAgent uses RuntimeConnection.abort() when available", () => {
+	const deadPid = 999999;
+
+	function connProcessTracker(): {
+		isAlive: (pid: number) => boolean;
+		killTree: (pid: number) => Promise<void>;
+		killed: number[];
+	} {
+		const killed: number[] = [];
+		return {
+			isAlive: (pid: number) => {
+				try {
+					process.kill(pid, 0);
+					return true;
+				} catch {
+					return false;
+				}
+			},
+			killTree: async (pid: number) => {
+				killed.push(pid);
+			},
+			killed,
+		};
+	}
+
+	// Test A: killAgent uses connection.abort() when a connection is registered
+	test("Test A: abort() called for ZFC-terminated headless agent with registered connection", async () => {
+		const session = makeSession({
+			agentName: "headless-conn-agent",
+			tmuxSession: "", // headless
+			pid: deadPid, // dead PID → ZFC fires (pidAlive=false)
+			state: "working",
+			lastActivity: new Date().toISOString(),
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		let abortCount = 0;
+		const removedNames: string[] = [];
+		const proc = connProcessTracker();
+		const tmuxMock = tmuxWithLiveness({ "": true });
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_process: proc,
+			_eventStore: null,
+			_recordFailure: async () => {},
+			_getConnection: (name: string) => {
+				if (name !== "headless-conn-agent") return undefined;
+				return {
+					getState: async () => ({ status: "working" as const }),
+					sendPrompt: async () => {},
+					followUp: async () => {},
+					abort: async () => {
+						abortCount++;
+					},
+					close: () => {},
+				};
+			},
+			_removeConnection: (name: string) => {
+				removedNames.push(name);
+			},
+			_tailerRegistry: new Map(),
+			_findLatestStdoutLog: async () => null,
+			_mailStore: null,
+		});
+
+		// abort() called exactly once
+		expect(abortCount).toBe(1);
+		// killTree NOT called (abort succeeded)
+		expect(proc.killed).toHaveLength(0);
+		// removeConnection called for the agent
+		expect(removedNames).toContain("headless-conn-agent");
+	});
+
+	// Test B: killAgent falls back to killTree when conn.abort() throws
+	test("Test B: killTree called as fallback when abort() throws", async () => {
+		const session = makeSession({
+			agentName: "headless-abort-fail",
+			tmuxSession: "",
+			pid: deadPid,
+			state: "working",
+			lastActivity: new Date().toISOString(),
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		let abortCalled = false;
+		const removedNames: string[] = [];
+		const proc = connProcessTracker();
+		const tmuxMock = tmuxWithLiveness({ "": true });
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_process: proc,
+			_eventStore: null,
+			_recordFailure: async () => {},
+			_getConnection: (name: string) => {
+				if (name !== "headless-abort-fail") return undefined;
+				return {
+					getState: async () => ({ status: "working" as const }),
+					sendPrompt: async () => {},
+					followUp: async () => {},
+					abort: async () => {
+						abortCalled = true;
+						throw new Error("process already dead");
+					},
+					close: () => {},
+				};
+			},
+			_removeConnection: (name: string) => {
+				removedNames.push(name);
+			},
+			_tailerRegistry: new Map(),
+			_findLatestStdoutLog: async () => null,
+			_mailStore: null,
+		});
+
+		// abort() was attempted
+		expect(abortCalled).toBe(true);
+		// killTree called as defense-in-depth fallback
+		expect(proc.killed).toContain(deadPid);
+		// removeConnection still called (before fallback)
+		expect(removedNames).toContain("headless-abort-fail");
+	});
+
+	// Test C: killAgent uses conn.abort() for triage-terminate path (level 2 → terminate)
+	test("Test C: abort() called in triage-terminate path (level 2 → terminate verdict)", async () => {
+		const nudgeIntervalMs = 60_000;
+		// stalledSince 2.5 intervals ago → expectedLevel = floor(2.5) = 2 → triage fires
+		const stalledSince = new Date(Date.now() - 2.5 * nudgeIntervalMs).toISOString();
+		// staleActivity: 2x staleThreshold (60s) — stale but not zombie, so escalate fires
+		const staleActivity = new Date(Date.now() - THRESHOLDS.staleThresholdMs * 2).toISOString();
+
+		const session = makeSession({
+			agentName: "headless-triage-conn",
+			tmuxSession: "",
+			pid: process.pid, // alive — ZFC won't fire; escalation path triggers triage
+			state: "stalled",
+			lastActivity: staleActivity,
+			escalationLevel: 1,
+			stalledSince,
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		let abortCount = 0;
+		const removedNames: string[] = [];
+		const proc = connProcessTracker();
+		const tmuxMock = tmuxWithLiveness({ "": true });
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			nudgeIntervalMs,
+			tier1Enabled: true,
+			_tmux: tmuxMock,
+			_triage: triageAlways("terminate"),
+			_nudge: nudgeTracker().nudge,
+			_process: proc,
+			_eventStore: null,
+			_recordFailure: async () => {},
+			// getState returns "error" so lastActivity is NOT refreshed — stale condition preserved
+			_getConnection: (name: string) => {
+				if (name !== "headless-triage-conn") return undefined;
+				return {
+					getState: async () => ({ status: "error" as const }),
+					sendPrompt: async () => {},
+					followUp: async () => {},
+					abort: async () => {
+						abortCount++;
+					},
+					close: () => {},
+				};
+			},
+			_removeConnection: (name: string) => {
+				removedNames.push(name);
+			},
+			_tailerRegistry: new Map(),
+			_findLatestStdoutLog: async () => null,
+			_mailStore: null,
+		});
+
+		// abort() called via triage-terminate → killAgent path
+		expect(abortCount).toBe(1);
+		// killTree NOT called (abort succeeded)
+		expect(proc.killed).toHaveLength(0);
+		// tmux killSession NOT called (headless path only)
+		expect(tmuxMock.killed).toHaveLength(0);
+	});
+
+	// Test D: integration — watchdog terminates a hung headless agent without touching tmux
+	test("Test D: conn.abort() called, tmux.killSession and killTree NEVER called, state → zombie", async () => {
+		const session = makeSession({
+			agentName: "headless-zombie-conn",
+			tmuxSession: "",
+			pid: deadPid, // dead PID → ZFC fires
+			state: "working",
+			lastActivity: new Date(Date.now() - THRESHOLDS.zombieThresholdMs * 2).toISOString(),
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		let abortCount = 0;
+		const proc = connProcessTracker();
+		const tmuxMock = tmuxWithLiveness({ "": true });
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_process: proc,
+			_eventStore: null,
+			_recordFailure: async () => {},
+			_getConnection: (name: string) => {
+				if (name !== "headless-zombie-conn") return undefined;
+				return {
+					getState: async () => ({ status: "working" as const }),
+					sendPrompt: async () => {},
+					followUp: async () => {},
+					abort: async () => {
+						abortCount++;
+					},
+					close: () => {},
+				};
+			},
+			_removeConnection: () => {},
+			_tailerRegistry: new Map(),
+			_findLatestStdoutLog: async () => null,
+			_mailStore: null,
+		});
+
+		// abort() called
+		expect(abortCount).toBe(1);
+		// tmux.killSession NEVER called
+		expect(tmuxMock.killed).toHaveLength(0);
+		// killTree NEVER called (abort succeeded)
+		expect(proc.killed).toHaveLength(0);
+		// Agent state transitioned to zombie
+		const reloaded = readSessionsFromStore(tempRoot);
+		expect(reloaded[0]?.state).toBe("zombie");
+	});
+
+	// Test E: liveness — getState() returning error status drives the agent toward zombie
+	test("Test E: getState()=error + dead PID → tmuxAlive=false, state=zombie, terminate, abort called", async () => {
+		const session = makeSession({
+			agentName: "headless-error-conn",
+			tmuxSession: "",
+			pid: deadPid, // dead → ZFC fires: pidAlive=false
+			state: "working",
+			lastActivity: new Date().toISOString(), // fresh — time-based won't fire; ZFC does
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		let abortCount = 0;
+		const proc = connProcessTracker();
+		const checks: HealthCheck[] = [];
+		const tmuxMock = tmuxWithLiveness({ "": true });
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			onHealthCheck: (c) => checks.push(c),
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_process: proc,
+			_eventStore: null,
+			_recordFailure: async () => {},
+			_getConnection: (name: string) => {
+				if (name !== "headless-error-conn") return undefined;
+				return {
+					getState: async () => ({ status: "error" as const }),
+					sendPrompt: async () => {},
+					followUp: async () => {},
+					abort: async () => {
+						abortCount++;
+					},
+					close: () => {},
+				};
+			},
+			_removeConnection: () => {},
+			_tailerRegistry: new Map(),
+			_findLatestStdoutLog: async () => null,
+			_mailStore: null,
+		});
+
+		// Health check produced
+		expect(checks).toHaveLength(1);
+		// tmuxAlive=false because getState returned "error"
+		expect(checks[0]?.tmuxAlive).toBe(false);
+		// ZFC fires (pidAlive=false for dead PID) → zombie/terminate
+		expect(checks[0]?.state).toBe("zombie");
+		expect(checks[0]?.action).toBe("terminate");
+		// abort() called via killAgent
+		expect(abortCount).toBe(1);
+		// killTree NOT called (abort succeeded)
+		expect(proc.killed).toHaveLength(0);
+	});
+
+	// Test F: connection.getState() rejection drops the connection and falls back to tmux
+	test("Test F: getState() rejection → removeConnection called, tmux liveness used as fallback", async () => {
+		const session = makeSession({
+			agentName: "headless-reject-conn",
+			tmuxSession: "",
+			pid: process.pid, // alive
+			state: "working",
+			lastActivity: new Date().toISOString(), // fresh — no stale
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		const removedNames: string[] = [];
+		const checks: HealthCheck[] = [];
+		// tmux returns alive — used as fallback when getState rejects
+		const tmuxMock = tmuxWithLiveness({ "": true });
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			onHealthCheck: (c) => checks.push(c),
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_process: { isAlive: () => true, killTree: async () => {} },
+			_eventStore: null,
+			_recordFailure: async () => {},
+			_getConnection: (name: string) => {
+				if (name !== "headless-reject-conn") return undefined;
+				return {
+					getState: () => Promise.reject(new Error("connection error")),
+					sendPrompt: async () => {},
+					followUp: async () => {},
+					abort: async () => {},
+					close: () => {},
+				};
+			},
+			_removeConnection: (name: string) => {
+				removedNames.push(name);
+			},
+			_tailerRegistry: new Map(),
+			_findLatestStdoutLog: async () => null,
+			_mailStore: null,
+		});
+
+		// removeConnection called (connection dropped after rejection)
+		expect(removedNames).toContain("headless-reject-conn");
+		// Agent is healthy (alive PID, fresh lastActivity, tmux fallback returns alive)
+		expect(checks).toHaveLength(1);
+		expect(checks[0]?.action).toBe("none");
+	});
+});
