@@ -598,7 +598,14 @@ export async function runDaemonTick(options: DaemonOptions): Promise<void> {
 				await recordFailureFn(root, session, reason, 0);
 
 				// Kill the agent: prefer conn.abort(), fall back to PID/tmux
-				await killAgent({ session, tmuxAlive, tmux, process: proc, getConnection: getConn, removeConnection: removeConn });
+				await killAgent({
+					session,
+					tmuxAlive,
+					tmux,
+					process: proc,
+					getConnection: getConn,
+					removeConnection: removeConn,
+				});
 				store.updateState(session.agentName, "zombie");
 				// Reset escalation tracking on terminal state
 				store.updateEscalation(session.agentName, 0, null);
@@ -875,7 +882,14 @@ async function executeEscalationAction(ctx: {
 					result.verdict,
 				);
 
-				await killAgent({ session, tmuxAlive, tmux, process: proc, getConnection: getConn, removeConnection: removeConn });
+				await killAgent({
+					session,
+					tmuxAlive,
+					tmux,
+					process: proc,
+					getConnection: getConn,
+					removeConnection: removeConn,
+				});
 				return { terminated: true, stateChanged: true };
 			}
 
@@ -911,7 +925,14 @@ async function executeEscalationAction(ctx: {
 			// Record the failure via mulch (Tier 0: progressive escalation to terminal level)
 			await recordFailure(root, session, "Progressive escalation reached terminal level", 0);
 
-			await killAgent({ session, tmuxAlive, tmux, process: proc, getConnection: getConn, removeConnection: removeConn });
+			await killAgent({
+				session,
+				tmuxAlive,
+				tmux,
+				process: proc,
+				getConnection: getConn,
+				removeConnection: removeConn,
+			});
 			return { terminated: true, stateChanged: true };
 		}
 	}
