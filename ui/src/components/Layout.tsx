@@ -3,6 +3,7 @@ import { useCallback } from "react";
 import { NavLink, Outlet, useSearchParams } from "react-router-dom";
 
 import { ConnectionStatus } from "@/components/connection-status";
+import { Logo } from "@/components/Logo";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { fetchRuns } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -50,7 +51,7 @@ function TopBar() {
 	return (
 		<header className="border-b border-border shrink-0 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
 			<div className="h-14 flex items-center gap-6 px-6">
-				<span className="font-semibold text-sm tracking-tight">Overstory</span>
+				<Logo size="sm" tool="overstory" showWordmark />
 				<nav className="flex items-center gap-1">
 					<NavItem to="/coordinator" label="Coordinator" />
 					<NavItem to="/" label="Fleet" end />

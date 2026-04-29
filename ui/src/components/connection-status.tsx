@@ -9,9 +9,9 @@ interface ConnectionStatusProps {
 }
 
 const DOT_COLOR: Record<ConnectionStatusKind, string> = {
-	open: "bg-green-500",
-	connecting: "bg-amber-500",
-	closed: "bg-red-500",
+	open: "bg-success",
+	connecting: "bg-warning",
+	closed: "bg-destructive",
 	idle: "bg-muted-foreground/40",
 };
 

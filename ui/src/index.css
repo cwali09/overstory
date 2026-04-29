@@ -19,6 +19,10 @@
 	--color-accent-foreground: var(--accent-foreground);
 	--color-destructive: var(--destructive);
 	--color-destructive-foreground: var(--destructive-foreground);
+	--color-success: var(--success);
+	--color-success-foreground: var(--success-foreground);
+	--color-warning: var(--warning);
+	--color-warning-foreground: var(--warning-foreground);
 	--color-border: var(--border);
 	--color-input: var(--input);
 	--color-ring: var(--ring);
@@ -33,59 +37,90 @@
 	--radius-xl: calc(var(--radius) + 4px);
 }
 
+/*
+ * os-eco forest palette (overstory operator console)
+ *
+ * Source: ../../../branding/visual-spec.md
+ *   primary    → forest green   46,125,50  (overstory brand)
+ *   accent     → amber          255,183,77 (IDs, references, highlights)
+ *   muted      → stone gray     120,120,110
+ *
+ * Tool RGB triples live in `@/lib/brand` — never hardcode tool colors.
+ *
+ * Light vs dark deviation:
+ *   Light primary lifted from L=34% → L=36% so default buttons don't feel heavy.
+ *   Dark primary lifted to L=45% so the brand reads against a near-black canvas
+ *   while still passing AA contrast against white foreground (4.6:1).
+ *   The deeper 27,94,32 shade ships as `--primary-strong` for logo top-bars and
+ *   theme-color meta tags — closer to the rendered logo.png.
+ *
+ * Chart slots map to ecosystem tools (1-based: seeds, sapling, canopy, overstory,
+ * mulch). When greenhouse needs a slot, alias chart-2/sapling-or-seeds-equivalent.
+ */
+
 :root {
 	--radius: 0.5rem;
 	--background: hsl(0 0% 100%);
-	--foreground: hsl(224 71.4% 4.1%);
+	--foreground: hsl(140 25% 8%);
 	--card: hsl(0 0% 100%);
-	--card-foreground: hsl(224 71.4% 4.1%);
+	--card-foreground: hsl(140 25% 8%);
 	--popover: hsl(0 0% 100%);
-	--popover-foreground: hsl(224 71.4% 4.1%);
-	--primary: hsl(220.9 39.3% 11%);
-	--primary-foreground: hsl(210 20% 98%);
-	--secondary: hsl(220 14.3% 95.9%);
-	--secondary-foreground: hsl(220.9 39.3% 11%);
-	--muted: hsl(220 14.3% 95.9%);
-	--muted-foreground: hsl(220 8.9% 46.1%);
-	--accent: hsl(220 14.3% 95.9%);
-	--accent-foreground: hsl(220.9 39.3% 11%);
-	--destructive: hsl(0 84.2% 60.2%);
-	--destructive-foreground: hsl(210 20% 98%);
-	--border: hsl(220 13% 91%);
-	--input: hsl(220 13% 91%);
-	--ring: hsl(224 71.4% 4.1%);
-	--chart-1: hsl(12 76% 61%);
-	--chart-2: hsl(173 58% 39%);
-	--chart-3: hsl(197 37% 24%);
-	--chart-4: hsl(43 74% 66%);
-	--chart-5: hsl(27 87% 67%);
+	--popover-foreground: hsl(140 25% 8%);
+	--primary: hsl(123 46% 36%);
+	--primary-foreground: hsl(0 0% 100%);
+	--primary-strong: hsl(123 55% 24%);
+	--secondary: hsl(80 18% 94%);
+	--secondary-foreground: hsl(140 25% 12%);
+	--muted: hsl(80 12% 95%);
+	--muted-foreground: hsl(60 4% 38%);
+	--accent: hsl(36 100% 65%);
+	--accent-foreground: hsl(28 60% 14%);
+	--destructive: hsl(0 75% 48%);
+	--destructive-foreground: hsl(0 0% 100%);
+	--success: hsl(123 43% 39%);
+	--success-foreground: hsl(0 0% 100%);
+	--warning: hsl(43 96% 50%);
+	--warning-foreground: hsl(28 60% 14%);
+	--border: hsl(80 12% 88%);
+	--input: hsl(80 12% 88%);
+	--ring: hsl(123 46% 40%);
+	--chart-1: hsl(89 46% 48%); /* seeds */
+	--chart-2: hsl(122 39% 49%); /* sapling */
+	--chart-3: hsl(123 43% 39%); /* canopy */
+	--chart-4: hsl(123 46% 34%); /* overstory */
+	--chart-5: hsl(29 53% 36%); /* mulch */
 }
 
 .dark {
-	--background: hsl(224 71.4% 4.1%);
-	--foreground: hsl(210 20% 98%);
-	--card: hsl(224 71.4% 4.1%);
-	--card-foreground: hsl(210 20% 98%);
-	--popover: hsl(224 71.4% 4.1%);
-	--popover-foreground: hsl(210 20% 98%);
-	--primary: hsl(210 20% 98%);
-	--primary-foreground: hsl(220.9 39.3% 11%);
-	--secondary: hsl(215 27.9% 16.9%);
-	--secondary-foreground: hsl(210 20% 98%);
-	--muted: hsl(215 27.9% 16.9%);
-	--muted-foreground: hsl(217.9 10.6% 64.9%);
-	--accent: hsl(215 27.9% 16.9%);
-	--accent-foreground: hsl(210 20% 98%);
-	--destructive: hsl(0 62.8% 30.6%);
-	--destructive-foreground: hsl(210 20% 98%);
-	--border: hsl(215 27.9% 16.9%);
-	--input: hsl(215 27.9% 16.9%);
-	--ring: hsl(216 12.2% 83.9%);
-	--chart-1: hsl(220 70% 50%);
-	--chart-2: hsl(160 60% 45%);
-	--chart-3: hsl(30 80% 55%);
-	--chart-4: hsl(280 65% 60%);
-	--chart-5: hsl(340 75% 55%);
+	--background: hsl(140 18% 6%);
+	--foreground: hsl(80 10% 92%);
+	--card: hsl(140 18% 6%);
+	--card-foreground: hsl(80 10% 92%);
+	--popover: hsl(140 18% 6%);
+	--popover-foreground: hsl(80 10% 92%);
+	--primary: hsl(122 39% 45%);
+	--primary-foreground: hsl(0 0% 100%);
+	--primary-strong: hsl(123 55% 24%);
+	--secondary: hsl(140 14% 14%);
+	--secondary-foreground: hsl(80 10% 92%);
+	--muted: hsl(140 14% 14%);
+	--muted-foreground: hsl(60 6% 65%);
+	--accent: hsl(36 90% 58%);
+	--accent-foreground: hsl(28 60% 12%);
+	--destructive: hsl(0 62% 45%);
+	--destructive-foreground: hsl(0 0% 100%);
+	--success: hsl(122 39% 49%);
+	--success-foreground: hsl(0 0% 100%);
+	--warning: hsl(43 96% 56%);
+	--warning-foreground: hsl(28 60% 12%);
+	--border: hsl(140 14% 16%);
+	--input: hsl(140 14% 16%);
+	--ring: hsl(122 39% 52%);
+	--chart-1: hsl(89 50% 55%); /* seeds */
+	--chart-2: hsl(122 39% 55%); /* sapling */
+	--chart-3: hsl(123 43% 48%); /* canopy */
+	--chart-4: hsl(123 46% 42%); /* overstory */
+	--chart-5: hsl(29 53% 50%); /* mulch */
 }
 
 /*
