@@ -1,10 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useSearchParams } from "react-router-dom";
 
 import { fetchAgents, fetchRuns } from "@/lib/api";
 
 import { AgentTable } from "./fleet/AgentTable";
-import { RunPicker } from "./fleet/RunPicker";
 import { SummaryCards } from "./fleet/SummaryCards";
 
 export function Home() {
@@ -15,8 +14,8 @@ export function Home() {
 	});
 
 	const runs = runsQuery.data ?? [];
-	const [pickedRunId, setPickedRunId] = useState<string | null>(null);
-	const effectiveRunId = pickedRunId ?? runs[0]?.id ?? null;
+	const [params] = useSearchParams();
+	const effectiveRunId = params.get("run") ?? runs[0]?.id ?? null;
 
 	const agentsQuery = useQuery({
 		queryKey: ["agents", effectiveRunId],
@@ -41,7 +40,6 @@ export function Home() {
 		<div className="p-6 flex flex-col gap-6">
 			<div className="flex items-center justify-between">
 				<h1 className="text-xl font-semibold">Fleet</h1>
-				<RunPicker runs={runs} selectedRunId={effectiveRunId} onSelect={setPickedRunId} />
 			</div>
 
 			{isError && (

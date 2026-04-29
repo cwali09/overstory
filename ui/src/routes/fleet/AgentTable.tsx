@@ -29,7 +29,13 @@ export function AgentTable({ agents }: AgentTableProps) {
 	const navigate = useNavigate();
 
 	if (agents.length === 0) {
-		return <p className="text-sm text-muted-foreground py-4">No agents in this run yet.</p>;
+		return (
+			<p className="text-sm text-muted-foreground py-4">
+				No agents in this run yet — spawn one with{" "}
+				<code className="font-mono">{"ov sling <task-id> --capability builder --name <name>"}</code>
+				.
+			</p>
+		);
 	}
 
 	return (
