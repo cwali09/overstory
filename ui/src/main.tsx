@@ -6,6 +6,7 @@ import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { Layout } from "@/components/Layout";
 import { AgentDetail } from "@/routes/AgentDetail";
 import { Home } from "@/routes/Home";
+import { Mail } from "@/routes/Mail";
 
 import "./index.css";
 
@@ -28,6 +29,7 @@ createRoot(rootEl).render(
 					<Route path="/" element={<Layout />}>
 						<Route index element={<Home />} />
 						<Route path="/agents/:name" element={<AgentDetail />} />
+						<Route path="mail" element={<Mail />} />
 						<Route
 							path="*"
 							element={

@@ -198,6 +198,11 @@ export function installBroadcaster(opts: BroadcasterOptions): () => void {
 	registerWsHandler({
 		getUpgradeData(req: Request): unknown | null {
 			const url = new URL(req.url);
+			const mailParam = url.searchParams.get("mail");
+			if (mailParam === "true") {
+				const data: RoomData = { rooms: ["mail"] };
+				return data;
+			}
 			const run = url.searchParams.get("run");
 			const agent = url.searchParams.get("agent");
 			if (run !== null) {
@@ -291,6 +296,7 @@ export function installBroadcaster(opts: BroadcasterOptions): () => void {
 				const frameStr = JSON.stringify(frame);
 				broadcast(`agent:${message.to}`, frameStr);
 				broadcast(`agent:${message.from}`, frameStr);
+				broadcast("mail", frameStr);
 			}
 		} catch {
 			// DB not ready yet; retry next tick
