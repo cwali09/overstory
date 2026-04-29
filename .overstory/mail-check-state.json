@@ -1,8 +1,7 @@
 {
-	"phase3-wave1-conn-lead-v2": 1777433007408,
-	"phase3-wave1-dashboard-lead-v2": 1777432726454,
-	"phase3-wave1-hooks-design-lead-v2": 1777432832495,
-	"conn-lint-fixer": 1777432668526,
-	"conn-rebase-fixer": 1777433581437,
-	"hooks-design-doc-writer": 1777433590727
+	"hooks-design-doc-rebaser": 1777435056476,
+	"phase3-wave2-nudge-lead": 1777434798396,
+	"phase3-wave2-watchdog-lead": 1777434934011,
+	"nudge-1f66-builder": 1777434847323,
+	"watchdog-format-fixer": 1777434952242
 }
