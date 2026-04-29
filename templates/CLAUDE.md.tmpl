@@ -48,9 +48,12 @@ ov log <event> --agent <name>  # Hook-driven event logging
 3. Assign exclusive file scope so agents do not conflict
 4. Spawn: `ov sling <bead-id> --capability <type> --name <unique-name> --files src/foo.ts,src/bar.ts`
 
-Each spawned agent gets its own git worktree, branch, CLAUDE.md overlay, and
-tmux session. Agents communicate via `ov mail` and report completion
-by closing their {{TRACKER_NAME}} issue (`{{TRACKER_CLI}} close <id> --reason "summary"`).
+Each spawned agent gets its own git worktree, branch, and CLAUDE.md overlay.
+Claude agents spawn **headless by default** — the web UI (`ov serve`, then open
+http://localhost:8080) is the primary operator surface. Pass `--no-headless` to
+spawn into a tmux session you can attach to (`tmux attach -t ov-<agent>`).
+Agents communicate via `ov mail` and report completion by closing their
+{{TRACKER_NAME}} issue (`{{TRACKER_CLI}} close <id> --reason "summary"`).
 
 ## Hierarchical Delegation
 

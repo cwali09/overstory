@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+#### Headless Claude is the new default for new projects
+- **`ov init` now writes `runtime.claudeHeadlessByDefault: true`** into the freshly-generated `.overstory/config.yaml` (`src/commands/init.ts`). New projects spawn Claude agents headless out of the box; the web UI (`ov serve`, then open http://localhost:8080) is the primary operator surface and tmux is opt-in via `ov sling --no-headless` (overstory-caec).
+- **Existing projects keep tmux behavior on upgrade.** The fallback default in `resolveUseHeadless` (`src/commands/sling.ts`) remains `false`, so projects that already have a `config.yaml` without the field continue to spawn into tmux until they explicitly add `runtime.claudeHeadlessByDefault: true` (or pass `--headless` per spawn). To opt in: edit `.overstory/config.yaml` and add the field under `runtime:`, or re-run `ov init --yes` to regenerate the config from the new template.
+- **CLAUDE.md template updated** (`templates/CLAUDE.md.tmpl`) to describe the headless-default + UI-first workflow with `--no-headless` documented as the tmux escape hatch.
+
 ## [0.10.1] - 2026-04-28
 
 ### Added

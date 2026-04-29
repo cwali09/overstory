@@ -353,6 +353,14 @@ describe("initCommand: canonical branch detection", () => {
 		const content = await Bun.file(configPath).text();
 		expect(content).toContain("canonicalBranch: main");
 	});
+
+	test("generated config opts into headless Claude by default (overstory-caec)", async () => {
+		await initCommand({ _spawner: noopSpawner });
+
+		const configPath = join(tempDir, ".overstory", "config.yaml");
+		const content = await Bun.file(configPath).text();
+		expect(content).toContain("claudeHeadlessByDefault: true");
+	});
 });
 
 describe("initCommand: --yes flag", () => {

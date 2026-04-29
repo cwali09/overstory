@@ -816,6 +816,10 @@ export async function initCommand(opts: InitOptions): Promise<void> {
 	config.project.canonicalBranch = canonicalBranch;
 	if (config.runtime) {
 		config.runtime.default = defaultRuntime;
+		// New projects default to headless Claude spawns; the UI (`ov serve`) is the
+		// primary operator surface and tmux is opt-in via `--no-headless`. Existing
+		// projects keep tmux until they edit their config (overstory-caec).
+		config.runtime.claudeHeadlessByDefault = true;
 	}
 
 	const configYaml = serializeConfigToYaml(config);

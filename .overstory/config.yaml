@@ -58,6 +58,7 @@ logging:
 runtime:
   default: claude
   shellInitDelayMs: 0
+  claudeHeadlessByDefault: true
   pi:
     provider: anthropic
     modelMap:
