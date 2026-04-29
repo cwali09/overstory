@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { Button } from "@/components/ui/button";
 import { type Frame, type StoredEvent, useWebSocket } from "@/lib/ws";
 
 import {
@@ -14,12 +15,15 @@ import {
 } from "./api";
 import { Composer, type SlashCommand } from "./Composer";
 import { EmptyState } from "./EmptyState";
+import { NewRunDialog } from "./NewRunDialog";
 import { StatusPill } from "./StatusPill";
 import { type ChatTurn, Thread } from "./Thread";
 
 const COORDINATOR = "coordinator";
 const OPERATOR = "operator";
 const STALL_AFTER_MS = 60_000;
+const NEW_RUN_POLL_INTERVAL_MS = 500;
+const NEW_RUN_TIMEOUT_MS = 30_000;
 
 interface MailMessageWire {
 	id: string;
@@ -146,6 +150,14 @@ export function ConsolePage() {
 		result: CheckCompleteResult;
 	} | null>(null);
 	const [initialLoaded, setInitialLoaded] = useState(false);
+	const [newRunOpen, setNewRunOpenState] = useState(false);
+	const [isStartingNewRun, setIsStartingNewRun] = useState(false);
+	const [newRunError, setNewRunError] = useState<string | null>(null);
+
+	const setNewRunOpen = useCallback((open: boolean) => {
+		setNewRunOpenState(open);
+		if (!open) setNewRunError(null);
+	}, []);
 
 	const pendingRef = useRef<PendingTurn | null>(null);
 	useEffect(() => {
@@ -476,6 +488,37 @@ export function ConsolePage() {
 		[appendSystem],
 	);
 
+	const handleStartNewRun = useCallback(
+		async (subject: string, body: string) => {
+			setIsStartingNewRun(true);
+			setNewRunError(null);
+			try {
+				await postCoordinatorStart();
+				const deadline = Date.now() + NEW_RUN_TIMEOUT_MS;
+				let running = false;
+				while (Date.now() < deadline) {
+					const state = await fetchCoordinatorState();
+					if (state.running) {
+						running = true;
+						break;
+					}
+					await new Promise((r) => setTimeout(r, NEW_RUN_POLL_INTERVAL_MS));
+				}
+				if (!running) {
+					throw new Error("Timed out waiting for the coordinator to start.");
+				}
+				await postCoordinatorSend({ subject, body, from: OPERATOR });
+				setNewRunOpen(false);
+				appendSystem("Run started", `Sent initial prompt: ${subject}`);
+			} catch (err) {
+				setNewRunError(err instanceof Error ? err.message : String(err));
+			} finally {
+				setIsStartingNewRun(false);
+			}
+		},
+		[appendSystem, setNewRunOpen],
+	);
+
 	const showEmpty = initialLoaded && turns.length === 0 && pending === null;
 
 	const visibleTurns = useMemo(() => turns, [turns]);
@@ -491,10 +534,23 @@ export function ConsolePage() {
 
 			{showEmpty ? (
 				<div className="flex-1 min-h-0">
-					<EmptyState onSelect={(t) => setComposerValue(t)} />
+					<EmptyState
+						onSelect={(t) => setComposerValue(t)}
+						onStartNewRun={() => setNewRunOpen(true)}
+						isStopped={stateQuery.data?.running === false}
+					/>
 				</div>
 			) : (
 				<Thread turns={visibleTurns} />
+			)}
+
+			{!showEmpty && stateQuery.data?.running === false && (
+				<div className="px-4 py-3 border-t flex items-center gap-3 shrink-0 bg-muted/30">
+					<span className="text-sm text-muted-foreground">Coordinator is stopped.</span>
+					<Button type="button" size="sm" className="ml-auto" onClick={() => setNewRunOpen(true)}>
+						Start new run
+					</Button>
+				</div>
 			)}
 
 			<Composer
@@ -507,11 +563,13 @@ export function ConsolePage() {
 				isPending={pending !== null}
 			/>
 
-			{stateQuery.data?.running === false && (
-				<div className="px-4 py-2 text-xs text-muted-foreground border-t shrink-0">
-					Coordinator is stopped — start it with <code>/start</code> before sending.
-				</div>
-			)}
+			<NewRunDialog
+				open={newRunOpen}
+				onOpenChange={setNewRunOpen}
+				onStart={handleStartNewRun}
+				isStarting={isStartingNewRun}
+				error={newRunError}
+			/>
 		</div>
 	);
 }

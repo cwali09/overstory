@@ -1,3 +1,4 @@
+import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 
 const STARTER_PROMPTS = [
@@ -8,9 +9,13 @@ const STARTER_PROMPTS = [
 
 interface EmptyStateProps {
 	onSelect: (text: string) => void;
+	onStartNewRun?: () => void;
+	isStopped?: boolean;
 }
 
-export function EmptyState({ onSelect }: EmptyStateProps) {
+export function EmptyState({ onSelect, onStartNewRun, isStopped }: EmptyStateProps) {
+	const showStartCta = isStopped === true && onStartNewRun !== undefined;
+
 	return (
 		<div className="flex flex-col items-center justify-center h-full gap-6 p-6">
 			<div className="text-center">
@@ -19,6 +24,14 @@ export function EmptyState({ onSelect }: EmptyStateProps) {
 					Send a message to start. Replies arrive inline.
 				</p>
 			</div>
+			{showStartCta && (
+				<div className="flex flex-col items-center gap-2">
+					<p className="text-sm text-muted-foreground">Coordinator is stopped.</p>
+					<Button type="button" onClick={onStartNewRun}>
+						Start new run
+					</Button>
+				</div>
+			)}
 			<div className="grid gap-3 w-full max-w-2xl sm:grid-cols-3">
 				{STARTER_PROMPTS.map((p) => (
 					<button key={p.text} type="button" onClick={() => onSelect(p.text)} className="text-left">
