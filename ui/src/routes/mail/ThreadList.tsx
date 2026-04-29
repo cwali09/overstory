@@ -1,5 +1,5 @@
-import { useRef } from "react";
 import { Trash2 } from "lucide-react";
+import { useRef } from "react";
 import { Badge } from "@/components/ui/badge";
 import { useScrollFade } from "@/lib/use-scroll-fade";
 import type { MailMessage, MailMessageType } from "./types.ts";
