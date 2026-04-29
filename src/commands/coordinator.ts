@@ -15,6 +15,7 @@
 import { mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { Command } from "commander";
+import { buildInitialHeadlessPrompt, formatMailSection } from "../agents/headless-prompt.ts";
 import { createIdentity, loadIdentity } from "../agents/identity.ts";
 import { createManifestLoader, resolveModel } from "../agents/manifest.ts";
 import { loadConfig } from "../config.ts";
@@ -29,6 +30,8 @@ import { createRunStore, createSessionStore } from "../sessions/store.ts";
 import { resolveBackend, trackerCliName } from "../tracker/factory.ts";
 import type { AgentSession } from "../types.ts";
 import { isProcessRunning } from "../watchdog/health.ts";
+import type { SpawnHeadlessOptions } from "../worktree/process.ts";
+import { spawnHeadlessAgent } from "../worktree/process.ts";
 import type { SessionState } from "../worktree/tmux.ts";
 import {
 	capturePaneContent,
@@ -46,7 +49,7 @@ import { nudgeAgent } from "./nudge.ts";
 import { isRunningAsRoot } from "./sling.ts";
 
 /** Default coordinator agent name. */
-const COORDINATOR_NAME = "coordinator";
+export const COORDINATOR_NAME = "coordinator";
 
 export interface PersistentAgentSpec {
 	commandName: string;
@@ -120,6 +123,15 @@ export interface CoordinatorDeps {
 	_capturePaneContent?: (name: string, lines?: number) => Promise<string | null>;
 	/** Override poll interval for ask subcommand (default: ASK_POLL_INTERVAL_MS). Used in tests. */
 	_pollIntervalMs?: number;
+	/** Override headless spawn (used by tests to avoid forking real subprocesses). */
+	_spawnHeadless?: (
+		argv: string[],
+		opts: SpawnHeadlessOptions,
+	) => Promise<{
+		pid: number;
+		stdin: { write(data: string | Uint8Array): number | Promise<number> };
+		stdout: ReadableStream<Uint8Array> | null;
+	}>;
 }
 
 /**
@@ -332,6 +344,13 @@ export interface CoordinatorSessionOptions {
 	displayName?: string;
 	/** Custom beacon builder. Receives tracker CLI name, returns beacon string. */
 	beaconBuilder?: (trackerCli: string) => string;
+	/**
+	 * When true, spawn the coordinator headless (no tmux pane). The runtime must
+	 * implement buildDirectSpawn(). The CLI command `ov coordinator start` does
+	 * not yet pass this flag — it is consumed by the headless start path used by
+	 * the web UI's POST /api/coordinator/start endpoint.
+	 */
+	headless?: boolean;
 }
 
 /**
@@ -365,6 +384,7 @@ export async function startCoordinatorSession(
 		agentDefFile: agentDefFileOpt,
 		displayName: displayNameOpt,
 		beaconBuilder: beaconBuilderOpt,
+		headless: headlessFlag,
 	} = opts;
 
 	const coordinatorName = agentNameOpt ?? coordinatorNameOpt ?? COORDINATOR_NAME;
@@ -457,6 +477,157 @@ export async function startCoordinatorSession(
 				expertiseDomains: config.mulch.enabled ? config.mulch.domains : [],
 				recentTasks: [],
 			});
+		}
+
+		// Headless start path: bypass tmux entirely and spawn the coordinator
+		// process directly via runtime.buildDirectSpawn(). Same hooks, identity,
+		// and run-tracking as the tmux path — only the spawn mechanism differs.
+		if (headlessFlag === true) {
+			if (!runtime.buildDirectSpawn) {
+				throw new ValidationError(
+					`Headless coordinator start requires a runtime with buildDirectSpawn (got: ${runtime.id})`,
+					{ field: "runtime", value: runtime.id },
+				);
+			}
+
+			const spawnHeadless = deps._spawnHeadless ?? spawnHeadlessAgent;
+			const directEnv: Record<string, string> = {
+				...runtime.buildEnv(resolvedModel),
+				OVERSTORY_AGENT_NAME: coordinatorName,
+				OVERSTORY_PROJECT_ROOT: projectRoot,
+				...(profileFlag ? { OVERSTORY_PROFILE: profileFlag } : {}),
+			};
+			const argv = runtime.buildDirectSpawn({
+				cwd: projectRoot,
+				env: directEnv,
+				...(resolvedModel.isExplicitOverride ? { model: resolvedModel.model } : {}),
+				instructionPath: runtime.instructionPath,
+			});
+
+			// Per-session log dir mirrors sling.ts headless path.
+			const logTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
+			const headlessLogDir = join(overstoryDir, "logs", "coordinator", logTimestamp);
+			await mkdir(headlessLogDir, { recursive: true });
+
+			const headlessProc = await spawnHeadless(argv, {
+				cwd: projectRoot,
+				env: { ...(process.env as Record<string, string>), ...directEnv },
+				stdoutFile: join(headlessLogDir, "stdout.log"),
+				stderrFile: join(headlessLogDir, "stderr.log"),
+				agentName: coordinatorName,
+			});
+
+			// Build the initial stdin prompt from agent definition + pending dispatch
+			// mail + activation beacon. Replaces SessionStart hooks (no-op headless).
+			const agentDefPath = join(projectRoot, ".overstory", "agent-defs", agentDefFile);
+			const agentDefHandle = Bun.file(agentDefPath);
+			const primeContext = (await agentDefHandle.exists()) ? await agentDefHandle.text() : "";
+
+			const mailDbPath = join(overstoryDir, "mail.db");
+			const pendingMailStore = createMailStore(mailDbPath);
+			let mailSection = "";
+			try {
+				const pendingMailClient = createMailClient(pendingMailStore);
+				const pendingMessages = pendingMailClient.check(coordinatorName);
+				mailSection = formatMailSection(pendingMessages);
+			} finally {
+				pendingMailStore.close();
+			}
+
+			const resolvedBackend = await resolveBackend(config.taskTracker.backend, config.project.root);
+			const trackerCli = trackerCliName(resolvedBackend);
+			const beacon = beaconBuilder(trackerCli);
+			const initialPrompt = buildInitialHeadlessPrompt(
+				primeContext || undefined,
+				mailSection || undefined,
+				beacon,
+			);
+			await headlessProc.stdin.write(initialPrompt);
+
+			// Create run record + current-run.txt + session row.
+			const sessionId = `session-${Date.now()}-${coordinatorName}`;
+			const runId = `run-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+			const runStore = createRunStore(join(overstoryDir, "sessions.db"));
+			try {
+				runStore.createRun({
+					id: runId,
+					startedAt: new Date().toISOString(),
+					coordinatorSessionId: sessionId,
+					coordinatorName,
+					status: "active",
+				});
+			} finally {
+				runStore.close();
+			}
+			await Bun.write(join(overstoryDir, "current-run.txt"), runId);
+
+			const session: AgentSession = {
+				id: sessionId,
+				agentName: coordinatorName,
+				capability,
+				worktreePath: projectRoot,
+				branchName: config.project.canonicalBranch,
+				taskId: "",
+				tmuxSession: "", // headless: no tmux pane
+				state: "booting",
+				pid: headlessProc.pid,
+				parentAgent: null,
+				depth: 0,
+				runId,
+				startedAt: new Date().toISOString(),
+				lastActivity: new Date().toISOString(),
+				escalationLevel: 0,
+				stalledSince: null,
+				transcriptPath: null,
+			};
+			store.upsert(session);
+
+			// Auto-start watchdog / monitor (same as tmux path).
+			let watchdogPid: number | undefined;
+			if (watchdogFlag) {
+				const watchdogResult = await watchdog.start();
+				if (watchdogResult) {
+					watchdogPid = watchdogResult.pid;
+					if (!json) printHint("Watchdog started");
+				} else {
+					if (!json) printWarning("Watchdog failed to start");
+				}
+			}
+			let monitorPid: number | undefined;
+			if (monitorFlag) {
+				if (!config.watchdog.tier2Enabled) {
+					if (!json) printWarning("Monitor skipped", "watchdog.tier2Enabled is false");
+				} else {
+					const monitorResult = await monitor.start([]);
+					if (monitorResult) {
+						monitorPid = monitorResult.pid;
+						if (!json) printHint("Monitor started");
+					} else {
+						if (!json) printWarning("Monitor failed to start");
+					}
+				}
+			}
+
+			const output = {
+				agentName: coordinatorName,
+				capability,
+				tmuxSession: "",
+				projectRoot,
+				pid: headlessProc.pid,
+				headless: true,
+				watchdog: watchdogFlag ? watchdogPid !== undefined : false,
+				monitor: monitorFlag ? monitorPid !== undefined : false,
+			};
+
+			if (json) {
+				jsonOutput(`${capability} start`, output);
+			} else {
+				printSuccess(`${displayName} started (headless)`);
+				process.stdout.write(`  Root:    ${projectRoot}\n`);
+				process.stdout.write(`  PID:     ${headlessProc.pid}\n`);
+				process.stdout.write(`  Logs:    ${headlessLogDir}\n`);
+			}
+			return;
 		}
 
 		// Preflight: verify tmux is installed before attempting to spawn.
@@ -680,6 +851,18 @@ function isActivePersistentAgentSession(
  * 3. Mark session as completed in SessionStore
  * 4. Auto-complete the active run (if current-run.txt exists)
  */
+/**
+ * Stop the default coordinator. Handles both tmux and headless sessions.
+ * Exposed for callers outside the CLI command surface (e.g. the web-UI POST
+ * /api/coordinator/stop endpoint, which lives in coordinator-actions.ts).
+ */
+export async function stopCoordinatorSession(
+	opts: { json: boolean },
+	deps: CoordinatorDeps = {},
+): Promise<void> {
+	await stopPersistentAgent(COORDINATOR_SPEC, opts, deps);
+}
+
 async function stopPersistentAgent(
 	spec: PersistentAgentSpec,
 	opts: { json: boolean },
@@ -713,10 +896,24 @@ async function stopPersistentAgent(
 			});
 		}
 
-		// Kill tmux session with process tree cleanup
-		const alive = await tmux.isSessionAlive(session.tmuxSession);
-		if (alive) {
-			await tmux.killSession(session.tmuxSession);
+		// Headless sessions have no tmux pane (tmuxSession === ""). Tear down via
+		// the connection registry (SIGTERM-with-SIGKILL-escalation) and skip tmux.
+		if (session.tmuxSession === "") {
+			const { removeConnection } = await import("../runtimes/connections.ts");
+			removeConnection(spec.agentName);
+			if (session.pid !== null && isProcessRunning(session.pid)) {
+				try {
+					process.kill(session.pid, "SIGTERM");
+				} catch {
+					// process may have exited between the check and the signal
+				}
+			}
+		} else {
+			// Kill tmux session with process tree cleanup
+			const alive = await tmux.isSessionAlive(session.tmuxSession);
+			if (alive) {
+				await tmux.killSession(session.tmuxSession);
+			}
 		}
 
 		// Always attempt to stop watchdog

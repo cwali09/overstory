@@ -28,6 +28,7 @@ import {
 	coordinatorCommand,
 	createCoordinatorCommand,
 	resolveAttach,
+	startCoordinatorSession,
 } from "./coordinator.ts";
 import {
 	buildOrchestratorBeacon,
@@ -2663,5 +2664,131 @@ describe("checkComplete", () => {
 		const cmd = createCoordinatorCommand({});
 		const subcommandNames = cmd.commands.map((c) => c.name());
 		expect(subcommandNames).toContain("check-complete");
+	});
+});
+
+describe("startCoordinatorSession headless", () => {
+	test("with headless: true, calls spawnHeadlessAgent and skips tmux", async () => {
+		const { tmux, calls: tmuxCalls } = makeFakeTmux();
+		const { watchdog } = makeFakeWatchdog();
+		const { monitor } = makeFakeMonitor();
+
+		const spawnCalls: Array<{
+			argv: string[];
+			cwd: string;
+			agentName?: string;
+		}> = [];
+		const writes: string[] = [];
+
+		const fakeSpawn = async (
+			argv: string[],
+			opts: { cwd: string; env: Record<string, string>; agentName?: string },
+		): Promise<{
+			pid: number;
+			stdin: { write(data: string | Uint8Array): number | Promise<number> };
+			stdout: ReadableStream<Uint8Array> | null;
+		}> => {
+			spawnCalls.push({ argv, cwd: opts.cwd, agentName: opts.agentName });
+			return {
+				pid: 55555,
+				stdin: {
+					write(data: string | Uint8Array): number {
+						writes.push(typeof data === "string" ? data : new TextDecoder().decode(data));
+						return 0;
+					},
+				},
+				stdout: null,
+			};
+		};
+
+		const deps: CoordinatorDeps = {
+			_tmux: tmux,
+			_watchdog: watchdog,
+			_monitor: monitor,
+			_spawnHeadless: fakeSpawn,
+		};
+
+		await captureStdout(async () => {
+			await startCoordinatorSession(
+				{
+					json: true,
+					attach: false,
+					watchdog: false,
+					monitor: false,
+					headless: true,
+				},
+				deps,
+			);
+		});
+
+		// spawnHeadlessAgent was called exactly once with agentName: "coordinator"
+		expect(spawnCalls.length).toBe(1);
+		expect(spawnCalls[0]?.agentName).toBe("coordinator");
+		expect(spawnCalls[0]?.cwd).toBe(tempDir);
+
+		// initial stdin prompt was written
+		expect(writes.length).toBeGreaterThanOrEqual(1);
+
+		// tmux helpers were never called for the headless path
+		expect(tmuxCalls.createSession.length).toBe(0);
+		expect(tmuxCalls.sendKeys.length).toBe(0);
+		expect(tmuxCalls.waitForTuiReady.length).toBe(0);
+		expect(tmuxCalls.ensureTmuxAvailable).toBe(0);
+
+		// Session row records empty tmuxSession + the headless spawn pid
+		const sessions = loadSessionsFromDb();
+		expect(sessions.length).toBe(1);
+		expect(sessions[0]?.agentName).toBe("coordinator");
+		expect(sessions[0]?.tmuxSession).toBe("");
+		expect(sessions[0]?.pid).toBe(55555);
+		expect(sessions[0]?.state).toBe("booting");
+
+		// current-run.txt was written for downstream consumers
+		const runFile = Bun.file(join(overstoryDir, "current-run.txt"));
+		expect(await runFile.exists()).toBe(true);
+	});
+
+	test("rejects when runtime has no buildDirectSpawn", async () => {
+		// Override config to route the coordinator capability to a runtime that
+		// lacks buildDirectSpawn (e.g. cursor). The headless path must reject.
+		await Bun.write(
+			join(overstoryDir, "config.yaml"),
+			[
+				"project:",
+				"  name: test-project",
+				`  root: ${tempDir}`,
+				"  canonicalBranch: main",
+				"watchdog:",
+				"  tier2Enabled: true",
+				"runtime:",
+				"  capabilities:",
+				"    coordinator: cursor",
+			].join("\n"),
+		);
+
+		const { tmux } = makeFakeTmux();
+		const { watchdog } = makeFakeWatchdog();
+		const { monitor } = makeFakeMonitor();
+		const deps: CoordinatorDeps = {
+			_tmux: tmux,
+			_watchdog: watchdog,
+			_monitor: monitor,
+			_spawnHeadless: async () => {
+				throw new Error("should not be called");
+			},
+		};
+
+		await expect(
+			startCoordinatorSession(
+				{
+					json: true,
+					attach: false,
+					watchdog: false,
+					monitor: false,
+					headless: true,
+				},
+				deps,
+			),
+		).rejects.toThrow(ValidationError);
 	});
 });

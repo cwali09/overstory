@@ -110,6 +110,14 @@ describe("registerRestApi", () => {
 			_sessionStore: ctx.sessionStore,
 			_eventStore: ctx.eventStore,
 			_mailStore: ctx.mailStore,
+			// Coordinator actions reuse the same stores as the test harness so
+			// seeded session/mail rows are visible across the API surface.
+			_coordinatorActionDeps: {
+				projectRoot: tempDir,
+				_sessionStore: ctx.sessionStore,
+				_mailStore: ctx.mailStore,
+				_askPollIntervalMs: 20,
+			},
 		});
 	});
 
@@ -782,6 +790,319 @@ describe("registerRestApi", () => {
 				const res = await get(server, ep);
 				expect(res.headers.get("content-type")).toContain("application/json");
 			}
+		});
+	});
+
+	// ─── Coordinator API ──────────────────────────────────────────────────────
+
+	describe("coordinator API", () => {
+		function makeCoordSession(
+			overrides: Partial<{
+				tmuxSession: string;
+				state: "working" | "completed" | "booting";
+				pid: number;
+			}> = {},
+		) {
+			return {
+				id: `session-${Date.now()}-coordinator`,
+				agentName: "coordinator",
+				capability: "coordinator",
+				worktreePath: ctx.tempDir,
+				branchName: "main",
+				taskId: "",
+				tmuxSession: overrides.tmuxSession ?? "",
+				state: overrides.state ?? ("working" as const),
+				pid: overrides.pid ?? 99999,
+				parentAgent: null,
+				depth: 0,
+				runId: "run-test",
+				startedAt: new Date().toISOString(),
+				lastActivity: new Date().toISOString(),
+				escalationLevel: 0,
+				stalledSince: null,
+				transcriptPath: null,
+			};
+		}
+
+		// Replace registered handlers with custom action overrides for a test.
+		function reregisterWith(overrides: {
+			startCoordinatorHeadless?: (deps: unknown) => Promise<{
+				started: boolean;
+				alreadyRunning: boolean;
+				pid: number | null;
+				runId: string | null;
+			}>;
+			stopCoordinator?: (deps: unknown) => Promise<{ stopped: boolean }>;
+			checkCoordinatorComplete?: (deps: unknown) => Promise<unknown>;
+		}): void {
+			_resetHandlers();
+			registerRestApi({
+				_runStore: ctx.runStore,
+				_sessionStore: ctx.sessionStore,
+				_eventStore: ctx.eventStore,
+				_mailStore: ctx.mailStore,
+				_coordinatorActionDeps: {
+					projectRoot: ctx.tempDir,
+					_sessionStore: ctx.sessionStore,
+					_mailStore: ctx.mailStore,
+					_askPollIntervalMs: 20,
+				},
+				_coordinatorActions: overrides as Parameters<typeof registerRestApi>[0] extends infer D
+					? D extends { _coordinatorActions?: infer A }
+						? A
+						: never
+					: never,
+			});
+		}
+
+		// ─── GET /api/coordinator/state ──────────────────────────────────────
+
+		describe("GET /api/coordinator/state", () => {
+			test("returns running: false when no session", async () => {
+				const server = await startServer();
+				const { status, body } = await getJson<{
+					data: { running: boolean };
+					success: boolean;
+				}>(server, "/api/coordinator/state");
+				expect(status).toBe(200);
+				expect(body.success).toBe(true);
+				expect(body.data.running).toBe(false);
+			});
+
+			test("returns running: true after seeding a session", async () => {
+				ctx.sessionStore.upsert(makeCoordSession({ tmuxSession: "" }));
+				const server = await startServer();
+				const { status, body } = await getJson<{
+					data: { running: boolean; pid: number | null; tmuxSession: string | null };
+				}>(server, "/api/coordinator/state");
+				expect(status).toBe(200);
+				expect(body.data.running).toBe(true);
+				expect(body.data.pid).toBe(99999);
+				expect(body.data.tmuxSession).toBeNull();
+			});
+
+			test("405 for POST", async () => {
+				const server = await startServer();
+				const res = await fetch(`http://127.0.0.1:${server.port}/api/coordinator/state`, {
+					method: "POST",
+				});
+				expect(res.status).toBe(405);
+			});
+		});
+
+		// ─── POST /api/coordinator/send ───────────────────────────────────────
+
+		describe("POST /api/coordinator/send", () => {
+			test("creates mail row for a headless session", async () => {
+				ctx.sessionStore.upsert(makeCoordSession({ tmuxSession: "" }));
+				const server = await startServer();
+				const res = await fetch(`http://127.0.0.1:${server.port}/api/coordinator/send`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ subject: "hi", body: "the body" }),
+				});
+				expect(res.status).toBe(200);
+				const json = (await res.json()) as { success: boolean; data: { messageId: string } };
+				expect(json.success).toBe(true);
+				expect(json.data.messageId).toMatch(/^msg-/);
+
+				const rows = ctx.mailStore.getAll({ to: "coordinator" });
+				expect(rows.length).toBe(1);
+				expect(rows[0]?.subject).toBe("hi");
+				expect(rows[0]?.body).toBe("the body");
+			});
+
+			test("returns 400 on missing fields", async () => {
+				ctx.sessionStore.upsert(makeCoordSession({ tmuxSession: "" }));
+				const server = await startServer();
+				const res = await fetch(`http://127.0.0.1:${server.port}/api/coordinator/send`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ body: "no subject" }),
+				});
+				expect(res.status).toBe(400);
+				const json = (await res.json()) as { success: boolean };
+				expect(json.success).toBe(false);
+			});
+
+			test("returns 400 on invalid JSON", async () => {
+				ctx.sessionStore.upsert(makeCoordSession({ tmuxSession: "" }));
+				const server = await startServer();
+				const res = await fetch(`http://127.0.0.1:${server.port}/api/coordinator/send`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: "{not json",
+				});
+				expect(res.status).toBe(400);
+			});
+
+			test("returns 409 when session is tmux-only", async () => {
+				ctx.sessionStore.upsert(makeCoordSession({ tmuxSession: "tmux-pane" }));
+				const server = await startServer();
+				const res = await fetch(`http://127.0.0.1:${server.port}/api/coordinator/send`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ subject: "x", body: "y" }),
+				});
+				expect(res.status).toBe(409);
+			});
+
+			test("returns 409 when no coordinator session is running", async () => {
+				const server = await startServer();
+				const res = await fetch(`http://127.0.0.1:${server.port}/api/coordinator/send`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ subject: "x", body: "y" }),
+				});
+				expect(res.status).toBe(409);
+			});
+
+			test("405 for GET", async () => {
+				const server = await startServer();
+				const res = await fetch(`http://127.0.0.1:${server.port}/api/coordinator/send`);
+				expect(res.status).toBe(405);
+			});
+		});
+
+		// ─── POST /api/coordinator/ask ────────────────────────────────────────
+
+		describe("POST /api/coordinator/ask", () => {
+			test("creates mail and returns timedOut: true after deadline", async () => {
+				ctx.sessionStore.upsert(makeCoordSession({ tmuxSession: "" }));
+				const server = await startServer();
+				const res = await fetch(`http://127.0.0.1:${server.port}/api/coordinator/ask`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ subject: "Q", body: "?", timeoutSec: 1 }),
+				});
+				expect(res.status).toBe(200);
+				const json = (await res.json()) as {
+					success: boolean;
+					data: { messageId: string; reply: unknown; timedOut: boolean };
+				};
+				expect(json.success).toBe(true);
+				expect(json.data.timedOut).toBe(true);
+				expect(json.data.reply).toBeNull();
+
+				const rows = ctx.mailStore.getAll({ to: "coordinator" });
+				expect(rows.length).toBe(1);
+			});
+
+			test("returns 400 on timeoutSec out of range", async () => {
+				ctx.sessionStore.upsert(makeCoordSession({ tmuxSession: "" }));
+				const server = await startServer();
+				const res = await fetch(`http://127.0.0.1:${server.port}/api/coordinator/ask`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ subject: "Q", body: "?", timeoutSec: 9999 }),
+				});
+				expect(res.status).toBe(400);
+			});
+		});
+
+		// ─── POST /api/coordinator/check-complete ─────────────────────────────
+
+		describe("POST /api/coordinator/check-complete", () => {
+			test("returns the structured CheckCompleteResult shape", async () => {
+				reregisterWith({
+					checkCoordinatorComplete: async () => ({
+						complete: false,
+						triggers: {
+							allAgentsDone: { enabled: false, met: false, detail: "" },
+							taskTrackerEmpty: { enabled: false, met: false, detail: "" },
+							onShutdownSignal: { enabled: false, met: false, detail: "" },
+						},
+					}),
+				});
+				const server = await startServer();
+				const res = await fetch(`http://127.0.0.1:${server.port}/api/coordinator/check-complete`, {
+					method: "POST",
+				});
+				expect(res.status).toBe(200);
+				const json = (await res.json()) as {
+					success: boolean;
+					data: { complete: boolean; triggers: Record<string, unknown> };
+				};
+				expect(json.success).toBe(true);
+				expect(json.data.complete).toBe(false);
+				expect(json.data.triggers).toBeDefined();
+			});
+		});
+
+		// ─── POST /api/coordinator/start ──────────────────────────────────────
+
+		describe("POST /api/coordinator/start", () => {
+			test("returns started: true when start succeeds (DI stub)", async () => {
+				reregisterWith({
+					startCoordinatorHeadless: async () => ({
+						started: true,
+						alreadyRunning: false,
+						pid: 12345,
+						runId: "run-new",
+					}),
+				});
+				const server = await startServer();
+				const res = await fetch(`http://127.0.0.1:${server.port}/api/coordinator/start`, {
+					method: "POST",
+				});
+				expect(res.status).toBe(200);
+				const json = (await res.json()) as {
+					success: boolean;
+					data: { started: boolean; pid: number };
+				};
+				expect(json.success).toBe(true);
+				expect(json.data.started).toBe(true);
+				expect(json.data.pid).toBe(12345);
+			});
+
+			test("returns alreadyRunning: true when session already exists", async () => {
+				ctx.sessionStore.upsert(makeCoordSession({ tmuxSession: "" }));
+				const server = await startServer();
+				const res = await fetch(`http://127.0.0.1:${server.port}/api/coordinator/start`, {
+					method: "POST",
+				});
+				expect(res.status).toBe(200);
+				const json = (await res.json()) as {
+					data: { alreadyRunning: boolean; started: boolean };
+				};
+				expect(json.data.alreadyRunning).toBe(true);
+				expect(json.data.started).toBe(false);
+			});
+
+			test("405 for GET", async () => {
+				const server = await startServer();
+				const res = await fetch(`http://127.0.0.1:${server.port}/api/coordinator/start`);
+				expect(res.status).toBe(405);
+			});
+		});
+
+		// ─── POST /api/coordinator/stop ───────────────────────────────────────
+
+		describe("POST /api/coordinator/stop", () => {
+			test("returns stopped: true when an active session exists (DI stub)", async () => {
+				ctx.sessionStore.upsert(makeCoordSession({ tmuxSession: "" }));
+				reregisterWith({
+					stopCoordinator: async () => ({ stopped: true }),
+				});
+				const server = await startServer();
+				const res = await fetch(`http://127.0.0.1:${server.port}/api/coordinator/stop`, {
+					method: "POST",
+				});
+				expect(res.status).toBe(200);
+				const json = (await res.json()) as { success: boolean; data: { stopped: boolean } };
+				expect(json.success).toBe(true);
+				expect(json.data.stopped).toBe(true);
+			});
+
+			test("returns stopped: false when no active session", async () => {
+				const server = await startServer();
+				const res = await fetch(`http://127.0.0.1:${server.port}/api/coordinator/stop`, {
+					method: "POST",
+				});
+				expect(res.status).toBe(200);
+				const json = (await res.json()) as { data: { stopped: boolean } };
+				expect(json.data.stopped).toBe(false);
+			});
 		});
 	});
 });

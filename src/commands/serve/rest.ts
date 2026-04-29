@@ -9,7 +9,7 @@
  */
 
 import { join } from "node:path";
-import { OverstoryError, ValidationError } from "../../errors.ts";
+import { AgentError, OverstoryError, ValidationError } from "../../errors.ts";
 import { createEventStore } from "../../events/store.ts";
 import { apiError, apiJson } from "../../json.ts";
 import type { MailStore } from "../../mail/store.ts";
@@ -18,6 +18,16 @@ import type { SessionStore } from "../../sessions/store.ts";
 import { createRunStore, createSessionStore } from "../../sessions/store.ts";
 import type { EventStore, RunStore } from "../../types.ts";
 import { registerApiHandler } from "../serve.ts";
+import {
+	askCoordinatorAction,
+	ConflictError,
+	type CoordinatorActionDeps,
+	checkCoordinatorComplete,
+	getCoordinatorState,
+	sendToCoordinator,
+	startCoordinatorHeadless,
+	stopCoordinator,
+} from "./coordinator-actions.ts";
 
 // ─── Cursor helpers ───────────────────────────────────────────────────────────
 
@@ -112,6 +122,11 @@ function paginateItems<T extends { id: string }>(
 
 function statusFromError(err: OverstoryError): number {
 	if (err instanceof ValidationError) return 400;
+	if (err instanceof ConflictError) return 409;
+	// AgentError with "not running" message — surface as 409 (preconditions
+	// failed) so the UI can offer a "start coordinator" affordance instead of
+	// treating it as a server-side fault.
+	if (err instanceof AgentError && /not running/i.test(err.message)) return 409;
 	return 500;
 }
 
@@ -123,6 +138,24 @@ export interface RestApiDeps {
 	_eventStore?: EventStore;
 	_mailStore?: MailStore;
 	_projectRoot?: string;
+	/**
+	 * Override coordinator action functions (used by tests). When omitted, the
+	 * production functions imported from ./coordinator-actions.ts are called.
+	 */
+	_coordinatorActions?: {
+		getCoordinatorState?: typeof getCoordinatorState;
+		sendToCoordinator?: typeof sendToCoordinator;
+		askCoordinatorAction?: typeof askCoordinatorAction;
+		checkCoordinatorComplete?: typeof checkCoordinatorComplete;
+		startCoordinatorHeadless?: typeof startCoordinatorHeadless;
+		stopCoordinator?: typeof stopCoordinator;
+	};
+	/**
+	 * Override the deps passed to coordinator-actions. When omitted, the actions
+	 * use deps.projectRoot to open their own short-lived stores. Tests pass
+	 * `_sessionStore` / `_mailStore` so actions reuse the test harness DBs.
+	 */
+	_coordinatorActionDeps?: Partial<CoordinatorActionDeps>;
 }
 
 interface Stores {
@@ -152,12 +185,78 @@ type RouteHandler = (
 	match: RegExpMatchArray,
 	params: URLSearchParams,
 	stores: Stores,
+	ctx: HandlerContext,
 ) => Promise<Response>;
 
 interface Route {
 	method: string;
 	pattern: RegExp;
 	handler: RouteHandler;
+}
+
+/**
+ * Per-request context passed to every handler. Holds the resolved coordinator
+ * action functions (live or DI-overridden) and the deps that drive them.
+ */
+interface HandlerContext {
+	projectRoot: string;
+	coordinatorActions: {
+		getCoordinatorState: typeof getCoordinatorState;
+		sendToCoordinator: typeof sendToCoordinator;
+		askCoordinatorAction: typeof askCoordinatorAction;
+		checkCoordinatorComplete: typeof checkCoordinatorComplete;
+		startCoordinatorHeadless: typeof startCoordinatorHeadless;
+		stopCoordinator: typeof stopCoordinator;
+	};
+	coordinatorActionDeps: CoordinatorActionDeps;
+}
+
+// ─── Body parsing ────────────────────────────────────────────────────────────
+
+async function readJsonBody<T>(req: Request, validate: (v: unknown) => T): Promise<T> {
+	let raw: unknown;
+	try {
+		raw = await req.json();
+	} catch {
+		throw new ValidationError("Invalid JSON body");
+	}
+	return validate(raw);
+}
+
+function asObject(v: unknown, msg: string): Record<string, unknown> {
+	if (v === null || typeof v !== "object" || Array.isArray(v)) {
+		throw new ValidationError(msg);
+	}
+	return v as Record<string, unknown>;
+}
+
+function requireString(obj: Record<string, unknown>, field: string): string {
+	const v = obj[field];
+	if (typeof v !== "string" || v.length === 0) {
+		throw new ValidationError(`Missing or invalid '${field}' (string)`, { field, value: v });
+	}
+	return v;
+}
+
+function optionalString(obj: Record<string, unknown>, field: string): string | undefined {
+	const v = obj[field];
+	if (v === undefined || v === null) return undefined;
+	if (typeof v !== "string") {
+		throw new ValidationError(`Invalid '${field}' (must be string)`, { field, value: v });
+	}
+	return v;
+}
+
+function optionalTimeoutSec(obj: Record<string, unknown>): number {
+	const v = obj.timeoutSec;
+	if (v === undefined || v === null) return 120;
+	if (typeof v !== "number" || !Number.isFinite(v) || v < 1 || v > 600) {
+		throw new ValidationError("Invalid 'timeoutSec' (must be a number 1..600)", {
+			field: "timeoutSec",
+			value: v,
+		});
+	}
+	return v;
 }
 
 // ─── Individual handlers ──────────────────────────────────────────────────────
@@ -338,6 +437,99 @@ async function handleMarkMailRead(
 	return apiJson({ id, read: true });
 }
 
+// ─── Coordinator handlers ─────────────────────────────────────────────────────
+
+async function handleCoordinatorState(
+	_req: Request,
+	_match: RegExpMatchArray,
+	_params: URLSearchParams,
+	_stores: Stores,
+	ctx: HandlerContext,
+): Promise<Response> {
+	const state = ctx.coordinatorActions.getCoordinatorState(ctx.coordinatorActionDeps);
+	return apiJson(state);
+}
+
+async function handleCoordinatorSend(
+	req: Request,
+	_match: RegExpMatchArray,
+	_params: URLSearchParams,
+	_stores: Stores,
+	ctx: HandlerContext,
+): Promise<Response> {
+	const { subject, body, from } = await readJsonBody(req, (raw) => {
+		const obj = asObject(raw, "Body must be a JSON object");
+		return {
+			subject: requireString(obj, "subject"),
+			body: requireString(obj, "body"),
+			from: optionalString(obj, "from"),
+		};
+	});
+	const result = await ctx.coordinatorActions.sendToCoordinator(
+		ctx.coordinatorActionDeps,
+		body,
+		from !== undefined ? { subject, from } : { subject },
+	);
+	return apiJson(result);
+}
+
+async function handleCoordinatorAsk(
+	req: Request,
+	_match: RegExpMatchArray,
+	_params: URLSearchParams,
+	_stores: Stores,
+	ctx: HandlerContext,
+): Promise<Response> {
+	const { subject, body, from, timeoutSec } = await readJsonBody(req, (raw) => {
+		const obj = asObject(raw, "Body must be a JSON object");
+		return {
+			subject: requireString(obj, "subject"),
+			body: requireString(obj, "body"),
+			from: optionalString(obj, "from"),
+			timeoutSec: optionalTimeoutSec(obj),
+		};
+	});
+	const result = await ctx.coordinatorActions.askCoordinatorAction(
+		ctx.coordinatorActionDeps,
+		body,
+		from !== undefined ? { subject, from, timeoutSec } : { subject, timeoutSec },
+	);
+	return apiJson(result);
+}
+
+async function handleCoordinatorCheckComplete(
+	_req: Request,
+	_match: RegExpMatchArray,
+	_params: URLSearchParams,
+	_stores: Stores,
+	ctx: HandlerContext,
+): Promise<Response> {
+	const result = await ctx.coordinatorActions.checkCoordinatorComplete(ctx.coordinatorActionDeps);
+	return apiJson(result);
+}
+
+async function handleCoordinatorStart(
+	_req: Request,
+	_match: RegExpMatchArray,
+	_params: URLSearchParams,
+	_stores: Stores,
+	ctx: HandlerContext,
+): Promise<Response> {
+	const result = await ctx.coordinatorActions.startCoordinatorHeadless(ctx.coordinatorActionDeps);
+	return apiJson(result);
+}
+
+async function handleCoordinatorStop(
+	_req: Request,
+	_match: RegExpMatchArray,
+	_params: URLSearchParams,
+	_stores: Stores,
+	ctx: HandlerContext,
+): Promise<Response> {
+	const result = await ctx.coordinatorActions.stopCoordinator(ctx.coordinatorActionDeps);
+	return apiJson(result);
+}
+
 // ─── Route table ─────────────────────────────────────────────────────────────
 
 const ROUTES: Route[] = [
@@ -349,6 +541,16 @@ const ROUTES: Route[] = [
 	{ method: "GET", pattern: /^\/api\/mail$/, handler: handleGetMail },
 	{ method: "GET", pattern: /^\/api\/mail\/([^/]+)$/, handler: handleGetMailMessage },
 	{ method: "POST", pattern: /^\/api\/mail\/([^/]+)\/read$/, handler: handleMarkMailRead },
+	{ method: "GET", pattern: /^\/api\/coordinator\/state$/, handler: handleCoordinatorState },
+	{ method: "POST", pattern: /^\/api\/coordinator\/send$/, handler: handleCoordinatorSend },
+	{ method: "POST", pattern: /^\/api\/coordinator\/ask$/, handler: handleCoordinatorAsk },
+	{
+		method: "POST",
+		pattern: /^\/api\/coordinator\/check-complete$/,
+		handler: handleCoordinatorCheckComplete,
+	},
+	{ method: "POST", pattern: /^\/api\/coordinator\/start$/, handler: handleCoordinatorStart },
+	{ method: "POST", pattern: /^\/api\/coordinator\/stop$/, handler: handleCoordinatorStop },
 ];
 
 // ─── Public registration ──────────────────────────────────────────────────────
@@ -360,10 +562,10 @@ const ROUTES: Route[] = [
  */
 export function registerRestApi(deps?: RestApiDeps): void {
 	let stores: Stores | null = null;
+	const projectRoot = deps?._projectRoot ?? process.cwd();
 
 	function getStores(): Stores {
 		if (stores !== null) return stores;
-		const root = deps?._projectRoot ?? (deps === undefined ? process.cwd() : process.cwd());
 
 		if (
 			deps?._runStore !== undefined &&
@@ -378,10 +580,24 @@ export function registerRestApi(deps?: RestApiDeps): void {
 				mail: deps._mailStore,
 			};
 		} else {
-			stores = openStores(root);
+			stores = openStores(projectRoot);
 		}
 		return stores;
 	}
+
+	const overrides = deps?._coordinatorActions ?? {};
+	const coordinatorActions = {
+		getCoordinatorState: overrides.getCoordinatorState ?? getCoordinatorState,
+		sendToCoordinator: overrides.sendToCoordinator ?? sendToCoordinator,
+		askCoordinatorAction: overrides.askCoordinatorAction ?? askCoordinatorAction,
+		checkCoordinatorComplete: overrides.checkCoordinatorComplete ?? checkCoordinatorComplete,
+		startCoordinatorHeadless: overrides.startCoordinatorHeadless ?? startCoordinatorHeadless,
+		stopCoordinator: overrides.stopCoordinator ?? stopCoordinator,
+	};
+	const coordinatorActionDeps: CoordinatorActionDeps = {
+		projectRoot,
+		...(deps?._coordinatorActionDeps ?? {}),
+	};
 
 	registerApiHandler((req: Request): Response | Promise<Response> | null => {
 		const url = new URL(req.url);
@@ -396,7 +612,12 @@ export function registerRestApi(deps?: RestApiDeps): void {
 				// Return Promise<Response> — never null — so the type is satisfied
 				return (async (): Promise<Response> => {
 					try {
-						return await route.handler(req, match, url.searchParams, getStores());
+						const ctx: HandlerContext = {
+							projectRoot,
+							coordinatorActions,
+							coordinatorActionDeps,
+						};
+						return await route.handler(req, match, url.searchParams, getStores(), ctx);
 					} catch (err) {
 						if (err instanceof OverstoryError) {
 							return apiError(err.message, statusFromError(err));
