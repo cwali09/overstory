@@ -7,9 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-04-30
+
+### Added
+
+#### Spawn-per-turn engine for headless Claude task workers (Phase 1–3)
+- **`src/agents/turn-runner.ts`** — `runTurn(opts)` drives a single user turn end-to-end: acquires the per-agent lock, re-reads `SessionStore` for fresh `claudeSessionId`, builds argv with `resumeSessionId`, spawns `claude` with a real stdin pipe (not a FIFO), drains `runtime.parseEvents`, captures `session_id`, tees events into `events.db`, snapshots `mail.db` for `worker_done` detection, applies state transitions (`booting → working`, `completed` when terminal mail observed), handles abort with `SIGTERM → SIGKILL` escalation, and releases the lock on every exit path (overstory-7b8c).
+- **`src/agents/turn-lock.ts`** — per-agent serialization with in-process `Promise` mutex plus a cross-process SQLite-backed lease at `.overstory/turn-locks.db`. Stale leases (dead PID) are stolen on next acquire.
+- **`src/agents/turn-runner-dispatch.ts`** — shared `buildRunTurnOptsFactory` and `isSpawnPerTurnAgent` helpers consumed by both `serve.ts` and `nudge.ts` so spawn-per-turn dispatch lives in one place.
+- **`src/agents/capabilities.ts`** — `isTaskScopedCapability()`, `terminalMailTypesFor()`, and `completionMailTypeFor()` define the canonical set of task-scoped capabilities and their terminal mail contracts. The dynamic overlay generator and runtime now derive the terminal `--type` from this single source of truth.
+- **Phase 3 generalization (overstory-2cf9)** — capability gate in dispatch swaps the builder-only check for `isTaskScopedCapability()`, routing builder, scout, reviewer, merger, and lead through the spawn-per-turn engine. The `claudeSpawnPerTurn` config flag is removed (no longer opt-in); legacy long-lived FIFO infrastructure (`headless-stdin.ts`, `headless-finalize.ts`, `watch-exit.ts`) is deleted.
+- **`ov sling` first user turn** is now driven through `runTurn` instead of spawning a long-lived headless process; subsequent turns are driven by `ov serve` (mail injection loop) and `ov nudge`.
+- **`ClaudeRuntime.buildDirectSpawn` `resumeSessionId`** — Phase 1 plumbing (overstory-7b8c) wires `--resume <id>` after `--model` when the field is non-empty. The headless tailer parses `session_id` from stream-json system/result events and pins it once per lifetime via `SessionStore.updateClaudeSessionId`; observed value wins on resume mismatch with a stderr warning and `_onResumeMismatch` DI hook for tests.
+
+#### Headless-equivalent hooks system (overstory-1c32)
+- **`HooksDef.isHeadless`** flag on `ClaudeRuntime.deployConfig` — headless agents skip `settings.local.json` template hooks (SessionStart / UserPromptSubmit / PostToolUse / Stop / PreCompact) but **still receive the dynamic `PreToolUse` security guards** (path boundary, capability blocks, bash danger patterns, tracker close, lead-close gate) so destructive operations are blocked equivalently to tmux mode.
+- **`src/agents/headless-prompt.ts`** — `buildInitialHeadlessPrompt()`, `encodeUserTurn()`, and `formatMailSection()` build the first user turn (prime + mail + beacon) for headless spawns.
+- **`src/agents/headless-mail-injector.ts`** — `startTurnRunnerMailLoop()` polls `mail.db`, batches unread messages into a single user turn, awaits `runTurn`, and only marks messages read on `exitCode === 0`. Re-entrancy guard prevents overlapping spawns; throws and non-zero exits leave messages unread for the next iteration.
+- **`docs/headless-hooks-design.md`** — full design doc for the headless-equivalent hooks pipeline (overstory-1c32).
+
+#### Coordinator console + mail compose in the web UI
+- **`/coordinator` chat console** — new `ui/src/routes/coordinator/{ConsolePage,Composer,Thread,EmptyState,PendingBubble,StatusPill,NewRunDialog,api}.tsx` providing a chat-style operator surface for the persistent coordinator: send / ask flows, thread rendering, status pill, slash-command popover with explicit dismissal, and a "start new run" affordance for stopped coordinators (overstory-82b4 / overstory-08a3 / overstory-0d64).
+- **`/api/coordinator/*` REST endpoints** — `state`, `send`, `ask`, `check-complete`, `start`, `stop` under `src/commands/serve/coordinator-actions.ts`. All write paths route through the headless connection registry and reject `409` when the active coordinator is tmux-only (overstory-82b4).
+- **Mail compose, reply, and per-row delete in the UI** — `ui/src/routes/mail/Composer.tsx` plus mail compose REST API in `src/commands/serve/mail-actions.ts` (overstory-2740).
+- **UI polish foundations** (overstory-d108) — `command-palette`, `connection-status`, `theme-toggle`, shadcn `command` / `dialog` / `dropdown-menu` / `sonner` primitives, `use-auto-scroll` / `use-scroll-fade` hooks, theme provider + toast helper, and `ws-status` integration into the app shell.
+- **os-eco forest branding** (overstory-29da) — `ui/src/index.css` adopts forest primary/accent/ring tokens with semantic `--success` / `--warning` colors; `ui/src/lib/brand.ts` exposes `TOOL_BRAND` + `toolHex`/`toolRgb` helpers; new stacked-bars `Logo.tsx`, `favicon.svg`, and `apple-touch-icon.png` ship in `ui/public/`.
+
+#### `ov serve` build pipeline + `--dev` HMR proxy
+- **Auto-build UI in production** — `src/commands/serve/build.ts` `ensureUiBuild()` runs `bun install` (when `node_modules` missing) and `bun run build` whenever `ui/dist/index.html` is absent or older than any tracked source/config under `ui/`. `runServe` invokes it before binding the port unless `--dev` or the `_skipAutoBuild` test hook is set.
+- **`--dev` / `--dev-port` flags** — `src/commands/serve/dev.ts` spawns `ui/dev-server.ts` (Bun HMR with `/api`+`/ws` proxy back to the main port) and threads its `stop()` into the graceful-shutdown chain. `ui/package.json` `dev` script now points at `./dev-server.ts` so HMR runs through the proxy script.
+
+#### Watchdog: atomic PID lock + multi-daemon recovery (overstory-8ef6)
+- **`acquirePidLock()`** in `src/utils/pid.ts` uses the write-temp-then-link pattern for true atomic PID-file acquisition. `fs.open(..., 'wx')` alone is insufficient: the file appears at the lock path before `writeFile` completes, letting a racing reader reclaim mid-write. `link()` is the proper atomic primitive — the lock path appears with full content already present.
+- **Foreground `ov watch`** acquires the lock atomically and refuses on contested lock instead of trampling. **Background mode** keeps the friendly pre-check and adds a post-spawn atomic acquire; if a racing writer wins, the just-spawned child is `SIGTERM`'d.
+- **`ov watch --kill-others`** flag for explicit recovery from pre-fix multi-daemon state. Polls for killed PIDs to be reaped before reclaiming the PID file so the immediate self-start does not race a still-alive zombie.
+- **`findRunningWatchdogProcesses()`** in `src/utils/process-scan.ts` scans `ps` for live `ov watch` daemons.
+- **`ov doctor --category watchdog`** gains a multi-daemon check (fixable): flags any case with > 1 live `ov watch` and points at `--kill-others`.
+
+#### Headless RuntimeConnection scaffold (overstory-63d5 / overstory-1f66 / overstory-32cd)
+- **`HeadlessClaudeConnection`** in `src/runtimes/headless-connection.ts` wraps a `Bun.Subprocess` stdin/PID into the `RuntimeConnection` interface: stdin write → `sendPrompt`/`followUp`, `kill(pid, 0)` → `getState`, `SIGTERM`+`SIGKILL` → `abort`. `registerHeadlessConnection()` factory in `src/runtimes/connections.ts`.
+- **`ov nudge` headless path** — `HeadlessClaudeConnection.nudge()` writes a stream-json user-message envelope to the agent's stdin. `nudge.ts` checks `getConnection()` first and routes headless agents through `conn.nudge()`; tmux agents fall through to `send-keys` unchanged. Debounce and `EventStore` recording apply to both paths. `NudgeableConnection` interface + `hasNudge()` type guard let `nudge.ts` detect headless support without modifying `RuntimeConnection`.
+- **Watchdog runtime-agnostic kill** — `killAgent()` prefers `conn.abort()` when a `RuntimeConnection` is registered, falling back to PID/tmux kill only if `abort()` throws. The liveness check is unified: `conn.getState()` drives `tmuxAlive` when a connection exists, falling back to `tmux.isSessionAlive()` otherwise.
+
+#### Direction & Design Docs
+- **`docs/design/containerize-swarms.md`** — design proposal for sandboxing swarm runs in containers (overstory-e2f1).
+- **`docs/headless-hooks-design.md`** — design doc for the headless-equivalent hooks system (overstory-1c32).
+- **`docs/direction-ui-and-ipc.md`** — "Operator surface" section gains a shipped-status callout now that Phase 3 and the default flip have landed (overstory-9cee).
+
 ### Changed
 
-#### Headless Claude is the new default for new projects
+#### Headless Claude is the new default for new projects (overstory-caec / overstory-9cee)
 - **`ov init` now writes `runtime.claudeHeadlessByDefault: true`** into the freshly-generated `.overstory/config.yaml` (`src/commands/init.ts`). New projects spawn Claude agents headless out of the box; the web UI (`ov serve`, then open http://localhost:8080) is the primary operator surface and tmux is opt-in via `ov sling --no-headless` (overstory-caec).
 - **Existing projects keep tmux behavior on upgrade.** The fallback default in `resolveUseHeadless` (`src/commands/sling.ts`) remains `false`, so projects that already have a `config.yaml` without the field continue to spawn into tmux until they explicitly add `runtime.claudeHeadlessByDefault: true` (or pass `--headless` per spawn). To opt in: edit `.overstory/config.yaml` and add the field under `runtime:`, or re-run `ov init --yes` to regenerate the config from the new template.
 - **CLAUDE.md template updated** (`templates/CLAUDE.md.tmpl`) to describe the headless-default + UI-first workflow with `--no-headless` documented as the tmux escape hatch.
@@ -19,6 +66,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `ov init` post-init hint and `ov coordinator start` post-start hint both point operators at `ov serve` first.
   - `templates/CLAUDE.md.tmpl` — adds a top-level "web UI is your primary operator surface" paragraph and reframes "Checking Status" to lead with the UI before listing the CLI alternatives.
   - `docs/direction-ui-and-ipc.md` — "Operator surface" section gains a shipped-status callout (Phase 3 + default flip both landed).
+
+#### Operator console polish (overstory-1041)
+- Standardized spacing, border weight, and typography hierarchy across the Coordinator console, Fleet, Mail, and Agent surfaces. The chosen scale is documented as a comment block in `ui/src/index.css` so future surfaces can reach for the same tokens.
+- Coordinator: `text-xl tracking-tight` headers, `max-w-4xl` thread, rounded-xl bubbles with `shadow-sm`, readable `text-xs` timestamps, composer breathing room and focus-ring polish.
+- Fleet: page max-width, uppercase `tabular-nums` summary cards, table wrapped in `rounded-xl/border-border` shell with `h-11` headers.
+
+### Fixed
+
+#### Headless agent observability + reachability
+- **`ov nudge` and mail delivery to headless agents** — `ov sling` and `ov serve` are separate processes, so the in-memory connection registry that the mail injector and nudge subscribed to was always empty in serve's process; headless agents were structurally unreachable for the entire duration of their run. Fixed by routing through the shared `RuntimeConnection` registry and (for spawn-per-turn agents) the dispatcher (overstory-41eb / overstory-1f66).
+- **PreToolUse security hooks deployed for headless Claude agents** — the original overstory-1c32 design assumed headless mode did not load `.claude/settings.local.json` PreToolUse hooks. Verified empirically that it does, so `deployHooks(headlessOnly=true)` now drops the template entries and keeps the dynamic `PreToolUse` guards (path boundary, capability blocks, bash danger, tracker close, lead close gate) for both modes (overstory-e24b).
+- **Headless agent sessions finalize on subprocess exit** — pre-Phase 3, headless mode's per-turn `Stop` hook never fired, so `SessionStore` stayed at `working` indefinitely after `ov sling` exited. Fixed via a detached `__watch-exit` polling subprocess (later subsumed by Phase 3 / overstory-2cf9, which deletes the helper now that `runTurn` owns lifecycle) (overstory-267e).
+- **Headless leads self-terminate after `sd close`** — fixed a path where headless leads stayed alive after closing their own task (overstory-6fc9).
+
+#### Spawn-per-turn correctness
+- **`worker_done` terminal contract enforced** (overstory-1a4c) — workers were sending `--type result` instead of `--type worker_done` as their terminal exit signal, leaving spawn-per-turn sessions stuck in `working` until the watchdog flipped them to `zombie`. Root cause: the dynamic overlay (`src/agents/overlay.ts` and `templates/overlay.md.tmpl`) injected `--type result` as the per-task completion instruction in three places, overriding the `worker_done` guidance in the base agent `.md` prompts. Two-part fix: (A) backstop in `capabilities.ts` so `terminalMailTypesFor()` accepts both `worker_done` and `result` for builder/scout/reviewer/lead — safe because the runner also requires `cleanResult` (Claude exited cleanly at end-of-turn); (B) tightened prompts so the dynamic overlay derives the terminal `--type` from `capabilities.ts` via `completionMailTypeFor()`, with all base agent docs updated to use `worker_done` (or `merged` for merger).
+- **`runTurn` cleanup-contract violations are diagnosable** (overstory-4af3) — silent catches around `SessionStore` writes and `turn.pid` I/O hid the original symptom (`turn.pid` leaked + `lastActivity` frozen at `startedAt`). Per-turn `RunnerLogger` now writes to `<turnLogDir>/runner.log` + `process.stderr` with a `[turn-runner:level]` prefix; explicit contract assertions (`existsSync(turn.pid)` after `unlink`, `updateSessionLastActivity` returning `false`) surface loudly instead of disappearing.
+
+#### UI
+- **Coordinator slash menu hidden by default** — empty input was treated as "slash-only", so the hint menu rendered on mount and required a click-off to dismiss before typing.
+- **Slash-command popover dismissal** — explicit dismissal in the composer prevents stuck popover state.
+
+#### Tests
+- **`log.test.ts` `--stdin` subprocess isolation** (overstory-6830) — subprocesses no longer inherit the parent shell's `OVERSTORY_PROJECT_ROOT`, so the suite is robust to the environment-injection added in 0.9.4.
+
+### Testing
+
+- 4101 tests across 133 files (9620 `expect()` calls)
+- New: `src/agents/turn-runner.test.ts` (959 lines), `src/agents/turn-lock.test.ts` (181 lines), `src/agents/turn-runner-dispatch.test.ts` (182 lines) — spawn-per-turn engine coverage
+- New: `src/agents/headless-mail-injector.test.ts`, `src/agents/headless-prompt.test.ts`, `src/agents/capabilities.test.ts`
+- New: `src/runtimes/headless-connection.test.ts` (264 lines), expanded `src/runtimes/connections.test.ts` and `src/runtimes/claude.test.ts`
+- New: `src/commands/serve/build.test.ts` (188 lines), `src/commands/serve/dev.test.ts` (168 lines), `src/commands/serve/coordinator-actions.test.ts` (339 lines), `src/commands/serve/mail-actions.test.ts` (312 lines), expanded `src/commands/serve/rest.test.ts`
+- New: `src/commands/coordinator.test.ts` (127 lines), `src/commands/dashboard.test.ts` (mixed-swarm and headless-dead-with-tmux-list regressions), expanded `src/commands/nudge.test.ts` (307 lines), `src/commands/watch.test.ts`
+- New: `src/utils/process-scan.test.ts`, expanded `src/utils/pid.test.ts` (atomic acquire, link-based primitive)
+- New: `src/watchdog/daemon.test.ts` expansion (363 lines — runtime-agnostic abort path), `src/worktree/process.test.ts`
+- New: `src/events/tailer.test.ts` (235 lines — session_id capture, resume mismatch handling)
 
 ## [0.10.1] - 2026-04-28
 
@@ -1843,7 +1926,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Biome configuration for formatting and linting
 - TypeScript strict mode with `noUncheckedIndexedAccess`
 
-[Unreleased]: https://github.com/jayminwest/overstory/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/jayminwest/overstory/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/jayminwest/overstory/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/jayminwest/overstory/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/jayminwest/overstory/compare/v0.9.4...v0.10.0
 [0.9.4]: https://github.com/jayminwest/overstory/compare/v0.9.3...v0.9.4

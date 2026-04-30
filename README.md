@@ -286,7 +286,7 @@ overstory/
       run.ts                      Orchestration run lifecycle
       trace.ts                    Agent/task timeline viewing
       clean.ts                    Worktree/session cleanup
-      doctor.ts                   Health check runner (12 check modules)
+      doctor.ts                   Health check runner (13 check modules)
       inspect.ts                  Deep per-agent inspection
       spec.ts                     Task spec management
       errors.ts                   Aggregated error view
@@ -319,7 +319,7 @@ overstory/
     watchdog/                     Tiered health monitoring (daemon, triage, health)
     logging/                      Multi-format logger + sanitizer + reporter + color control + shared theme/format
     metrics/                      SQLite metrics + pricing + transcript parsing
-    doctor/                       Health check modules (12 checks)
+    doctor/                       Health check modules (13 checks)
     utils/                        Shared utilities (bin, fs, pid, time, version)
     insights/                     Session insight analyzer for auto-expertise
     runtimes/                     AgentRuntime abstraction (registry + adapters: Claude, Pi, Copilot, Codex, Gemini, Sapling, OpenCode, Cursor, Aider, Goose, Amp)
