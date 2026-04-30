@@ -30,17 +30,8 @@
  * table are always up-to-date because they reflect real kernel state.
  */
 
+import { isPersistentCapability } from "../agents/capabilities.ts";
 import type { AgentSession, AgentState, HealthCheck } from "../types.ts";
-
-/**
- * Agent capabilities that run as persistent interactive sessions.
- * These agents are expected to have long idle periods (e.g. coordinator waiting
- * for worker mail) and should NOT be flagged stale/zombie based on lastActivity.
- * Only tmux/pid liveness checks apply to them.
- *
- * Shared concept with src/commands/log.ts:PERSISTENT_CAPABILITIES.
- */
-const PERSISTENT_CAPABILITIES = new Set(["coordinator", "orchestrator", "monitor"]);
 
 /** Numeric ordering for forward-only state transitions. */
 const STATE_ORDER: Record<AgentState, number> = {
@@ -98,7 +89,7 @@ function evaluateTimeBased(
 	// Persistent capabilities (coordinator, monitor) are expected to have long idle
 	// periods waiting for mail/events. Skip time-based stale/zombie detection for
 	// them — only tmux/pid liveness matters (checked above).
-	if (PERSISTENT_CAPABILITIES.has(session.capability)) {
+	if (isPersistentCapability(session.capability)) {
 		// Transition booting → working if we reach here (process alive)
 		const state = session.state === "booting" ? "working" : session.state;
 		return {

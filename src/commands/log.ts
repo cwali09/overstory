@@ -12,6 +12,7 @@
 
 import { join } from "node:path";
 import { Command } from "commander";
+import { isStopHookPersistentCapability } from "../agents/capabilities.ts";
 import { updateIdentity } from "../agents/identity.ts";
 import { loadConfig } from "../config.ts";
 import { ValidationError } from "../errors.ts";
@@ -79,22 +80,13 @@ function updateLastActivity(projectRoot: string, agentName: string): void {
 }
 
 /**
- * Agent capabilities that run as persistent interactive sessions.
- * The Stop hook fires every turn for these agents (not just at session end),
- * so they must NOT auto-transition to 'completed' on session-end events.
- *
- * Leads are persistent: they delegate to builders/scouts/reviewers and then
- * wait for results (overstory-49a7). Their completion is signaled by
- * `ov stop <lead>` or the watchdog detecting a dead process — not per-turn Stop.
- */
-const PERSISTENT_CAPABILITIES = new Set(["coordinator", "orchestrator", "monitor", "lead"]);
-
-/**
  * Transition agent state to 'completed' in the SessionStore.
  * Called when session-end event fires.
  *
- * Skips the transition for persistent agent types (coordinator, orchestrator, monitor, lead)
- * whose Stop hook fires every turn, not just at true session end.
+ * Skips the transition for capabilities in `STOP_HOOK_PERSISTENT_CAPABILITIES`
+ * (coordinator, orchestrator, monitor, lead) whose Stop hook fires every model
+ * turn rather than once at true session end. See
+ * `src/agents/capabilities.ts` for the full rationale and consumer list.
  *
  * Non-fatal: silently ignores errors to avoid breaking hook execution.
  */
@@ -104,7 +96,7 @@ function transitionToCompleted(projectRoot: string, agentName: string): void {
 		const { store } = openSessionStore(overstoryDir);
 		try {
 			const session = store.getByName(agentName);
-			if (session && PERSISTENT_CAPABILITIES.has(session.capability)) {
+			if (session && isStopHookPersistentCapability(session.capability)) {
 				// Check if a persistent top-level agent self-exited by verifying the run
 				// is already completed.
 				// If `ov run complete` was called before session-end, the run status is 'completed'
@@ -712,7 +704,7 @@ async function runLog(opts: {
 
 					// Auto-record expertise via mulch learn + record (post-session).
 					// Skip persistent agents whose Stop hook fires every turn.
-					if (!PERSISTENT_CAPABILITIES.has(agentSession.capability)) {
+					if (!isStopHookPersistentCapability(agentSession.capability)) {
 						try {
 							const mulchClient = createMulchClient(config.project.root);
 							const mailDbPath = join(config.project.root, ".overstory", "mail.db");
@@ -733,7 +725,7 @@ async function runLog(opts: {
 
 					// Append outcomes to applied mulch records (outcome feedback loop).
 					// Reads applied-records.json written by sling.ts at spawn time.
-					if (!PERSISTENT_CAPABILITIES.has(agentSession.capability)) {
+					if (!isStopHookPersistentCapability(agentSession.capability)) {
 						try {
 							const mulchClient = createMulchClient(config.project.root);
 							await appendOutcomeToAppliedRecords({

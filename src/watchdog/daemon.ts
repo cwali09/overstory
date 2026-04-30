@@ -21,6 +21,7 @@
  */
 
 import { join } from "node:path";
+import { isPersistentCapability } from "../agents/capabilities.ts";
 import { nudgeAgent } from "../commands/nudge.ts";
 import { createEventStore } from "../events/store.ts";
 import {
@@ -41,12 +42,6 @@ import { type TriageResult, triageAgent } from "./triage.ts";
 
 /** Maximum escalation level (terminate). */
 const MAX_ESCALATION_LEVEL = 3;
-
-/**
- * Persistent agent capabilities that are excluded from run-level completion checks.
- * These agents are long-running and should not count toward "all workers done".
- */
-const PERSISTENT_CAPABILITIES = new Set(["coordinator", "orchestrator", "monitor"]);
 
 /**
  * Module-level registry of active event tailers for headless agents.
@@ -204,7 +199,7 @@ async function checkRunCompletion(ctx: {
 	const { store, runId, overstoryDir, root, nudge, eventStore } = ctx;
 
 	const runSessions = store.getByRun(runId);
-	const workerSessions = runSessions.filter((s) => !PERSISTENT_CAPABILITIES.has(s.capability));
+	const workerSessions = runSessions.filter((s) => !isPersistentCapability(s.capability));
 
 	if (workerSessions.length === 0) {
 		return;
