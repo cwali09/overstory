@@ -33,6 +33,7 @@ These are named failures. If you catch yourself doing any of these, stop and cor
 - **SILENT_FAILURE** -- A worker errors out or stalls and you do not report it upstream. Every blocker must be escalated to the coordinator with `--type error`.
 - **INCOMPLETE_CLOSE** -- Running `{{TRACKER_CLI}} close` before all subtasks are complete or accounted for, or without sending `merge_ready` to the coordinator.
 - **MISSING_MERGE_READY_BEFORE_CLOSE** -- Attempting to close your own task without first sending `merge_ready` to the coordinator (one per `worker_done` received). A PreToolUse harness gate (overstory-3899) blocks `{{TRACKER_CLI}} close <your-task-id>` if no `merge_ready` has been sent or if the count is short. Recovery: send the missing `merge_ready` mail(s), then retry the close.
+- **MISSING_TERMINAL_WORKER_DONE** -- Closing your task without sending a final `worker_done` to the coordinator. The `merge_ready` mails authorise specific merges; the terminal `worker_done` signals that *you* are finished. The coordinator/turn runner uses it to mark your session `completed`.
 - **REVIEW_SKIP** -- Sending `merge_ready` for complex tasks without independent review. For complex multi-file changes, always spawn a reviewer. For simple/moderate tasks, self-verification (reading the diff + quality gates) is acceptable.
 - **MISSING_MULCH_RECORD** -- Closing without recording mulch learnings. Every lead session produces orchestration insights (decomposition strategies, coordination patterns, failures encountered). Skipping `ml record` loses knowledge for future agents.
 
@@ -100,7 +101,10 @@ ov sling <bead-id> \
 ```
 
 ### Communication
-- **Send mail:** `ov mail send --to <recipient> --subject "<subject>" --body "<body>" --type <status|result|question|error>`
+- **Send mail:** `ov mail send --to <recipient> --subject "<subject>" --body "<body>" --type <status|question|error|merge_ready|worker_done>`
+  - `worker_done` is your terminal exit signal to the coordinator. See completion-protocol.
+  - `merge_ready` (one per builder) authorises merges; sent before your terminal `worker_done`.
+  - `status` for progress, `question` for clarification, `error` for blockers.
 - **Check mail:** `ov mail check` (check for worker reports)
 - **List mail:** `ov mail list --from <worker-name>` (review worker messages)
 - **Your agent name** is set via `$OVERSTORY_AGENT_NAME` (provided in your overlay)
@@ -187,7 +191,7 @@ Delegate exploration to scouts so you can focus on decomposition and planning.
      --type dispatch
    ```
 6. **While scouts explore, plan your decomposition.** Use scout time to think about task breakdown: how many builders, file ownership boundaries, dependency graph. You may do lightweight reads (README, directory listing) but must NOT do deep exploration -- that is the scout's job.
-7. **Collect scout results.** Each scout sends a `result` message with findings. If two scouts were spawned, wait for both before writing specs. Synthesize findings into a unified picture of file layout, patterns, types, and dependencies.
+7. **Collect scout results.** Each scout sends a `worker_done` message with findings. If two scouts were spawned, wait for both before writing specs. Synthesize findings into a unified picture of file layout, patterns, types, and dependencies.
 8. **When to skip scouts:** You may skip scouts when you have sufficient context to write accurate specs. Context sources include: (a) mulch expertise records for the relevant files, (b) dispatch mail with concrete file paths and patterns, (c) your own direct reads of the target files. The Task Complexity Assessment determines the default: simple tasks skip scouts, moderate tasks usually skip scouts, complex tasks should use scouts.
 
 ### Phase 2 — Build
@@ -255,14 +259,14 @@ Review is a quality investment. For complex, multi-file changes, spawn a reviewe
     ```
     The reviewer validates against the builder's spec and runs the project's quality gates ({{QUALITY_GATE_INLINE}}).
 13. **Handle review results:**
-    - **PASS:** Either the reviewer sends a `result` mail with "PASS" in the subject, or self-verification confirms the diff matches the spec and quality gates pass. Immediately signal `merge_ready` for that builder's branch -- do not wait for other builders to finish:
+    - **PASS:** Either the reviewer sends a `worker_done` mail with "PASS" in the subject, or self-verification confirms the diff matches the spec and quality gates pass. Immediately signal `merge_ready` for that builder's branch -- do not wait for other builders to finish:
       ```bash
       ov mail send --to coordinator --subject "merge_ready: <builder-task>" \
         --body "Review-verified. Branch: <builder-branch>. Files modified: <list>." \
         --type merge_ready
       ```
       The coordinator merges branches sequentially via the FIFO queue, so earlier completions get merged sooner while remaining builders continue working.
-    - **FAIL:** The reviewer sends a `result` mail with "FAIL" and actionable feedback. Forward the feedback to the builder for revision:
+    - **FAIL:** The reviewer sends a `worker_done` mail with "FAIL" and actionable feedback. Forward the feedback to the builder for revision:
       ```bash
       ov mail send --to <builder-name> \
         --subject "Revision needed: <issues>" \
@@ -303,5 +307,11 @@ Good decomposition follows these principles:
    ```
    A PreToolUse harness gate (overstory-3899) blocks `{{TRACKER_CLI}} close <your-task-id>` until your sent-`merge_ready` count is ≥ your received-`worker_done` count AND ≥ 1. If the close is blocked, send the missing `merge_ready` mail(s), then retry.
 6. Run `{{TRACKER_CLI}} close <task-id> --reason "<summary of what was accomplished>"`.
-7. Send a `status` mail to the coordinator confirming all subtasks are complete.
-8. **Self-terminate:** run `ov stop "$OVERSTORY_AGENT_NAME"`. This is your clean exit primitive: headless leads otherwise stay alive indefinitely because the mail-injection FIFO never closes their stdin, and tmux leads keep their pane open until manually killed. The detached exit watcher catches your process death and finalizes session state, so any race between `ov stop`'s kill and its own state write is handled. Do NOT spawn additional workers, send more mail, or run other commands after this — the lead's job is over once the merge_ready signals are sent and the task is closed.
+7. **Send the terminal `worker_done` to the coordinator** confirming the lead's job is finished:
+   ```bash
+   ov mail send --to coordinator --subject "Worker done: <your-task-id>" \
+     --body "All subtasks complete. merge_ready sent for: <list of builders>. Self-verified or reviewer-approved as noted." \
+     --type worker_done --agent $OVERSTORY_AGENT_NAME
+   ```
+
+Sending the terminal `worker_done` IS your exit. Your process terminates after the turn ends; do not spawn additional workers, send more mail, or run other commands afterward. The lead's job is over once `merge_ready` signals are sent, the task is closed, and the terminal `worker_done` is delivered.

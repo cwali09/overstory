@@ -219,10 +219,12 @@ function makeRunOpts(
 		abortSignal?: AbortSignal;
 		sigkillDelayMs?: number;
 		runId?: string | null;
+		capability?: string;
 	},
 ): Parameters<typeof runTurn>[0] {
 	return {
 		agentName,
+		capability: overrides.capability ?? "builder",
 		overstoryDir: ctx.overstoryDir,
 		worktreePath: ctx.worktreePath,
 		projectRoot: ctx.projectRoot,
@@ -284,7 +286,7 @@ describe("runTurn", () => {
 		expect(spawnCount).toBe(0);
 		expect(result.exitCode).toBeNull();
 		expect(result.cleanResult).toBe(false);
-		expect(result.workerDoneObserved).toBe(false);
+		expect(result.terminalMailObserved).toBe(false);
 		expect(result.durationMs).toBe(0);
 		expect(result.initialState).toBe("working");
 		expect(result.finalState).toBe("working");
@@ -311,7 +313,7 @@ describe("runTurn", () => {
 		expect(result.cleanResult).toBe(true);
 		expect(result.newSessionId).toBe("claude-sess-A");
 		expect(result.resumeMismatch).toBe(false);
-		expect(result.workerDoneObserved).toBe(false);
+		expect(result.terminalMailObserved).toBe(false);
 		// initial=booting, no worker_done → working (idle) finalState
 		expect(result.initialState).toBe("booting");
 		expect(result.finalState).toBe("working");
@@ -380,7 +382,7 @@ describe("runTurn", () => {
 		expect(after?.claudeSessionId).toBe("actually-new");
 	});
 
-	test("workerDoneObserved + clean exit → completed state", async () => {
+	test("terminalMailObserved + clean exit → completed state", async () => {
 		seedSession(ctx.sessionsDbPath, { agentName: "wd", state: "working" });
 		const { runtime } = makeSpyRuntime();
 
@@ -441,7 +443,7 @@ describe("runTurn", () => {
 
 		const result = await runTurn(makeRunOpts(ctx, "wd", { runtime, _spawnFn: spawnFn }));
 
-		expect(result.workerDoneObserved).toBe(true);
+		expect(result.terminalMailObserved).toBe(true);
 		expect(result.cleanResult).toBe(true);
 		expect(result.finalState).toBe("completed");
 
@@ -462,7 +464,178 @@ describe("runTurn", () => {
 		const result = await runTurn(makeRunOpts(ctx, "idle", { runtime, _spawnFn: spawnFn }));
 
 		expect(result.cleanResult).toBe(true);
-		expect(result.workerDoneObserved).toBe(false);
+		expect(result.terminalMailObserved).toBe(false);
+		expect(result.finalState).toBe("working");
+	});
+
+	test("merger: merged mail counts as terminal → completed", async () => {
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "mg",
+			capability: "merger",
+			state: "working",
+		});
+		const { runtime } = makeSpyRuntime();
+
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			(async () => {
+				await Bun.sleep(20);
+				const s = createMailStore(ctx.mailDbPath);
+				try {
+					createMailClient(s).sendProtocol({
+						from: "mg",
+						to: "lead",
+						subject: "Merged: feature/foo",
+						body: "ok",
+						type: "merged",
+						priority: "normal",
+						payload: { branch: "feature/foo", taskId: "t-mg", tier: "clean-merge" },
+					});
+				} finally {
+					s.close();
+				}
+				emitFakeTurn(fake, { sessionId: "mg-session" });
+				fake._exit(0);
+			})();
+			return fake;
+		};
+
+		const result = await runTurn(
+			makeRunOpts(ctx, "mg", { runtime, _spawnFn: spawnFn, capability: "merger" }),
+		);
+
+		expect(result.terminalMailObserved).toBe(true);
+		expect(result.finalState).toBe("completed");
+	});
+
+	test("merger: merge_failed mail also counts as terminal → completed", async () => {
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "mgf",
+			capability: "merger",
+			state: "working",
+		});
+		const { runtime } = makeSpyRuntime();
+
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			(async () => {
+				await Bun.sleep(20);
+				const s = createMailStore(ctx.mailDbPath);
+				try {
+					createMailClient(s).sendProtocol({
+						from: "mgf",
+						to: "lead",
+						subject: "Merge failed: feature/bar",
+						body: "conflict",
+						type: "merge_failed",
+						priority: "high",
+						payload: {
+							branch: "feature/bar",
+							taskId: "t-mgf",
+							conflictFiles: ["src/foo.ts"],
+							errorMessage: "conflict",
+						},
+					});
+				} finally {
+					s.close();
+				}
+				emitFakeTurn(fake, { sessionId: "mgf-session" });
+				fake._exit(0);
+			})();
+			return fake;
+		};
+
+		const result = await runTurn(
+			makeRunOpts(ctx, "mgf", { runtime, _spawnFn: spawnFn, capability: "merger" }),
+		);
+
+		expect(result.terminalMailObserved).toBe(true);
+		expect(result.finalState).toBe("completed");
+	});
+
+	test("scout: --type result mail counts as terminal → completed (overstory-1a4c)", async () => {
+		// Regression for overstory-1a4c: workers frequently send `--type result`
+		// instead of `--type worker_done` because both are valid mail types and
+		// the agent prompts described `result` as a completion signal in some
+		// examples. Pre-fix, this left sessions stuck in `working` until the
+		// watchdog flipped them to `zombie`. The runner now accepts `result` as
+		// a terminal type for builder/scout/reviewer/lead.
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "scout-result",
+			capability: "scout",
+			state: "working",
+		});
+		const { runtime } = makeSpyRuntime();
+
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			(async () => {
+				await Bun.sleep(20);
+				const s = createMailStore(ctx.mailDbPath);
+				try {
+					createMailClient(s).send({
+						from: "scout-result",
+						to: "coordinator",
+						subject: "Spec ready: overstory-4670",
+						body: "Spec written.",
+						type: "result",
+						priority: "normal",
+					});
+				} finally {
+					s.close();
+				}
+				emitFakeTurn(fake, { sessionId: "scout-result-session" });
+				fake._exit(0);
+			})();
+			return fake;
+		};
+
+		const result = await runTurn(
+			makeRunOpts(ctx, "scout-result", { runtime, _spawnFn: spawnFn, capability: "scout" }),
+		);
+
+		expect(result.terminalMailObserved).toBe(true);
+		expect(result.cleanResult).toBe(true);
+		expect(result.finalState).toBe("completed");
+	});
+
+	test("merger: worker_done is NOT terminal for merger → stays working", async () => {
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "mg-wd",
+			capability: "merger",
+			state: "working",
+		});
+		const { runtime } = makeSpyRuntime();
+
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			(async () => {
+				await Bun.sleep(20);
+				const s = createMailStore(ctx.mailDbPath);
+				try {
+					createMailClient(s).sendProtocol({
+						from: "mg-wd",
+						to: "lead",
+						subject: "Worker done (wrong type for merger)",
+						body: "x",
+						type: "worker_done",
+						priority: "normal",
+						payload: { taskId: "t", branch: "b", exitCode: 0, filesModified: [] },
+					});
+				} finally {
+					s.close();
+				}
+				emitFakeTurn(fake, { sessionId: "mg-wd-session" });
+				fake._exit(0);
+			})();
+			return fake;
+		};
+
+		const result = await runTurn(
+			makeRunOpts(ctx, "mg-wd", { runtime, _spawnFn: spawnFn, capability: "merger" }),
+		);
+
+		expect(result.terminalMailObserved).toBe(false);
 		expect(result.finalState).toBe("working");
 	});
 
