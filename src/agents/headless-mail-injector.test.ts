@@ -38,6 +38,8 @@ describe("startTurnRunnerMailLoop", () => {
 			durationMs: 1,
 			initialState: "booting",
 			finalState: "working",
+			stallAborted: false,
+			terminalMailMissing: false,
 			...result,
 		};
 		return {
@@ -359,6 +361,8 @@ describe("startTurnRunnerMailLoop", () => {
 				durationMs: 0,
 				initialState: "booting",
 				finalState: "working",
+				stallAborted: false,
+				terminalMailMissing: false,
 			};
 		};
 

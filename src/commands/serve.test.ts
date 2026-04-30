@@ -326,6 +326,8 @@ describe("installMailInjectors", () => {
 					durationMs: 1,
 					initialState: "booting" as const,
 					finalState: "working" as const,
+					stallAborted: false,
+					terminalMailMissing: false,
 				};
 			},
 		};

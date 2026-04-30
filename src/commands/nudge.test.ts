@@ -442,6 +442,8 @@ describe("nudgeAgent spawn-per-turn dispatch", () => {
 				durationMs: 1,
 				initialState: "booting" as const,
 				finalState: "working" as const,
+				stallAborted: false,
+				terminalMailMissing: false,
 			};
 		};
 
@@ -476,6 +478,8 @@ describe("nudgeAgent spawn-per-turn dispatch", () => {
 				durationMs: 1,
 				initialState: "booting" as const,
 				finalState: "working" as const,
+				stallAborted: false,
+				terminalMailMissing: false,
 			};
 		};
 
@@ -506,6 +510,8 @@ describe("nudgeAgent spawn-per-turn dispatch", () => {
 				durationMs: 1,
 				initialState: "booting" as const,
 				finalState: "working" as const,
+				stallAborted: false,
+				terminalMailMissing: false,
 			};
 		};
 

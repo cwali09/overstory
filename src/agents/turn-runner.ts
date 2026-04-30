@@ -111,6 +111,16 @@ export interface RunTurnOpts {
 	abortSignal?: AbortSignal;
 	/** Time between SIGTERM and SIGKILL on abort. Default 2000ms. */
 	sigkillDelayMs?: number;
+	/**
+	 * Mid-stream stall watchdog: max time (ms) between parser events before the
+	 * runner aborts the turn via SIGTERM (escalates to SIGKILL after
+	 * `sigkillDelayMs`). Resets on every event from the runtime parser. Default
+	 * 600000ms (10 minutes) — generous enough to span long tool calls while
+	 * still bounding hung-claude turns (overstory-ddb3).
+	 *
+	 * Set to `0` to disable (test injection / explicit opt-out only).
+	 */
+	eventStallTimeoutMs?: number;
 }
 
 export interface TurnResult {
@@ -134,6 +144,21 @@ export interface TurnResult {
 	initialState: AgentState;
 	/** AgentState computed by the transition rules and persisted on exit. */
 	finalState: AgentState;
+	/**
+	 * True iff the per-event stall watchdog fired during the turn — the runner
+	 * sent SIGTERM/SIGKILL because no parser event arrived for
+	 * `eventStallTimeoutMs` (overstory-ddb3). Treated like `aborted` for
+	 * finalState purposes (`zombie`).
+	 */
+	stallAborted: boolean;
+	/**
+	 * True iff claude exited cleanly (`cleanResult` true) without sending the
+	 * capability-specific terminal mail (overstory-6071). Contract violation:
+	 * the agent finished its turn but failed to signal completion. Logged at
+	 * `error` level via the runner diagnostic sink and recorded here for
+	 * caller-visible auditing.
+	 */
+	terminalMailMissing: boolean;
 }
 
 const defaultSpawnFn: TurnSpawnFn = (cmd, options) =>
@@ -481,6 +506,8 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 			durationMs: 0,
 			initialState: preInitialState,
 			finalState: preInitialState,
+			stallAborted: false,
+			terminalMailMissing: false,
 		};
 	}
 
@@ -649,6 +676,46 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 		let observedAnyEvent = false;
 		let bootedToWorking = false;
 
+		// Stall watchdog (overstory-ddb3): if no parser event arrives for
+		// `eventStallTimeoutMs`, abort the turn via SIGTERM/SIGKILL. Otherwise a
+		// hung claude (Anthropic API stall, deadlock) hangs the runner forever.
+		const eventStallTimeoutMs = opts.eventStallTimeoutMs ?? 600_000;
+		let stallAborted = false;
+		let stallTimer: ReturnType<typeof setTimeout> | null = null;
+		let stallSigkillTimer: ReturnType<typeof setTimeout> | null = null;
+		const clearStallTimer = (): void => {
+			if (stallTimer) {
+				clearTimeout(stallTimer);
+				stallTimer = null;
+			}
+		};
+		const armStallTimer = (): void => {
+			if (eventStallTimeoutMs <= 0) return;
+			clearStallTimer();
+			stallTimer = setTimeout(() => {
+				if (aborted || stallAborted) return;
+				stallAborted = true;
+				runnerLog(
+					"error",
+					`parser stalled: no event for ${eventStallTimeoutMs}ms — aborting via SIGTERM`,
+				);
+				try {
+					proc.kill("SIGTERM");
+				} catch {
+					// process may have already exited
+				}
+				stallSigkillTimer = setTimeout(() => {
+					try {
+						proc.kill("SIGKILL");
+					} catch {
+						// ignore
+					}
+				}, sigkillDelayMs);
+				(stallSigkillTimer as { unref?: () => void }).unref?.();
+			}, eventStallTimeoutMs);
+			(stallTimer as { unref?: () => void }).unref?.();
+		};
+
 		// `AgentRuntime.parseEvents` is declared as a 1-param method, but the Claude
 		// adapter accepts an `onSessionId` hook. Widen the call site so we can pass
 		// the hook without depending on adapter-specific types.
@@ -657,6 +724,9 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 			opts?: { onSessionId?: (sid: string) => void },
 		) => AsyncIterable<AgentEvent>;
 		const parseEvents = runtime.parseEvents as unknown as ParseEventsWithOpts;
+
+		// Arm before iteration so a process that never emits also gets caught.
+		armStallTimer();
 
 		try {
 			const parser = parseEvents(proc.stdout, {
@@ -669,6 +739,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 			});
 
 			for await (const event of parser) {
+				armStallTimer();
 				observedAnyEvent = true;
 
 				if (!bootedToWorking && initialState === "booting") {
@@ -697,6 +768,11 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 				}
 			}
 		} finally {
+			clearStallTimer();
+			if (stallSigkillTimer) {
+				clearTimeout(stallSigkillTimer);
+				stallSigkillTimer = null;
+			}
 			try {
 				eventStore.close();
 			} catch {
@@ -718,7 +794,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 		if (opts.abortSignal && !opts.abortSignal.aborted) {
 			opts.abortSignal.removeEventListener("abort", onAbort);
 		}
-		if (aborted) {
+		if (aborted || stallAborted) {
 			exitCode = null;
 		}
 
@@ -739,10 +815,27 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 		const resumeMismatch =
 			priorSessionId !== null && newSessionId !== null && newSessionId !== priorSessionId;
 
+		// Contract violation (overstory-6071): claude exited cleanly (saw a
+		// `result` event with isError:false) but never sent the capability's
+		// terminal mail. Pre-fix this fell through to `working` and stayed
+		// there forever — the process is gone but the session looks alive.
+		// Surface loudly via the runner diagnostic sink and settle to
+		// `completed` so operators don't see a zombie-but-labeled-working row.
+		const terminalMailMissing = cleanResult && !terminalMailObserved && !aborted && !stallAborted;
+		if (terminalMailMissing) {
+			const expected = terminalMailTypesFor(capability).join("|") || "<none>";
+			runnerLog(
+				"error",
+				`agent exited cleanly without sending terminal mail (expected ${expected}); marking completed and surfacing contract violation`,
+			);
+		}
+
 		let finalState: AgentState;
-		if (aborted) {
+		if (aborted || stallAborted) {
 			finalState = "zombie";
 		} else if (cleanResult && terminalMailObserved) {
+			finalState = "completed";
+		} else if (terminalMailMissing) {
 			finalState = "completed";
 		} else if (observedAnyEvent || bootedToWorking) {
 			finalState = "working";
@@ -786,6 +879,8 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 			durationMs,
 			initialState,
 			finalState,
+			stallAborted,
+			terminalMailMissing,
 		};
 	} finally {
 		// PID-file cleanup so a follow-up turn never sees a stale PID (covers

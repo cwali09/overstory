@@ -204,6 +204,14 @@ function readSession(sessionsDbPath: string, agentName: string): AgentSession | 
 
 // ---------- shared fixture context ----------
 
+/**
+ * Silent diagnostic sink for tests that don't assert on logs. Suppresses the
+ * `[turn-runner:error]` stderr mirror so contract-violation messages
+ * (overstory-6071) — which are expected for many tests that drive a clean
+ * exit without seeding terminal mail — don't pollute the test runner output.
+ */
+const silentLogger: RunnerLogger = () => {};
+
 interface Ctx {
 	overstoryDir: string;
 	worktreePath: string;
@@ -251,7 +259,7 @@ function makeRunOpts(
 		...(overrides._spawnFn !== undefined ? { _spawnFn: overrides._spawnFn } : {}),
 		...(overrides.abortSignal !== undefined ? { abortSignal: overrides.abortSignal } : {}),
 		...(overrides.sigkillDelayMs !== undefined ? { sigkillDelayMs: overrides.sigkillDelayMs } : {}),
-		...(overrides._logWarning !== undefined ? { _logWarning: overrides._logWarning } : {}),
+		_logWarning: overrides._logWarning ?? silentLogger,
 	};
 }
 
@@ -308,7 +316,7 @@ describe("runTurn", () => {
 		expect(after?.state).toBe("working");
 	});
 
-	test("happy path: spawn, drain events, capture session id, transition booting → working", async () => {
+	test("happy path: spawn, drain events, capture session id, contract violation surfaces as completed", async () => {
 		seedSession(ctx.sessionsDbPath, { agentName: "alpha", state: "booting" });
 		const { runtime, spawnCalls } = makeSpyRuntime();
 
@@ -319,19 +327,26 @@ describe("runTurn", () => {
 			return fake;
 		};
 
-		const result = await runTurn(makeRunOpts(ctx, "alpha", { runtime, _spawnFn: spawnFn }));
+		// Suppress the contract-violation error log (overstory-6071) so it
+		// doesn't leak to test stderr; assertions below still cover the case.
+		const logger: RunnerLogger = () => {};
+		const result = await runTurn(
+			makeRunOpts(ctx, "alpha", { runtime, _spawnFn: spawnFn, _logWarning: logger }),
+		);
 
 		expect(result.exitCode).toBe(0);
 		expect(result.cleanResult).toBe(true);
 		expect(result.newSessionId).toBe("claude-sess-A");
 		expect(result.resumeMismatch).toBe(false);
 		expect(result.terminalMailObserved).toBe(false);
-		// initial=booting, no worker_done → working (idle) finalState
+		// initial=booting, clean exit but no terminal mail → contract violation,
+		// settles to `completed` (overstory-6071).
 		expect(result.initialState).toBe("booting");
-		expect(result.finalState).toBe("working");
+		expect(result.terminalMailMissing).toBe(true);
+		expect(result.finalState).toBe("completed");
 
 		const after = readSession(ctx.sessionsDbPath, "alpha");
-		expect(after?.state).toBe("working");
+		expect(after?.state).toBe("completed");
 		expect(after?.claudeSessionId).toBe("claude-sess-A");
 
 		// resumeSessionId on first turn is null (no prior id stored).
@@ -463,7 +478,11 @@ describe("runTurn", () => {
 		expect(after?.state).toBe("completed");
 	});
 
-	test("clean exit but no worker_done → stays working", async () => {
+	test("clean exit but no worker_done → contract violation, completed + error log (overstory-6071)", async () => {
+		// Pre-fix: claude exiting cleanly without sending the capability's
+		// terminal mail left the session at `working` forever — the process is
+		// gone but the row looks alive. Now the runner logs an error and
+		// settles to `completed` so operators see something terminal.
 		seedSession(ctx.sessionsDbPath, { agentName: "idle", state: "working" });
 		const { runtime } = makeSpyRuntime();
 		const fake = makeFakeProc();
@@ -473,11 +492,28 @@ describe("runTurn", () => {
 			return fake;
 		};
 
-		const result = await runTurn(makeRunOpts(ctx, "idle", { runtime, _spawnFn: spawnFn }));
+		const errors: Array<{ level: string; message: string }> = [];
+		const logger: RunnerLogger = (level, message) => {
+			errors.push({ level, message });
+		};
+
+		const result = await runTurn(
+			makeRunOpts(ctx, "idle", { runtime, _spawnFn: spawnFn, _logWarning: logger }),
+		);
 
 		expect(result.cleanResult).toBe(true);
 		expect(result.terminalMailObserved).toBe(false);
-		expect(result.finalState).toBe("working");
+		expect(result.terminalMailMissing).toBe(true);
+		expect(result.finalState).toBe("completed");
+
+		// Contract violation must surface via the runner diagnostic sink.
+		const violation = errors.find(
+			(e) => e.level === "error" && e.message.includes("without sending terminal mail"),
+		);
+		expect(violation).toBeDefined();
+
+		const after = readSession(ctx.sessionsDbPath, "idle");
+		expect(after?.state).toBe("completed");
 	});
 
 	test("merger: merged mail counts as terminal → completed", async () => {
@@ -611,7 +647,12 @@ describe("runTurn", () => {
 		expect(result.finalState).toBe("completed");
 	});
 
-	test("merger: worker_done is NOT terminal for merger → stays working", async () => {
+	test("merger: worker_done is NOT terminal for merger → contract violation, completed", async () => {
+		// Mergers must send `merged` or `merge_failed`. A `worker_done` from a
+		// merger doesn't count as terminal, so this is the same contract
+		// violation as overstory-6071: clean exit, no terminal mail. Pre-fix
+		// this stuck at `working`; now it settles to `completed` with a loud
+		// error log.
 		seedSession(ctx.sessionsDbPath, {
 			agentName: "mg-wd",
 			capability: "merger",
@@ -643,12 +684,123 @@ describe("runTurn", () => {
 			return fake;
 		};
 
+		const logger: RunnerLogger = () => {};
 		const result = await runTurn(
-			makeRunOpts(ctx, "mg-wd", { runtime, _spawnFn: spawnFn, capability: "merger" }),
+			makeRunOpts(ctx, "mg-wd", {
+				runtime,
+				_spawnFn: spawnFn,
+				capability: "merger",
+				_logWarning: logger,
+			}),
 		);
 
 		expect(result.terminalMailObserved).toBe(false);
-		expect(result.finalState).toBe("working");
+		expect(result.terminalMailMissing).toBe(true);
+		expect(result.finalState).toBe("completed");
+	});
+
+	test("stall watchdog: no parser events for eventStallTimeoutMs → SIGTERM, zombie (overstory-ddb3)", async () => {
+		// Pre-fix: a hung claude (alive but stalled — Anthropic API hang,
+		// deadlock) would block the parser drain forever because the for-await
+		// loop only exits on stdout close. The runner now arms a per-event
+		// stall watchdog that resets on every event; on timeout it kills the
+		// process via the existing SIGTERM/SIGKILL escalation.
+		seedSession(ctx.sessionsDbPath, { agentName: "stalled", state: "working" });
+		const { runtime } = makeSpyRuntime();
+
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			// Emit nothing: simulate claude alive but stalled. The stall
+			// watchdog must fire and kill the process.
+			return fake;
+		};
+
+		const errors: Array<{ level: string; message: string }> = [];
+		const logger: RunnerLogger = (level, message) => {
+			errors.push({ level, message });
+		};
+
+		const result = await runTurn({
+			...makeRunOpts(ctx, "stalled", {
+				runtime,
+				_spawnFn: spawnFn,
+				_logWarning: logger,
+			}),
+			eventStallTimeoutMs: 50,
+			sigkillDelayMs: 25,
+		});
+
+		expect(fake._killSignals[0]).toBe("SIGTERM");
+		expect(result.stallAborted).toBe(true);
+		expect(result.exitCode).toBeNull();
+		expect(result.finalState).toBe("zombie");
+
+		const stallLog = errors.find(
+			(e) => e.level === "error" && e.message.includes("parser stalled"),
+		);
+		expect(stallLog).toBeDefined();
+
+		const after = readSession(ctx.sessionsDbPath, "stalled");
+		expect(after?.state).toBe("zombie");
+	});
+
+	test("stall watchdog: events reset the timer — live turns are not killed (overstory-ddb3)", async () => {
+		// Per-event reset: a turn whose events keep arriving must not be
+		// aborted by the stall watchdog. We give a generous 500ms stall
+		// budget and emit several events each separated by ~50ms; the
+		// cumulative runtime exceeds the budget, but no inter-event gap
+		// does, so a properly resetting timer never fires.
+		seedSession(ctx.sessionsDbPath, { agentName: "live", state: "working" });
+		const { runtime } = makeSpyRuntime();
+
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			(async () => {
+				const sessionId = "live-session";
+				fake._pushLine(
+					JSON.stringify({
+						type: "system",
+						subtype: "init",
+						session_id: sessionId,
+						model: "claude-test",
+					}),
+				);
+				for (let i = 0; i < 6; i++) {
+					await Bun.sleep(50);
+					fake._pushLine(
+						JSON.stringify({
+							type: "assistant",
+							message: {
+								role: "assistant",
+								content: [{ type: "text", text: `chunk ${i}` }],
+							},
+							session_id: sessionId,
+						}),
+					);
+				}
+				emitFakeTurn(fake, { sessionId });
+				fake._exit(0);
+			})();
+			return fake;
+		};
+
+		const logger: RunnerLogger = () => {};
+		const result = await runTurn({
+			...makeRunOpts(ctx, "live", {
+				runtime,
+				_spawnFn: spawnFn,
+				_logWarning: logger,
+			}),
+			eventStallTimeoutMs: 500,
+			sigkillDelayMs: 25,
+		});
+
+		expect(result.stallAborted).toBe(false);
+		expect(result.exitCode).toBe(0);
+		expect(result.cleanResult).toBe(true);
+		// Sanity: turn ran longer than the stall budget would allow if the
+		// timer didn't reset on each event (6 × 50ms = 300ms minimum).
+		expect(result.durationMs).toBeGreaterThanOrEqual(250);
 	});
 
 	test("abortSignal triggers SIGTERM, finalState becomes zombie", async () => {
