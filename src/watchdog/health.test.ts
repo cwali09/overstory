@@ -493,6 +493,102 @@ describe("headless agents (tmuxSession empty, PID-based lifecycle)", () => {
 	});
 });
 
+// === Spawn-per-turn workers (tmuxSession === '' && pid === null) ===
+
+describe("spawn-per-turn workers (overstory-7a34)", () => {
+	// Spawn-per-turn workers (builder/scout/reviewer/lead/merger under the
+	// headless default) have no persistent process between turns. The previous
+	// "headless" branch only matched pid !== null, so these sessions fell into
+	// the TUI/tmux path where tmuxAlive=false → ZFC Rule 1 → zombie within
+	// seconds of sling, despite being actively executing tools (overstory-7a34).
+
+	test("freshly slung spawn-per-turn lead (booting, no pid, no tmux) → working", () => {
+		const session = makeSession({
+			tmuxSession: "",
+			pid: null,
+			capability: "lead",
+			state: "booting",
+			lastActivity: new Date().toISOString(),
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("working");
+		expect(check.action).toBe("none");
+		expect(check.reconciliationNote).toBeNull();
+	});
+
+	test("active spawn-per-turn worker (working, recent activity) → stays working", () => {
+		const session = makeSession({
+			tmuxSession: "",
+			pid: null,
+			capability: "builder",
+			state: "working",
+			lastActivity: new Date(Date.now() - 5_000).toISOString(),
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("working");
+		expect(check.action).toBe("none");
+	});
+
+	test("spawn-per-turn worker between turns (state working, very recent) → working, NOT zombie", () => {
+		// Repro: ov sling --capability lead any-task; within ~30s ov dashboard
+		// previously showed state='zombie' while ov feed showed live tool calls.
+		const session = makeSession({
+			tmuxSession: "",
+			pid: null,
+			capability: "lead",
+			state: "working",
+			lastActivity: new Date().toISOString(),
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("working");
+		expect(check.action).toBe("none");
+	});
+
+	test("spawn-per-turn worker with stale activity → stalled", () => {
+		const session = makeSession({
+			tmuxSession: "",
+			pid: null,
+			capability: "builder",
+			state: "working",
+			lastActivity: new Date(Date.now() - 60_000).toISOString(),
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("stalled");
+		expect(check.action).toBe("escalate");
+	});
+
+	test("spawn-per-turn worker with zombie-level staleness → zombie, terminate", () => {
+		const session = makeSession({
+			tmuxSession: "",
+			pid: null,
+			capability: "builder",
+			state: "working",
+			lastActivity: new Date(Date.now() - 200_000).toISOString(),
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("zombie");
+		expect(check.action).toBe("terminate");
+	});
+
+	test("spawn-per-turn worker that already completed → skips monitoring", () => {
+		const session = makeSession({
+			tmuxSession: "",
+			pid: null,
+			capability: "builder",
+			state: "completed",
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("completed");
+		expect(check.action).toBe("none");
+	});
+});
+
 // === transitionState ===
 
 describe("transitionState", () => {

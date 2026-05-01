@@ -645,10 +645,19 @@ export function renderAgentPanel(
 				: now;
 		const duration = formatDuration(endTime - new Date(agent.startedAt).getTime());
 		const durationPadded = pad(duration, 9);
+		// Three liveness topologies (overstory-7a34):
+		//   tmux:           tmuxSession !== ""        → tmux session must exist
+		//   long-lived headless: tmuxSession === "" && pid !== null → PID must be alive
+		//   spawn-per-turn: tmuxSession === "" && pid === null   → no process between
+		//     turns is normal, so liveness reduces to "state is non-terminal".
+		//     Time-based stale/zombie classification is handled in evaluateHealth.
 		const isHeadless = agent.tmuxSession === "" && agent.pid !== null;
-		const alive = isHeadless
-			? agent.pid !== null && isProcessAlive(agent.pid)
-			: data.status.tmuxSessions.some((s) => s.name === agent.tmuxSession);
+		const isSpawnPerTurn = agent.tmuxSession === "" && agent.pid === null;
+		const alive = isSpawnPerTurn
+			? agent.state !== "zombie" && agent.state !== "completed"
+			: isHeadless
+				? agent.pid !== null && isProcessAlive(agent.pid)
+				: data.status.tmuxSessions.some((s) => s.name === agent.tmuxSession);
 		const aliveDot = alive ? color.green(">") : color.red("x");
 
 		const lineContent = `${dimBox.vertical} ${stateColorFn(icon)}  ${name} ${capability} ${color.dim(runtime)} ${stateColorFn(state)} ${taskId} ${durationPadded} ${aliveDot}    `;

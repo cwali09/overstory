@@ -709,7 +709,11 @@ export async function runDaemonTick(options: DaemonOptions): Promise<void> {
 			// active headless agent that doesn't already have one running.
 			// Tailers persist between ticks (module-level registry) so events are
 			// continuously written to events.db while the agent is working.
-			if (session.tmuxSession === "" && session.pid !== null) {
+			//
+			// Both long-lived headless (pid !== null) and spawn-per-turn workers
+			// (pid === null, overstory-7a34) emit stream-json to stdout.log, so
+			// either pattern needs a tailer.
+			if (session.tmuxSession === "") {
 				activeHeadlessAgents.add(session.agentName);
 				if (!tailerRegistry.has(session.agentName)) {
 					// Discover the latest stdout.log for this agent and start tailing.
@@ -760,9 +764,12 @@ export async function runDaemonTick(options: DaemonOptions): Promise<void> {
 			} else {
 				tmuxAlive = await tmux.isSessionAlive(session.tmuxSession);
 
-				// Headless agents without a registered connection (e.g. after a process
-				// restart): event-based activity detection to avoid false-positive stale.
-				if (session.tmuxSession === "" && session.pid !== null && eventStore) {
+				// Headless agents without a registered connection: event-based
+				// activity detection to avoid false-positive stale. Covers both
+				// long-lived headless (e.g. after a process restart) and
+				// spawn-per-turn workers between turns where lastActivity is
+				// the only liveness signal (overstory-7a34).
+				if (session.tmuxSession === "" && eventStore) {
 					try {
 						const recentEvents = eventStore.getByAgent(session.agentName, {
 							since: new Date(Date.now() - staleThresholdMs).toISOString(),

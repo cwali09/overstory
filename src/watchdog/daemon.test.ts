@@ -2709,6 +2709,73 @@ describe("headless agent stale detection via events.db (Bug 2)", () => {
 			eventStore.close();
 		}
 	});
+
+	test("spawn-per-turn worker (pid=null) is NOT flagged zombie when actively emitting events (overstory-7a34)", async () => {
+		// Repro: ov sling --capability lead → freshly slung headless lead has
+		// tmuxSession='' AND pid=null (no persistent process between turns).
+		// Previously the daemon's event-based liveness fallback was gated by
+		// `pid !== null`, so spawn-per-turn workers' lastActivity was never
+		// refreshed from events.db and they would flip to stalled / zombie
+		// despite ov feed showing live tool activity.
+		const staleActivity = new Date(Date.now() - THRESHOLDS.staleThresholdMs * 2).toISOString();
+
+		const session = makeSession({
+			agentName: "spawn-per-turn-lead",
+			capability: "lead",
+			tmuxSession: "", // headless
+			pid: null, // spawn-per-turn: no persistent process between turns
+			state: "working",
+			lastActivity: staleActivity, // stale — would flip without event fallback
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		const eventsDbPath = join(tempRoot, ".overstory", "events.db");
+		const eventStore = createEventStore(eventsDbPath);
+
+		try {
+			// Insert a recent tool event for this agent (matches ov feed activity)
+			eventStore.insert({
+				runId: null,
+				agentName: "spawn-per-turn-lead",
+				sessionId: null,
+				eventType: "tool_end",
+				toolName: "Edit",
+				toolArgs: null,
+				toolDurationMs: 50,
+				level: "info",
+				data: null,
+			});
+
+			const checks: HealthCheck[] = [];
+
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				onHealthCheck: (c) => checks.push(c),
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_process: { isAlive: () => true, killTree: async () => {} },
+				_eventStore: eventStore,
+				_recordFailure: async () => {},
+				_getConnection: () => undefined,
+				_removeConnection: () => {},
+				_tailerRegistry: new Map(),
+				_findLatestStdoutLog: async () => null,
+			});
+
+			// lastActivity refreshed from events.db → spawn-per-turn evaluation
+			// path keeps the agent in working, NOT zombie.
+			expect(checks).toHaveLength(1);
+			expect(checks[0]?.action).toBe("none");
+			expect(checks[0]?.state).toBe("working");
+
+			const reloaded = readSessionsFromStore(tempRoot);
+			expect(reloaded[0]?.state).toBe("working");
+		} finally {
+			eventStore.close();
+		}
+	});
 });
 
 // ============================================================

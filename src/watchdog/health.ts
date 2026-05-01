@@ -62,13 +62,32 @@ export function isProcessRunning(pid: number): boolean {
 }
 
 /**
- * Detect whether a session is a headless agent.
+ * Detect whether a session is a long-lived headless agent.
  *
- * Headless agents are spawned without a tmux session (tmuxSession === '') and
- * are tracked solely by PID. For these agents, PID is the primary liveness signal.
+ * Long-lived headless agents (coordinator, orchestrator, monitor, sapling, etc.)
+ * have no tmux session (tmuxSession === '') but do have a persistent process —
+ * so `session.pid` is non-null and PID is the primary liveness signal.
  */
 function isHeadlessSession(session: AgentSession): boolean {
 	return session.tmuxSession === "" && session.pid !== null;
+}
+
+/**
+ * Detect whether a session is a spawn-per-turn worker between turns.
+ *
+ * Spawn-per-turn workers (task-scoped capabilities under the new headless
+ * default — builder/scout/reviewer/lead/merger) have no tmux session AND no
+ * persistent process: `tmuxSession === ''` and `session.pid === null` from
+ * sling onward. The per-turn claude PID lives in
+ * `.overstory/agents/<name>/turn.pid` only while a turn is in flight.
+ *
+ * "No process" is the normal state between turns, so neither tmux liveness nor
+ * pid liveness can be used as a death signal — only `lastActivity` recency
+ * (refreshed by the turn-runner on every event and by the watchdog from
+ * events.db) can. (overstory-7a34)
+ */
+export function isSpawnPerTurnSession(session: AgentSession): boolean {
+	return session.tmuxSession === "" && session.pid === null;
 }
 
 /**
@@ -156,19 +175,23 @@ function evaluateTimeBased(
  * Decision logic (in priority order):
  *
  * 1. Completed agents skip monitoring entirely.
- * 2. Headless agents (tmuxSession === ''): PID is primary liveness signal.
+ * 2. Spawn-per-turn workers (tmuxSession === '' && pid === null): no
+ *    persistent process between turns — fall straight through to time-based
+ *    checks driven by lastActivity. PID/tmux liveness are meaningless here.
+ * 3. Headless agents with persistent process (tmuxSession === '' && pid !== null):
+ *    PID is primary liveness signal.
  *    - pid dead → zombie, terminate.
  *    - pid alive + state zombie → investigate.
  *    - pid alive → fall through to time-based checks.
- * 3. tmux dead → zombie, terminate (regardless of what sessions.json says).
- * 4. tmux alive + sessions.json says zombie → investigate (don't auto-kill).
+ * 4. tmux dead → zombie, terminate (regardless of what sessions.json says).
+ * 5. tmux alive + sessions.json says zombie → investigate (don't auto-kill).
  *    Something external marked this zombie, but the process is still running.
- * 5. pid dead + tmux alive → zombie, terminate. The agent process exited but
+ * 6. pid dead + tmux alive → zombie, terminate. The agent process exited but
  *    the tmux pane shell survived. The agent is not doing work.
- * 6. lastActivity older than zombieMs → zombie, terminate.
- * 7. lastActivity older than staleMs → stalled, escalate.
- * 8. booting with recent activity → working.
- * 9. Otherwise → working, healthy.
+ * 7. lastActivity older than zombieMs → zombie, terminate.
+ * 8. lastActivity older than staleMs → stalled, escalate.
+ * 9. booting with recent activity → working.
+ * 10. Otherwise → working, healthy.
  *
  * @param session - The agent session to evaluate
  * @param tmuxAlive - Whether the agent's tmux session is still running
@@ -211,6 +234,17 @@ export function evaluateHealth(
 			action: "none",
 			reconciliationNote: null,
 		};
+	}
+
+	// === Spawn-per-turn path: no persistent process between turns ===
+	// For these workers (overstory-7a34) `session.pid` is null by design and
+	// there is no tmux session. Liveness signals reduce to lastActivity
+	// recency: the turn-runner updates it on every parser event during a
+	// turn, and the watchdog refreshes it from events.db between turns. PID
+	// and tmux checks would always say "dead" and false-positive every fresh
+	// agent as zombie within seconds of sling.
+	if (isSpawnPerTurnSession(session)) {
+		return evaluateTimeBased(session, base, elapsedMs, thresholds);
 	}
 
 	// === Headless path: PID is the primary liveness signal ===
