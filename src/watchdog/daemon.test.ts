@@ -20,10 +20,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEventStore } from "../events/store.ts";
 import { createMailStore } from "../mail/store.ts";
-import { createSessionStore } from "../sessions/store.ts";
+import { createRunStore, createSessionStore } from "../sessions/store.ts";
 import { cleanupTempDir } from "../test-helpers.ts";
 import type { AgentSession, HealthCheck, StoredEvent, WorkerDiedPayload } from "../types.ts";
-import { buildCompletionMessage, runDaemonTick, startDaemon } from "./daemon.ts";
+import {
+	buildCompletionMessage,
+	type RunIdWarnState,
+	runDaemonTick,
+	startDaemon,
+} from "./daemon.ts";
 
 // === Test constants ===
 
@@ -49,6 +54,34 @@ function writeSessionsToStore(root: string, sessions: AgentSession[]): void {
 		store.upsert(session);
 	}
 	store.close();
+}
+
+/**
+ * Mark a run as active: write current-run.txt AND insert a row in the runs
+ * table (sessions.db). The watchdog now validates the id against the runs
+ * table before running the run-completion check (overstory-87bf), so tests
+ * must seed both surfaces to mirror production reality.
+ */
+async function setActiveRun(root: string, runId: string): Promise<void> {
+	await Bun.write(join(root, ".overstory", "current-run.txt"), runId);
+	const runStore = createRunStore(join(root, ".overstory", "sessions.db"));
+	try {
+		runStore.createRun({
+			id: runId,
+			startedAt: new Date().toISOString(),
+			coordinatorSessionId: null,
+			status: "active",
+		});
+	} catch {
+		// Row may already exist (re-seeding within one test) — non-fatal.
+	} finally {
+		runStore.close();
+	}
+}
+
+/** Build a fresh, isolated RunIdWarnState for tests (overstory-87bf). */
+function freshRunIdWarnState(): RunIdWarnState {
+	return { missingFileWarned: false, unknownIds: new Set() };
 }
 
 /** Read sessions from the SessionStore (sessions.db) at the given root. */
@@ -1085,7 +1118,7 @@ describe("daemon event recording", () => {
 
 		// Write a current-run.txt
 		const runId = "run-2026-02-13T10-00-00-000Z";
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const eventsDbPath = join(tempRoot, ".overstory", "events.db");
 		const eventStore = createEventStore(eventsDbPath);
@@ -1422,7 +1455,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const nudgeMock = nudgeTracker();
 
@@ -1468,7 +1501,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const nudgeMock = nudgeTracker();
 
@@ -1510,7 +1543,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 		// Pre-write dedup marker
 		await Bun.write(join(tempRoot, ".overstory", "run-complete-notified.txt"), runId);
 
@@ -1614,7 +1647,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const nudgeMock = nudgeTracker();
 
@@ -1660,7 +1693,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const nudgeMock = nudgeTracker();
 
@@ -1702,7 +1735,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const eventsDbPath = join(tempRoot, ".overstory", "events.db");
 		const eventStore = createEventStore(eventsDbPath);
@@ -1760,7 +1793,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		await runDaemonTick({
 			root: tempRoot,
@@ -1801,7 +1834,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const nudgeMock = nudgeTracker();
 
@@ -1847,7 +1880,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const nudgeMock = nudgeTracker();
 
@@ -1882,7 +1915,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const nudgeMock = nudgeTracker();
 
@@ -1917,7 +1950,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const eventsDbPath = join(tempRoot, ".overstory", "events.db");
 		const eventStore = createEventStore(eventsDbPath);
@@ -1950,6 +1983,349 @@ describe("run completion detection", () => {
 		} finally {
 			store.close();
 		}
+	});
+
+	// overstory-e130: a run that mixes `completed` and `zombie` workers must
+	// still notify the coordinator. Before the fix, the every-completed predicate
+	// stranded the coordinator forever whenever the watchdog killed any worker.
+	test("nudges coordinator when workers are a mix of completed and zombie", async () => {
+		const sessions = [
+			makeSession({
+				id: "s1",
+				agentName: "builder-one",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-one",
+				state: "completed",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+			makeSession({
+				id: "s2",
+				agentName: "builder-two",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-two",
+				state: "zombie",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+		];
+
+		writeSessionsToStore(tempRoot, sessions);
+		await setActiveRun(tempRoot, runId);
+
+		const nudgeMock = nudgeTracker();
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			_tmux: tmuxAllAlive(),
+			_triage: triageAlways("extend"),
+			_nudge: nudgeMock.nudge,
+			_eventStore: null,
+		});
+
+		const coordinatorNudges = nudgeMock.calls.filter(
+			(c) => c.agentName === "coordinator" && c.message.includes("WATCHDOG"),
+		);
+		expect(coordinatorNudges).toHaveLength(1);
+		expect(coordinatorNudges[0]?.message).toContain("have terminated");
+		expect(coordinatorNudges[0]?.message).toContain("(1 completed, 1 zombie)");
+	});
+
+	test("nudges coordinator when every worker is zombie", async () => {
+		const sessions = [
+			makeSession({
+				id: "s1",
+				agentName: "builder-one",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-one",
+				state: "zombie",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+			makeSession({
+				id: "s2",
+				agentName: "builder-two",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-two",
+				state: "zombie",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+		];
+
+		writeSessionsToStore(tempRoot, sessions);
+		await setActiveRun(tempRoot, runId);
+
+		const nudgeMock = nudgeTracker();
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			_tmux: tmuxAllAlive(),
+			_triage: triageAlways("extend"),
+			_nudge: nudgeMock.nudge,
+			_eventStore: null,
+		});
+
+		const coordinatorNudges = nudgeMock.calls.filter(
+			(c) => c.agentName === "coordinator" && c.message.includes("WATCHDOG"),
+		);
+		expect(coordinatorNudges).toHaveLength(1);
+		expect(coordinatorNudges[0]?.message).toContain("(0 completed, 2 zombie)");
+	});
+
+	test("does not nudge when a working worker remains alongside a zombie", async () => {
+		const sessions = [
+			makeSession({
+				id: "s1",
+				agentName: "builder-one",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-one",
+				state: "zombie",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+			makeSession({
+				id: "s2",
+				agentName: "builder-two",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-two",
+				state: "working",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+		];
+
+		writeSessionsToStore(tempRoot, sessions);
+		await setActiveRun(tempRoot, runId);
+
+		const nudgeMock = nudgeTracker();
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			_tmux: tmuxAllAlive(),
+			_triage: triageAlways("extend"),
+			_nudge: nudgeMock.nudge,
+			_eventStore: null,
+		});
+
+		const coordinatorNudges = nudgeMock.calls.filter(
+			(c) => c.agentName === "coordinator" && c.message.includes("WATCHDOG"),
+		);
+		expect(coordinatorNudges).toHaveLength(0);
+	});
+
+	test("run_complete event with zombies records zombieAgents and warn level", async () => {
+		const sessions = [
+			makeSession({
+				id: "s1",
+				agentName: "builder-one",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-one",
+				state: "completed",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+			makeSession({
+				id: "s2",
+				agentName: "builder-two",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-two",
+				state: "zombie",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+		];
+
+		writeSessionsToStore(tempRoot, sessions);
+		await setActiveRun(tempRoot, runId);
+
+		const eventsDbPath = join(tempRoot, ".overstory", "events.db");
+		const eventStore = createEventStore(eventsDbPath);
+
+		try {
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_nudge: nudgeTracker().nudge,
+				_eventStore: eventStore,
+			});
+		} finally {
+			eventStore.close();
+		}
+
+		const store = createEventStore(eventsDbPath);
+		try {
+			const events = store.getTimeline({ since: "2000-01-01T00:00:00Z" });
+			const runCompleteEvent = events.find((e) => {
+				if (!e.data) return false;
+				const data = JSON.parse(e.data) as Record<string, unknown>;
+				return data.type === "run_complete";
+			});
+			expect(runCompleteEvent).toBeDefined();
+			expect(runCompleteEvent?.level).toBe("warn");
+			const data = JSON.parse(runCompleteEvent?.data ?? "{}") as Record<string, unknown>;
+			expect(data.completedAgents).toEqual(["builder-one"]);
+			expect(data.zombieAgents).toEqual(["builder-two"]);
+			expect(data.workerCount).toBe(2);
+		} finally {
+			store.close();
+		}
+	});
+
+	test("missing current-run.txt: warns once, skips run-completion check (overstory-87bf)", async () => {
+		const sessions = [
+			makeSession({
+				id: "s1",
+				agentName: "builder-one",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-one",
+				state: "completed",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+			makeSession({
+				id: "s2",
+				agentName: "builder-two",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-two",
+				state: "completed",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+		];
+
+		writeSessionsToStore(tempRoot, sessions);
+		// Deliberately do NOT call setActiveRun — current-run.txt absent.
+
+		const nudgeMock = nudgeTracker();
+		const warnState = freshRunIdWarnState();
+
+		const stderrWrites: string[] = [];
+		const originalStderrWrite = process.stderr.write.bind(process.stderr);
+		process.stderr.write = ((chunk: unknown, ...rest: unknown[]) => {
+			stderrWrites.push(typeof chunk === "string" ? chunk : String(chunk));
+			return originalStderrWrite(chunk as string, ...(rest as []));
+		}) as typeof process.stderr.write;
+
+		try {
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_nudge: nudgeMock.nudge,
+				_eventStore: null,
+				_runIdWarnState: warnState,
+			});
+
+			// Tick again to confirm the warning dedupes for the same cause.
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_nudge: nudgeMock.nudge,
+				_eventStore: null,
+				_runIdWarnState: warnState,
+			});
+		} finally {
+			process.stderr.write = originalStderrWrite;
+		}
+
+		// Run-completion skip is observable: no coordinator nudge was sent.
+		const coordinatorNudges = nudgeMock.calls.filter(
+			(c) => c.agentName === "coordinator" && c.message.includes("WATCHDOG"),
+		);
+		expect(coordinatorNudges).toHaveLength(0);
+
+		// Warning logged exactly once across the two ticks.
+		expect(warnState.missingFileWarned).toBe(true);
+		const missingWarnings = stderrWrites.filter((w) =>
+			w.includes("[WATCHDOG] current-run.txt missing"),
+		);
+		expect(missingWarnings).toHaveLength(1);
+	});
+
+	test("stale current-run.txt id (no row in runs table): warns once per id, skips check (overstory-87bf)", async () => {
+		const staleId = "run-stale-2026-01-01T00-00-00-000Z";
+		const sessions = [
+			makeSession({
+				id: "s1",
+				agentName: "builder-one",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-one",
+				state: "completed",
+				runId: staleId,
+				lastActivity: new Date().toISOString(),
+			}),
+			makeSession({
+				id: "s2",
+				agentName: "builder-two",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-two",
+				state: "completed",
+				runId: staleId,
+				lastActivity: new Date().toISOString(),
+			}),
+		];
+
+		writeSessionsToStore(tempRoot, sessions);
+		// Write current-run.txt but DO NOT seed the runs table — the lookup
+		// will return null, exercising the stale-id branch.
+		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), staleId);
+
+		const nudgeMock = nudgeTracker();
+		const warnState = freshRunIdWarnState();
+
+		const stderrWrites: string[] = [];
+		const originalStderrWrite = process.stderr.write.bind(process.stderr);
+		process.stderr.write = ((chunk: unknown, ...rest: unknown[]) => {
+			stderrWrites.push(typeof chunk === "string" ? chunk : String(chunk));
+			return originalStderrWrite(chunk as string, ...(rest as []));
+		}) as typeof process.stderr.write;
+
+		try {
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_nudge: nudgeMock.nudge,
+				_eventStore: null,
+				_runIdWarnState: warnState,
+			});
+
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_nudge: nudgeMock.nudge,
+				_eventStore: null,
+				_runIdWarnState: warnState,
+			});
+		} finally {
+			process.stderr.write = originalStderrWrite;
+		}
+
+		// Run-completion skip is observable: no coordinator nudge.
+		const coordinatorNudges = nudgeMock.calls.filter(
+			(c) => c.agentName === "coordinator" && c.message.includes("WATCHDOG"),
+		);
+		expect(coordinatorNudges).toHaveLength(0);
+
+		// Stale-id was recorded once, missing-file path was NOT triggered.
+		expect(warnState.unknownIds.has(staleId)).toBe(true);
+		expect(warnState.missingFileWarned).toBe(false);
+		const staleWarnings = stderrWrites.filter((w) =>
+			w.includes(`points to unknown run "${staleId}"`),
+		);
+		expect(staleWarnings).toHaveLength(1);
 	});
 });
 
@@ -2025,6 +2401,56 @@ describe("buildCompletionMessage", () => {
 		];
 		const msg = buildCompletionMessage(sessions, testRunId);
 		expect(msg).toContain("3");
+	});
+
+	// overstory-e130: zombie workers must surface in the message so the coordinator
+	// reads "have terminated (...)" instead of being misled into "have completed".
+	test("mix of completed and zombie workers → 'have terminated' with completed/zombie qualifier", () => {
+		const sessions = [
+			makeSession({ capability: "builder", agentName: "builder-1", state: "completed" }),
+			makeSession({ capability: "builder", agentName: "builder-2", state: "zombie" }),
+			makeSession({ capability: "builder", agentName: "builder-3", state: "completed" }),
+		];
+		const msg = buildCompletionMessage(sessions, testRunId);
+		expect(msg).toContain("have terminated");
+		expect(msg).toContain("(2 completed, 1 zombie)");
+		expect(msg).not.toContain("have completed");
+		// Capability-specific suffix is preserved
+		expect(msg).toContain("Awaiting lead verification");
+	});
+
+	test("all-zombie batch → '(0 completed, N zombie)' qualifier", () => {
+		const sessions = [
+			makeSession({ capability: "scout", agentName: "scout-1", state: "zombie" }),
+			makeSession({ capability: "scout", agentName: "scout-2", state: "zombie" }),
+		];
+		const msg = buildCompletionMessage(sessions, testRunId);
+		expect(msg).toContain("have terminated");
+		expect(msg).toContain("(0 completed, 2 zombie)");
+		expect(msg).toContain("Ready for next phase");
+	});
+
+	test("mixed-capability batch with zombies includes both qualifier and capability breakdown", () => {
+		const sessions = [
+			makeSession({ capability: "scout", agentName: "scout-1", state: "completed" }),
+			makeSession({ capability: "builder", agentName: "builder-1", state: "zombie" }),
+		];
+		const msg = buildCompletionMessage(sessions, testRunId);
+		expect(msg).toContain("have terminated");
+		expect(msg).toContain("(1 completed, 1 zombie)");
+		expect(msg).toContain("(builder, scout)");
+		expect(msg).toContain("Ready for next steps");
+	});
+
+	test("all-completed batch keeps existing 'have completed' phrasing (no zombie qualifier)", () => {
+		const sessions = [
+			makeSession({ capability: "builder", agentName: "builder-1", state: "completed" }),
+			makeSession({ capability: "builder", agentName: "builder-2", state: "completed" }),
+		];
+		const msg = buildCompletionMessage(sessions, testRunId);
+		expect(msg).toContain("have completed");
+		expect(msg).not.toContain("have terminated");
+		expect(msg).not.toContain("zombie");
 	});
 });
 
