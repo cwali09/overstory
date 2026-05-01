@@ -318,12 +318,18 @@ export interface WorkerDiedPayload {
 	agentName: string;
 	capability: string;
 	taskId: string;
-	/** Reason the watchdog terminated the child (e.g. "Process terminated"). */
+	/** Reason the watchdog or runner terminated the child (e.g. "Process terminated"). */
 	reason: string;
 	/** ISO timestamp of the child's last observed activity. */
 	lastActivity: string;
-	/** Watchdog tier that detected the failure. */
-	terminatedBy: "tier0" | "tier1";
+	/**
+	 * Source that detected the failure.
+	 * - `tier0`/`tier1`: watchdog daemon detected a dead/stuck process out-of-band.
+	 * - `runner`: the per-turn runner observed an in-band failure — either an
+	 *   abort/stall that forced SIGTERM/SIGKILL, or a clean exit without the
+	 *   capability's terminal mail (silent-no-op, overstory-4159 / overstory-c772).
+	 */
+	terminatedBy: "tier0" | "tier1" | "runner";
 }
 
 /** Supervisor signals branch is verified and ready for merge. */

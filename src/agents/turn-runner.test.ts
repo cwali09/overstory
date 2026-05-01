@@ -899,6 +899,244 @@ describe("runTurn", () => {
 		expect(after?.state).toBe("zombie");
 	});
 
+	// --- Parent-notify paths (overstory-4159, overstory-c772) ---
+	//
+	// When a turn ends without the capability's terminal mail, the runner emits
+	// a synthetic worker_died mail to the parent so the lead does not block on
+	// a signal that will never arrive. Three trigger paths:
+	//   1. abort (operator or external abortSignal) → finalState=zombie
+	//   2. parser stall → finalState=zombie
+	//   3. clean exit without terminal mail (terminalMailMissing) → completed
+
+	test("abort path: emits worker_died to parent with terminatedBy='runner' (overstory-c772)", async () => {
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "child-abort",
+			state: "working",
+			parentAgent: "lead-x",
+			taskId: "task-c772",
+		});
+		const { runtime } = makeSpyRuntime();
+		const fake = makeFakeProc();
+		const ac = new AbortController();
+		const spawnFn: TurnSpawnFn = () => {
+			fake._pushLine(JSON.stringify({ type: "system", subtype: "init", session_id: "abort-mail" }));
+			return fake;
+		};
+
+		const sharedMail = createMailStore(ctx.mailDbPath);
+		try {
+			const runPromise = runTurn({
+				...makeRunOpts(ctx, "child-abort", {
+					runtime,
+					_spawnFn: spawnFn,
+					abortSignal: ac.signal,
+					sigkillDelayMs: 25,
+				}),
+				_mailStore: sharedMail,
+			});
+			await Bun.sleep(60);
+			ac.abort();
+			const result = await runPromise;
+			expect(result.finalState).toBe("zombie");
+
+			const inbox = sharedMail.getAll({ to: "lead-x", type: "worker_died" });
+			expect(inbox.length).toBe(1);
+			const msg = inbox[0];
+			expect(msg?.from).toBe("child-abort");
+			expect(msg?.priority).toBe("high");
+			expect(msg?.subject).toContain("worker_died");
+			expect(msg?.subject).toContain("child-abort");
+			const payload = JSON.parse(msg?.payload ?? "{}") as {
+				terminatedBy?: string;
+				reason?: string;
+				agentName?: string;
+				taskId?: string;
+				capability?: string;
+			};
+			expect(payload.terminatedBy).toBe("runner");
+			expect(payload.agentName).toBe("child-abort");
+			// taskId in the mail mirrors the runner's opts.taskId for this turn;
+			// the test rig's makeRunOpts seeds this as "task-test".
+			expect(payload.taskId).toBe("task-test");
+			expect(payload.capability).toBe("builder");
+			expect(payload.reason).toContain("Aborted");
+		} finally {
+			sharedMail.close();
+		}
+	});
+
+	test("stall path: emits worker_died to parent (overstory-c772)", async () => {
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "child-stall",
+			state: "working",
+			parentAgent: "lead-y",
+			taskId: "task-c772-b",
+		});
+		const { runtime } = makeSpyRuntime();
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			// Emit nothing — stall watchdog must fire and abort.
+			return fake;
+		};
+
+		const sharedMail = createMailStore(ctx.mailDbPath);
+		try {
+			const result = await runTurn({
+				...makeRunOpts(ctx, "child-stall", {
+					runtime,
+					_spawnFn: spawnFn,
+				}),
+				_mailStore: sharedMail,
+				eventStallTimeoutMs: 50,
+				sigkillDelayMs: 25,
+			});
+			expect(result.stallAborted).toBe(true);
+			expect(result.finalState).toBe("zombie");
+
+			const inbox = sharedMail.getAll({ to: "lead-y", type: "worker_died" });
+			expect(inbox.length).toBe(1);
+			const payload = JSON.parse(inbox[0]?.payload ?? "{}") as {
+				terminatedBy?: string;
+				reason?: string;
+			};
+			expect(payload.terminatedBy).toBe("runner");
+			expect(payload.reason).toContain("stalled");
+		} finally {
+			sharedMail.close();
+		}
+	});
+
+	test("terminalMailMissing: emits worker_died to parent (overstory-4159)", async () => {
+		// Silent-no-op: claude exits cleanly but never sends worker_done. The
+		// lead would otherwise block forever waiting for a terminal mail.
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "child-noop",
+			state: "working",
+			parentAgent: "lead-z",
+			taskId: "task-4159",
+		});
+		const { runtime } = makeSpyRuntime();
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			emitFakeTurn(fake, { sessionId: "noop-session", isError: false });
+			fake._exit(0);
+			return fake;
+		};
+
+		const sharedMail = createMailStore(ctx.mailDbPath);
+		try {
+			const result = await runTurn({
+				...makeRunOpts(ctx, "child-noop", {
+					runtime,
+					_spawnFn: spawnFn,
+				}),
+				_mailStore: sharedMail,
+			});
+			expect(result.cleanResult).toBe(true);
+			expect(result.terminalMailMissing).toBe(true);
+			expect(result.finalState).toBe("completed");
+
+			const inbox = sharedMail.getAll({ to: "lead-z", type: "worker_died" });
+			expect(inbox.length).toBe(1);
+			const payload = JSON.parse(inbox[0]?.payload ?? "{}") as {
+				terminatedBy?: string;
+				reason?: string;
+				agentName?: string;
+			};
+			expect(payload.terminatedBy).toBe("runner");
+			expect(payload.agentName).toBe("child-noop");
+			expect(payload.reason).toContain("Clean exit without terminal mail");
+		} finally {
+			sharedMail.close();
+		}
+	});
+
+	test("no parentAgent: skips worker_died mail (orchestrator-spawned worker)", async () => {
+		// Orchestrator-spawned workers have parentAgent=null; there is nobody to
+		// notify. The runner must not fabricate a recipient.
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "orphan-noop",
+			state: "working",
+			parentAgent: null,
+			taskId: "task-orphan",
+		});
+		const { runtime } = makeSpyRuntime();
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			emitFakeTurn(fake, { sessionId: "orphan-session" });
+			fake._exit(0);
+			return fake;
+		};
+
+		const sharedMail = createMailStore(ctx.mailDbPath);
+		try {
+			const result = await runTurn({
+				...makeRunOpts(ctx, "orphan-noop", { runtime, _spawnFn: spawnFn }),
+				_mailStore: sharedMail,
+			});
+			expect(result.terminalMailMissing).toBe(true);
+			const all = sharedMail.getAll({ type: "worker_died" });
+			expect(all.length).toBe(0);
+		} finally {
+			sharedMail.close();
+		}
+	});
+
+	test("happy path: terminal mail observed → no worker_died emitted (no double-signal)", async () => {
+		seedSession(ctx.sessionsDbPath, {
+			agentName: "child-ok",
+			state: "working",
+			parentAgent: "lead-ok",
+			taskId: "task-happy",
+		});
+		const { runtime } = makeSpyRuntime();
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => {
+			(async () => {
+				await Bun.sleep(15);
+				const s = createMailStore(ctx.mailDbPath);
+				try {
+					createMailClient(s).sendProtocol({
+						from: "child-ok",
+						to: "lead-ok",
+						subject: "Worker done",
+						body: "ok",
+						type: "worker_done",
+						priority: "normal",
+						payload: {
+							taskId: "task-happy",
+							branch: "branch",
+							exitCode: 0,
+							filesModified: [],
+						},
+					});
+				} finally {
+					s.close();
+				}
+				emitFakeTurn(fake, { sessionId: "ok-session" });
+				fake._exit(0);
+			})();
+			return fake;
+		};
+
+		const sharedMail = createMailStore(ctx.mailDbPath);
+		try {
+			const result = await runTurn({
+				...makeRunOpts(ctx, "child-ok", { runtime, _spawnFn: spawnFn }),
+				_mailStore: sharedMail,
+			});
+			expect(result.terminalMailObserved).toBe(true);
+			expect(result.terminalMailMissing).toBe(false);
+			expect(result.finalState).toBe("completed");
+
+			// Inbox should have the agent's own worker_done, but NO worker_died.
+			const died = sharedMail.getAll({ to: "lead-ok", type: "worker_died" });
+			expect(died.length).toBe(0);
+		} finally {
+			sharedMail.close();
+		}
+	});
+
 	test("two concurrent runTurn calls for the same agent serialize", async () => {
 		seedSession(ctx.sessionsDbPath, { agentName: "serial", state: "working" });
 		const { runtime } = makeSpyRuntime();

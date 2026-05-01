@@ -26,9 +26,16 @@ import { join } from "node:path";
 import { AgentError } from "../errors.ts";
 import { createEventStore } from "../events/store.ts";
 import { filterToolArgs } from "../events/tool-filter.ts";
+import { createMailStore, type MailStore } from "../mail/store.ts";
 import type { AgentEvent, AgentRuntime, DirectSpawnOpts } from "../runtimes/types.ts";
 import { createSessionStore } from "../sessions/store.ts";
-import type { AgentState, EventStore, EventType, ResolvedModel } from "../types.ts";
+import type {
+	AgentState,
+	EventStore,
+	EventType,
+	ResolvedModel,
+	WorkerDiedPayload,
+} from "../types.ts";
 import { terminalMailTypesFor } from "./capabilities.ts";
 import { acquireTurnLock } from "./turn-lock.ts";
 
@@ -91,6 +98,13 @@ export interface RunTurnOpts {
 	_spawnFn?: TurnSpawnFn;
 	/** Test injection: time source. */
 	_now?: () => Date;
+	/**
+	 * Test injection: pre-opened MailStore for the parent-notify path.
+	 * Production opens `mailDbPath` briefly inside the helper and closes it; tests
+	 * pass a shared in-memory store so they can read what was inserted without
+	 * reopening the DB file.
+	 */
+	_mailStore?: MailStore;
 	/**
 	 * Test injection: runner diagnostic sink. When omitted, warnings append to
 	 * `<turnLogDir>/runner.log` and mirror to `process.stderr` with a
@@ -318,6 +332,98 @@ function latestTerminalMailTs(
 			db.close();
 		} catch {
 			// best-effort
+		}
+	}
+}
+
+/**
+ * Send a synthetic `worker_died` mail to the parent of a session whose turn
+ * ended without the capability's terminal mail. Mirrors the watchdog's
+ * `notifyParentOfDeath` (overstory-c111) but for in-band runner detection:
+ *
+ * - **Aborted / stalled** (zombie): operator `ov stop` or the parser-stall
+ *   watchdog killed the subprocess. The agent never got a chance to send
+ *   `worker_done`/`merged` (overstory-c772).
+ * - **terminalMailMissing**: claude exited cleanly but never sent the terminal
+ *   mail — the silent-no-op path (overstory-4159).
+ *
+ * Without this, the lead waits forever for a terminal mail that will never
+ * arrive. The watchdog's pre-tick state-snapshot dedup (mx-b0e54b) means a
+ * later watchdog tick on the now-zombie session will see `stateBeforeTick ===
+ * "zombie"` and skip its own notify, so we won't double-fire.
+ *
+ * Fire-and-forget: every failure surfaces through `runnerLog` and never
+ * propagates. Mail-send must not break the turn.
+ */
+function notifyParentOfRunnerDeath(ctx: {
+	mailStore: MailStore | null;
+	mailDbPath: string;
+	parentAgent: string;
+	agentName: string;
+	capability: string;
+	taskId: string;
+	reason: string;
+	lastActivity: string;
+	runnerLog: RunnerLogger;
+}): void {
+	const {
+		mailStore,
+		mailDbPath,
+		parentAgent,
+		agentName,
+		capability,
+		taskId,
+		reason,
+		lastActivity,
+		runnerLog,
+	} = ctx;
+
+	const payload: WorkerDiedPayload = {
+		agentName,
+		capability,
+		taskId,
+		reason,
+		lastActivity,
+		terminatedBy: "runner",
+	};
+	const subject = `[RUNNER] worker_died: ${agentName}`;
+	const body =
+		`Worker "${agentName}" (${capability}) on task ${taskId} ended without ` +
+		`sending its terminal mail. Reason: ${reason}. Last activity: ${lastActivity}. ` +
+		`Decide whether to retry the work, escalate, or report the failure upstream.`;
+
+	let store: MailStore | null = mailStore;
+	let owned = false;
+	if (store === null) {
+		try {
+			store = createMailStore(mailDbPath);
+			owned = true;
+		} catch (err) {
+			runnerLog("warn", "failed to open mail store for parent notify", err);
+			return;
+		}
+	}
+	try {
+		store.insert({
+			id: "",
+			from: agentName,
+			to: parentAgent,
+			subject,
+			body,
+			type: "worker_died",
+			priority: "high",
+			threadId: null,
+			payload: JSON.stringify(payload),
+		});
+	} catch (err) {
+		runnerLog("warn", "failed to send worker_died mail to parent", err);
+	} finally {
+		if (owned) {
+			try {
+				store.close();
+			} catch {
+				// best-effort
+			}
 		}
 	}
 }
@@ -553,6 +659,8 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 	const startedAtMs = now().getTime();
 	let initialState: AgentState = preInitialState;
 	let priorSessionId: string | null = null;
+	let parentAgent: string | null = null;
+	let sessionLastActivity: string | null = null;
 	let turnPidPath: string | null = null;
 	// Per-turn diagnostic sink. Bound after the turn log dir is created;
 	// pre-creation failures (rare — only the lock-held SessionStore re-read)
@@ -569,6 +677,8 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 				if (session) {
 					initialState = session.state;
 					priorSessionId = session.claudeSessionId ?? null;
+					parentAgent = session.parentAgent ?? null;
+					sessionLastActivity = session.lastActivity ?? null;
 				}
 			} finally {
 				store.close();
@@ -966,6 +1076,37 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 					),
 			);
 		}
+
+		// In-band parent notification (overstory-4159, overstory-c772). When the
+		// turn ends without the capability's terminal mail — either because the
+		// runner zombified (abort/stall) or claude exited cleanly without sending
+		// `worker_done` — synthesize a `worker_died` mail to the parent so the
+		// lead does not block forever waiting for a signal that will never come.
+		// The watchdog's pre-tick state-snapshot dedup (mx-b0e54b) ensures a
+		// later watchdog pass on the now-zombie session does not re-fire.
+		const shouldNotifyParent =
+			parentAgent !== null && (finalState === "zombie" || terminalMailMissing);
+		if (shouldNotifyParent && parentAgent !== null) {
+			const reason = aborted
+				? "Aborted by operator (SIGTERM)"
+				: stallAborted
+					? "Parser stalled (no events within timeout)"
+					: terminalMailMissing
+						? `Clean exit without terminal mail (expected ${terminalMailTypesFor(capability).join("|") || "<none>"})`
+						: "Turn ended without terminal mail";
+			notifyParentOfRunnerDeath({
+				mailStore: opts._mailStore ?? null,
+				mailDbPath,
+				parentAgent,
+				agentName,
+				capability,
+				taskId,
+				reason,
+				lastActivity: sessionLastActivity ?? new Date(startedAtMs).toISOString(),
+				runnerLog,
+			});
+		}
+
 		// `lastActivity` advancing past `startedAt` is a turn-cleanup contract
 		// invariant — silent failure here was the smoking gun in overstory-4af3.
 		const lastActivityOk = updateSessionLastActivity(sessionsDbPath, agentName, (err) =>
