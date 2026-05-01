@@ -1083,5 +1083,16 @@
 		"status": "completed",
 		"createdAt": "2026-05-01T00:01:15.899Z",
 		"completedAt": "2026-05-01T01:41:14.860Z"
+	},
+	{
+		"id": "group-51612f16",
+		"name": "turn-runner-stall",
+		"memberIssueIds": [
+			"overstory-8e61",
+			"overstory-de3c"
+		],
+		"status": "active",
+		"createdAt": "2026-05-01T15:22:06.886Z",
+		"completedAt": null
 	}
 ]
