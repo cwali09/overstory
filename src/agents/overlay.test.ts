@@ -523,7 +523,7 @@ describe("generateOverlay", () => {
 		expect(output).toContain("3");
 	});
 
-	test("dispatch overrides: maxAgentsOverride of 1 enables combined lead/worker guidance", async () => {
+	test("dispatch overrides: maxAgentsOverride of 1 directs the lead to spend the slot on a single builder", async () => {
 		const config = makeConfig({
 			capability: "lead",
 			maxAgentsOverride: 1,
@@ -532,8 +532,8 @@ describe("generateOverlay", () => {
 		const output = await generateOverlay(config);
 
 		expect(output).toContain("MAX AGENTS");
-		expect(output).toContain("combined **lead/worker**");
-		expect(output).toContain("only slot");
+		expect(output).toContain("single builder");
+		expect(output).toContain("Leads cannot implement directly");
 	});
 
 	test("dispatch overrides: maxAgentsOverride of 2 enables compressed-mode guidance", async () => {
@@ -546,7 +546,7 @@ describe("generateOverlay", () => {
 
 		expect(output).toContain("MAX AGENTS");
 		expect(output).toContain("compressed mode");
-		expect(output).toContain("self-verification");
+		expect(output).toContain("Leads do not implement");
 	});
 
 	test("dispatch overrides: both skipReview and maxAgentsOverride together", async () => {

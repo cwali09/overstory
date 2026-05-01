@@ -125,14 +125,14 @@ function formatDispatchOverrides(config: OverlayConfig): string {
 		if (config.maxAgentsOverride === 1) {
 			sections.push(
 				"- **MAX AGENTS**: Your per-lead agent ceiling has been set to **1**. " +
-					"Operate as a combined **lead/worker**: implement the task yourself unless a single specialist is absolutely necessary. " +
-					"Do not spend your only slot on a scout or reviewer unless that specialist work is the real bottleneck.",
+					"Spend that slot on a single builder for the whole task — skip scouts and reviewers and self-verify the builder's diff yourself. " +
+					"Leads cannot implement directly (Write/Edit/`git add`/`git commit` are blocked by the harness), so the one slot must be a builder.",
 			);
 		} else if (config.maxAgentsOverride === 2) {
 			sections.push(
 				"- **MAX AGENTS**: Your per-lead agent ceiling has been set to **2**. " +
-					"Operate in compressed mode: use at most one helper at a time when possible, then complete the remaining implementation and verification yourself. " +
-					"Prefer self-verification over spawning a separate reviewer.",
+					"Operate in compressed mode: spend the slots on builders (one or two), skip scouts and reviewers, and self-verify each diff yourself. " +
+					"Leads do not implement; every change requires a builder spawn.",
 			);
 		} else {
 			sections.push(
