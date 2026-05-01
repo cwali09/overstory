@@ -351,6 +351,14 @@ export interface CoordinatorSessionOptions {
 	 * the web UI's POST /api/coordinator/start endpoint.
 	 */
 	headless?: boolean;
+	/**
+	 * Acknowledge that a watchdog daemon from a previous session may already be
+	 * running and should be allowed to supervise this coordinator. Without this
+	 * (or `--watchdog`), the start command refuses to spawn when a leftover
+	 * daemon is detected, to surface the "watchdog persists across runs" trap
+	 * that overstory-3f0c was filed for.
+	 */
+	acceptExistingWatchdog?: boolean;
 }
 
 /**
@@ -385,6 +393,7 @@ export async function startCoordinatorSession(
 		displayName: displayNameOpt,
 		beaconBuilder: beaconBuilderOpt,
 		headless: headlessFlag,
+		acceptExistingWatchdog: acceptExistingWatchdogFlag,
 	} = opts;
 
 	const coordinatorName = agentNameOpt ?? coordinatorNameOpt ?? COORDINATOR_NAME;
@@ -405,6 +414,25 @@ export async function startCoordinatorSession(
 	const watchdog = deps._watchdog ?? createDefaultWatchdog(projectRoot);
 	const monitor = deps._monitor ?? createDefaultMonitor(projectRoot);
 	const tmuxSession = coordinatorTmuxSession(config.project.name, coordinatorName);
+
+	// Detect leftover watchdog daemon from a previous session (overstory-3f0c).
+	// If a watchdog is already running and the operator did not pass --watchdog
+	// or --accept-existing-watchdog, refuse to start: a persistent daemon will
+	// supervise this coordinator with policy decided by the original invocation,
+	// not the current one. This prevents "I didn't run --watchdog, why is the
+	// watchdog killing things?" surprises.
+	const watchdogAlreadyRunning = await watchdog.isRunning();
+	if (watchdogAlreadyRunning && !watchdogFlag && !acceptExistingWatchdogFlag) {
+		const existingPid = await readWatchdogPid(projectRoot);
+		const pidLabel = existingPid !== null ? `PID ${existingPid}` : "unknown PID";
+		throw new AgentError(
+			`Watchdog daemon (${pidLabel}) is already running from a previous session. ` +
+				`It will supervise this ${displayName.toLowerCase()} run and may take escalation actions you did not opt into. ` +
+				`To proceed: pass --watchdog to acknowledge, pass --accept-existing-watchdog to suppress this check, ` +
+				`or run 'ov watch --kill-others' (or remove .overstory/watchdog.pid) first.`,
+			{ agentName: coordinatorName },
+		);
+	}
 
 	// Check for existing coordinator session with the same name
 	const overstoryDir = join(projectRoot, ".overstory");
@@ -589,9 +617,21 @@ export async function startCoordinatorSession(
 				if (watchdogResult) {
 					watchdogPid = watchdogResult.pid;
 					if (!json) printHint("Watchdog started");
+				} else if (watchdogAlreadyRunning) {
+					// createDefaultWatchdog.start() returns null when an existing PID
+					// is alive — that's a no-op success, not a failure. Reuse the
+					// existing daemon. Sentinel value keeps `watchdogPid !== undefined`
+					// truthy in the JSON output.
+					watchdogPid = -1;
+					if (!json) printHint("Watchdog already running, reusing existing daemon");
 				} else {
 					if (!json) printWarning("Watchdog failed to start");
 				}
+			} else if (watchdogAlreadyRunning && acceptExistingWatchdogFlag) {
+				// --accept-existing-watchdog without --watchdog: surface that an
+				// existing daemon is supervising this run, but do not call start().
+				watchdogPid = -1;
+				if (!json) printHint("Watchdog already running, reusing existing daemon");
 			}
 			let monitorPid: number | undefined;
 			if (monitorFlag) {
@@ -615,7 +655,8 @@ export async function startCoordinatorSession(
 				projectRoot,
 				pid: headlessProc.pid,
 				headless: true,
-				watchdog: watchdogFlag ? watchdogPid !== undefined : false,
+				watchdog: watchdogPid !== undefined,
+				watchdogPreexisting: watchdogAlreadyRunning,
 				monitor: monitorFlag ? monitorPid !== undefined : false,
 			};
 
@@ -755,16 +796,28 @@ export async function startCoordinatorSession(
 			await tmux.sendKeys(tmuxSession, "");
 		}
 
-		// Auto-start watchdog if --watchdog flag is present
+		// Auto-start watchdog if --watchdog flag is present.
 		let watchdogPid: number | undefined;
 		if (watchdogFlag) {
 			const watchdogResult = await watchdog.start();
 			if (watchdogResult) {
 				watchdogPid = watchdogResult.pid;
 				if (!json) printHint("Watchdog started");
+			} else if (watchdogAlreadyRunning) {
+				// createDefaultWatchdog.start() returns null when an existing PID
+				// is alive — that's a no-op success, not a failure. Reuse the
+				// existing daemon. Sentinel value keeps `watchdogPid !== undefined`
+				// truthy in the JSON output.
+				watchdogPid = -1;
+				if (!json) printHint("Watchdog already running, reusing existing daemon");
 			} else {
 				if (!json) printWarning("Watchdog failed to start");
 			}
+		} else if (watchdogAlreadyRunning && acceptExistingWatchdogFlag) {
+			// --accept-existing-watchdog without --watchdog: surface that an
+			// existing daemon is supervising this run, but do not call start().
+			watchdogPid = -1;
+			if (!json) printHint("Watchdog already running, reusing existing daemon");
 		}
 
 		// Auto-start monitor if --monitor flag is present and tier2 is enabled
@@ -789,7 +842,8 @@ export async function startCoordinatorSession(
 			tmuxSession,
 			projectRoot,
 			pid,
-			watchdog: watchdogFlag ? watchdogPid !== undefined : false,
+			watchdog: watchdogPid !== undefined,
+			watchdogPreexisting: watchdogAlreadyRunning,
 			monitor: monitorFlag ? monitorPid !== undefined : false,
 		};
 
@@ -815,7 +869,14 @@ export async function startCoordinatorSession(
 
 async function startPersistentAgent(
 	spec: PersistentAgentSpec,
-	opts: { json: boolean; attach: boolean; watchdog: boolean; monitor: boolean; profile?: string },
+	opts: {
+		json: boolean;
+		attach: boolean;
+		watchdog: boolean;
+		monitor: boolean;
+		profile?: string;
+		acceptExistingWatchdog?: boolean;
+	},
 	deps: CoordinatorDeps = {},
 ): Promise<void> {
 	await startCoordinatorSession(
@@ -1557,6 +1618,10 @@ export function createPersistentAgentCommand(
 		.option("--attach", "Always attach to tmux session after start")
 		.option("--no-attach", "Never attach to tmux session after start")
 		.option("--watchdog", `Auto-start watchdog daemon with ${spec.commandName}`)
+		.option(
+			"--accept-existing-watchdog",
+			"Continue when a watchdog daemon from a previous session is already running (it will supervise this run)",
+		)
 		.option("--monitor", `Auto-start Tier 2 monitor agent with ${spec.commandName}`)
 		.option("--profile <name>", "Canopy profile to apply to spawned agents")
 		.option("--json", "Output as JSON")
@@ -1564,6 +1629,7 @@ export function createPersistentAgentCommand(
 			async (opts: {
 				attach?: boolean;
 				watchdog?: boolean;
+				acceptExistingWatchdog?: boolean;
 				monitor?: boolean;
 				json?: boolean;
 				profile?: string;
@@ -1576,6 +1642,7 @@ export function createPersistentAgentCommand(
 						json: opts.json ?? false,
 						attach: shouldAttach,
 						watchdog: opts.watchdog ?? false,
+						acceptExistingWatchdog: opts.acceptExistingWatchdog ?? false,
 						monitor: opts.monitor ?? false,
 						profile: opts.profile,
 					},
