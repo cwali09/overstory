@@ -13,8 +13,40 @@
  */
 
 import { createMailStore } from "../mail/store.ts";
+import type { MailMessage } from "../types.ts";
 import { encodeUserTurn } from "./headless-prompt.ts";
 import type { RunTurnOpts, TurnResult } from "./turn-runner.ts";
+
+/**
+ * Escape characters that would otherwise corrupt the `[MAIL] From: ... | Subject: ... |
+ * Priority: ...\n\n<body>` framing. `|` is the field delimiter and `\n\n` separates
+ * metadata from body, so an unescaped pipe or newline in a metadata value would let a
+ * crafted subject inject a fake field or smuggle a fake body. Backslash is escaped
+ * first so the escape sequence itself is unambiguous (overstory-2231).
+ */
+function escapeMailMetadata(value: string): string {
+	return value
+		.replace(/\\/g, "\\\\")
+		.replace(/\|/g, "\\|")
+		.replace(/\r/g, "\\r")
+		.replace(/\n/g, "\\n");
+}
+
+/**
+ * Format a batch of unread messages into the user-turn text the agent receives.
+ * Metadata values are escaped so a hostile or human-authored subject can't break
+ * the line framing.
+ */
+export function formatMailBatch(messages: readonly MailMessage[]): string {
+	return messages
+		.map(
+			(m) =>
+				`[MAIL] From: ${escapeMailMetadata(m.from)} | Subject: ${escapeMailMetadata(
+					m.subject,
+				)} | Priority: ${escapeMailMetadata(m.priority)}\n\n${m.body}`,
+		)
+		.join("\n\n---\n\n");
+}
 
 /**
  * Build the runTurn opts for delivering a user turn (Phase 2 builder dispatcher).
@@ -106,14 +138,7 @@ export function startTurnRunnerMailLoop(
 		}
 		if (messages.length === 0) return { kind: "idle" };
 
-		const text = messages
-			.map(
-				(m) =>
-					`[MAIL] From: ${m.from} | Subject: ${m.subject} | Priority: ${m.priority}\n\n${m.body}`,
-			)
-			.join("\n\n---\n\n");
-
-		const userTurnNdjson = encodeUserTurn(text);
+		const userTurnNdjson = encodeUserTurn(formatMailBatch(messages));
 		const ids = messages.map((m) => m.id);
 
 		inFlight = true;
@@ -166,14 +191,7 @@ export async function _runTurnRunnerTick(
 	}
 	if (messages.length === 0) return { kind: "idle" };
 
-	const text = messages
-		.map(
-			(m) =>
-				`[MAIL] From: ${m.from} | Subject: ${m.subject} | Priority: ${m.priority}\n\n${m.body}`,
-		)
-		.join("\n\n---\n\n");
-
-	const userTurnNdjson = encodeUserTurn(text);
+	const userTurnNdjson = encodeUserTurn(formatMailBatch(messages));
 	const ids = messages.map((m) => m.id);
 
 	try {
