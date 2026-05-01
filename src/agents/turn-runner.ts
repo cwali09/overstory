@@ -648,12 +648,35 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 		}
 
 		// Publish the live claude PID so other processes (`ov stop`, watchdog) can
-		// find and signal it. Best-effort: failure is non-fatal, the turn still
-		// runs — operators just lose the cross-process kill primitive for this turn.
+		// find and signal it. turn.pid is the cross-process kill primitive for
+		// headless task-scoped agents — without it, `ov stop` reads null and
+		// silently degrades (overstory-62a6). Treat write failure as a contract
+		// violation (symmetric with the cleanup-side assertion that turn.pid must
+		// not survive the runner): SIGKILL the just-spawned subprocess and abort
+		// the turn so the operator sees the failure instead of a half-broken
+		// agent that cannot be killed.
 		try {
 			await Bun.write(turnPidPath, `${proc.pid}\n`);
 		} catch (err) {
-			runnerLog("warn", "failed to write turn.pid", err);
+			runnerLog(
+				"error",
+				`failed to write turn.pid at ${turnPidPath} — kill primitive unavailable, aborting turn`,
+				err,
+			);
+			try {
+				proc.kill("SIGKILL");
+			} catch {
+				// process may have already exited
+			}
+			try {
+				await stderrWriter.end();
+			} catch {
+				// ignore
+			}
+			throw new AgentError(
+				`failed to write turn.pid at ${turnPidPath}: ${err instanceof Error ? err.message : String(err)}`,
+				{ agentName, ...(err instanceof Error ? { cause: err } : {}) },
+			);
 		}
 
 		// Tee stderr stream into the per-turn stderr.log without blocking the parser.

@@ -1137,6 +1137,42 @@ describe("runTurn", () => {
 		expect(existsSync(turnPidPathFor(ctx, "parser-fail"))).toBe(false);
 	});
 
+	test("turn.pid write failure SIGKILLs subprocess and aborts the turn (overstory-62a6)", async () => {
+		seedSession(ctx.sessionsDbPath, { agentName: "pid-write-fail", state: "working" });
+		const { runtime } = makeSpyRuntime();
+
+		// Pre-create turn.pid as a DIRECTORY so `Bun.write(turnPidPath, ...)` fails
+		// with EISDIR. This mirrors any real failure mode (read-only fs, permissions,
+		// disk full) where the kill primitive becomes unavailable.
+		const { mkdir } = await import("node:fs/promises");
+		const turnPidPath = turnPidPathFor(ctx, "pid-write-fail");
+		await mkdir(turnPidPath, { recursive: true });
+
+		const fake = makeFakeProc();
+		const spawnFn: TurnSpawnFn = () => fake;
+
+		const events: Array<{ level: string; message: string }> = [];
+		const logger: RunnerLogger = (level, message) => {
+			events.push({ level, message });
+		};
+
+		await expect(
+			runTurn(
+				makeRunOpts(ctx, "pid-write-fail", { runtime, _spawnFn: spawnFn, _logWarning: logger }),
+			),
+		).rejects.toThrow(/failed to write turn\.pid/);
+
+		// The kill primitive is unavailable, so the only safe way to avoid a
+		// silently un-killable agent is to SIGKILL the subprocess here.
+		expect(fake._killSignals).toContain("SIGKILL");
+		expect(fake._killed).toBe(true);
+
+		// Surfaces at error level (not warn) so the failure isn't silent.
+		expect(
+			events.some((e) => e.level === "error" && e.message.includes("failed to write turn.pid")),
+		).toBe(true);
+	});
+
 	test("silent SessionStore failure surfaces as a runner warning", async () => {
 		seedSession(ctx.sessionsDbPath, { agentName: "ss-fail", state: "working" });
 		const { runtime } = makeSpyRuntime();
