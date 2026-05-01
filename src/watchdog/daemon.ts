@@ -35,7 +35,14 @@ import { createMulchClient } from "../mulch/client.ts";
 import { getConnection, removeConnection } from "../runtimes/connections.ts";
 import type { RuntimeConnection } from "../runtimes/types.ts";
 import { openSessionStore } from "../sessions/compat.ts";
-import type { AgentSession, EventStore, HealthCheck, WorkerDiedPayload } from "../types.ts";
+import { createRunStore } from "../sessions/store.ts";
+import type {
+	AgentSession,
+	EventStore,
+	HealthCheck,
+	RunStore,
+	WorkerDiedPayload,
+} from "../types.ts";
 import { isProcessAlive, isSessionAlive, killProcessTree, killSession } from "../worktree/tmux.ts";
 import { evaluateHealth, transitionState } from "./health.ts";
 import { type TriageResult, triageAgent } from "./triage.ts";
@@ -49,6 +56,28 @@ const MAX_ESCALATION_LEVEL = 3;
  * survive between tick invocations. Overridable via DaemonOptions._tailerRegistry.
  */
 const _defaultTailerRegistry: Map<string, TailerHandle> = new Map();
+
+/**
+ * Per-cause dedup state for `current-run.txt` defensive-read warnings
+ * (overstory-87bf). The watchdog reads `.overstory/current-run.txt` once per
+ * tick to gate run-completion checks; if the file is missing/empty/unreadable
+ * or points to an id with no row in the runs table, the check would silently
+ * skip every tick. We log one warning per cause and then continue skipping
+ * silently, so an operator can see the run-completion path is wedged without
+ * drowning in repeated lines.
+ *
+ * Module-level by design: warnings should dedupe across ticks within one
+ * watchdog process. Overridable via DaemonOptions._runIdWarnState in tests.
+ */
+export interface RunIdWarnState {
+	missingFileWarned: boolean;
+	unknownIds: Set<string>;
+}
+
+const _defaultRunIdWarnState: RunIdWarnState = {
+	missingFileWarned: false,
+	unknownIds: new Set(),
+};
 
 /**
  * Record an agent failure to mulch for future reference.
@@ -111,6 +140,56 @@ async function readCurrentRunId(overstoryDir: string): Promise<string | null> {
 }
 
 /**
+ * Resolve the active run id for run-completion checks, defensively
+ * (overstory-87bf). Returns the id only when `current-run.txt` is readable
+ * AND points to a row in the runs table. On either failure mode, logs one
+ * warning per cause via `warnState` and returns null so the caller can skip
+ * the check silently on subsequent ticks.
+ *
+ * Intentionally narrow: the broader `readCurrentRunId` is unchanged and still
+ * powers event-recording paths where a stale id is acceptable as a label.
+ */
+async function resolveRunIdForCompletionCheck(
+	overstoryDir: string,
+	runStore: RunStore | null,
+	warnState: RunIdWarnState,
+): Promise<string | null> {
+	const runId = await readCurrentRunId(overstoryDir);
+	if (runId === null) {
+		if (!warnState.missingFileWarned) {
+			warnState.missingFileWarned = true;
+			process.stderr.write(
+				"[WATCHDOG] current-run.txt missing — run-completion checks disabled until restart\n",
+			);
+		}
+		return null;
+	}
+	if (runStore === null) {
+		// RunStore unavailable (rare — sessions.db open failed). Trust the file
+		// and let the downstream nudge path proceed; this is no worse than the
+		// pre-87bf behavior.
+		return runId;
+	}
+	let run: ReturnType<RunStore["getRun"]>;
+	try {
+		run = runStore.getRun(runId);
+	} catch {
+		// Treat lookup errors as "unknown" — same defensive posture as a missing row.
+		run = null;
+	}
+	if (run === null) {
+		if (!warnState.unknownIds.has(runId)) {
+			warnState.unknownIds.add(runId);
+			process.stderr.write(
+				`[WATCHDOG] current-run.txt points to unknown run "${runId}" — run-completion checks disabled until restart\n`,
+			);
+		}
+		return null;
+	}
+	return runId;
+}
+
+/**
  * Fire-and-forget: record an event to EventStore. Never throws.
  */
 function recordEvent(
@@ -142,10 +221,15 @@ function recordEvent(
 }
 
 /**
- * Build a phase-aware completion message based on the capabilities of completed workers.
+ * Build a phase-aware completion message based on the capabilities of terminal workers.
  *
- * Single-capability batches get targeted messages (e.g. scouts → "Ready for next phase"),
- * while mixed-capability batches get a generic summary with a breakdown.
+ * "Terminal" includes both `completed` (clean exit) and `zombie` (watchdog-killed)
+ * — see overstory-e130 for why a zombie counts as run-terminal. Single-capability
+ * batches get targeted messages (e.g. scouts → "Ready for next phase"), while
+ * mixed-capability batches get a generic summary with a breakdown. When any worker
+ * died, the verb changes from "have completed" to "have terminated" and the message
+ * carries a "(N completed, M zombie)" qualifier so the coordinator does not mistake
+ * a partial failure for a clean batch.
  */
 export function buildCompletionMessage(
 	workerSessions: readonly AgentSession[],
@@ -153,32 +237,41 @@ export function buildCompletionMessage(
 ): string {
 	const capabilities = new Set(workerSessions.map((s) => s.capability));
 	const count = workerSessions.length;
+	const zombieCount = workerSessions.filter((s) => s.state === "zombie").length;
+	const completedCount = count - zombieCount;
+	const verb = zombieCount > 0 ? "have terminated" : "have completed";
+	const qualifier = zombieCount > 0 ? ` (${completedCount} completed, ${zombieCount} zombie)` : "";
 
 	if (capabilities.size === 1) {
 		if (capabilities.has("scout")) {
-			return `[WATCHDOG] All ${count} scout(s) in run ${runId} have completed. Ready for next phase.`;
+			return `[WATCHDOG] All ${count} scout(s) in run ${runId} ${verb}${qualifier}. Ready for next phase.`;
 		}
 		if (capabilities.has("builder")) {
-			return `[WATCHDOG] All ${count} builder(s) in run ${runId} have completed. Awaiting lead verification.`;
+			return `[WATCHDOG] All ${count} builder(s) in run ${runId} ${verb}${qualifier}. Awaiting lead verification.`;
 		}
 		if (capabilities.has("reviewer")) {
-			return `[WATCHDOG] All ${count} reviewer(s) in run ${runId} have completed. Reviews done.`;
+			return `[WATCHDOG] All ${count} reviewer(s) in run ${runId} ${verb}${qualifier}. Reviews done.`;
 		}
 		if (capabilities.has("lead")) {
-			return `[WATCHDOG] All ${count} lead(s) in run ${runId} have completed. Ready for merge/cleanup.`;
+			return `[WATCHDOG] All ${count} lead(s) in run ${runId} ${verb}${qualifier}. Ready for merge/cleanup.`;
 		}
 		if (capabilities.has("merger")) {
-			return `[WATCHDOG] All ${count} merger(s) in run ${runId} have completed. Merges done.`;
+			return `[WATCHDOG] All ${count} merger(s) in run ${runId} ${verb}${qualifier}. Merges done.`;
 		}
 	}
 
 	const breakdown = Array.from(capabilities).sort().join(", ");
-	return `[WATCHDOG] All ${count} worker(s) in run ${runId} have completed (${breakdown}). Ready for next steps.`;
+	return `[WATCHDOG] All ${count} worker(s) in run ${runId} ${verb}${qualifier} (${breakdown}). Ready for next steps.`;
 }
 
 /**
- * Check if all worker sessions for the active run have completed, and if so,
- * nudge the coordinator. Fire-and-forget: never throws.
+ * Check if every worker session for the active run has reached a terminal state
+ * (`completed` or `zombie`), and if so, nudge the coordinator. Fire-and-forget:
+ * never throws.
+ *
+ * Zombie counts as terminal (overstory-e130): a watchdog-killed worker is not
+ * coming back, so excluding it would strand the coordinator on a run that mixes
+ * clean exits with kills.
  *
  * Deduplication: uses a marker file (run-complete-notified.txt) to prevent
  * repeated nudges for the same run ID.
@@ -205,8 +298,11 @@ async function checkRunCompletion(ctx: {
 		return;
 	}
 
-	const allCompleted = workerSessions.every((s) => s.state === "completed");
-	if (!allCompleted) {
+	// `completed` = clean exit, `zombie` = watchdog-killed. Both are terminal
+	// for run-completion: a zombie is not coming back, so blocking on it would
+	// strand the coordinator forever (overstory-e130).
+	const allTerminal = workerSessions.every((s) => s.state === "completed" || s.state === "zombie");
+	if (!allTerminal) {
 		return;
 	}
 
@@ -235,15 +331,20 @@ async function checkRunCompletion(ctx: {
 	// Record the event
 	const capabilitiesArr = Array.from(new Set(workerSessions.map((s) => s.capability))).sort();
 	const phase = capabilitiesArr.length === 1 ? capabilitiesArr[0] : "mixed";
+	const completedAgents = workerSessions
+		.filter((s) => s.state === "completed")
+		.map((s) => s.agentName);
+	const zombieAgents = workerSessions.filter((s) => s.state === "zombie").map((s) => s.agentName);
 	recordEvent(eventStore, {
 		runId,
 		agentName: "watchdog",
 		eventType: "custom",
-		level: "info",
+		level: zombieAgents.length > 0 ? "warn" : "info",
 		data: {
 			type: "run_complete",
 			workerCount: workerSessions.length,
-			completedAgents: workerSessions.map((s) => s.agentName),
+			completedAgents,
+			zombieAgents,
 			capabilities: capabilitiesArr,
 			phase,
 		},
@@ -319,6 +420,18 @@ export interface DaemonOptions {
 	_findLatestStdoutLog?: (overstoryDir: string, agentName: string) => Promise<string | null>;
 	/** Dependency injection for testing. Overrides MailStore creation for decision gate detection. */
 	_mailStore?: MailStore | null;
+	/**
+	 * Dependency injection for testing. Overrides the module-level run-id warning
+	 * state so each test starts with a clean dedup slate (overstory-87bf).
+	 */
+	_runIdWarnState?: RunIdWarnState;
+	/**
+	 * Dependency injection for testing. Overrides RunStore creation. When `null`
+	 * is passed explicitly, run-id validation is skipped (file presence still
+	 * gates the warning). When omitted, a real RunStore is opened against
+	 * `.overstory/sessions.db`.
+	 */
+	_runStore?: RunStore | null;
 }
 
 /**
@@ -516,9 +629,25 @@ export async function runDaemonTick(options: DaemonOptions): Promise<void> {
 	const findStdoutLog = options._findLatestStdoutLog ?? findLatestStdoutLog;
 	const maxTriagePerTick = options._maxTriagePerTick ?? 3;
 	const triageCount = { value: 0 };
+	const runIdWarnState = options._runIdWarnState ?? _defaultRunIdWarnState;
 
 	const overstoryDir = join(root, ".overstory");
 	const { store } = openSessionStore(overstoryDir);
+
+	// Open RunStore for run-id validation (overstory-87bf). Sharing sessions.db
+	// is intentional — same file, WAL mode covers concurrent reads.
+	let runStore: RunStore | null = null;
+	let ownRunStore = false;
+	if (options._runStore !== undefined) {
+		runStore = options._runStore;
+	} else {
+		try {
+			runStore = createRunStore(join(overstoryDir, "sessions.db"));
+			ownRunStore = true;
+		} catch {
+			// RunStore creation failure is non-fatal — id validation is then skipped.
+		}
+	}
 
 	// Open MailStore for decision gate detection (fire-and-forget: non-fatal if unavailable)
 	let mailStore: MailStore | null = null;
@@ -826,10 +955,18 @@ export async function runDaemonTick(options: DaemonOptions): Promise<void> {
 
 		// === Run-level completion detection ===
 		// After monitoring individual sessions, check if the entire run is done.
-		if (runId) {
+		// Re-resolve the run id defensively (overstory-87bf): a missing
+		// current-run.txt or a stale id (no row in runs table) skips the check
+		// and emits one warning per cause for the lifetime of this watchdog.
+		const validatedRunId = await resolveRunIdForCompletionCheck(
+			overstoryDir,
+			runStore,
+			runIdWarnState,
+		);
+		if (validatedRunId) {
 			await checkRunCompletion({
 				store,
-				runId,
+				runId: validatedRunId,
 				overstoryDir,
 				root,
 				nudge,
@@ -850,6 +987,14 @@ export async function runDaemonTick(options: DaemonOptions): Promise<void> {
 		if (eventStore && !useInjectedEventStore) {
 			try {
 				eventStore.close();
+			} catch {
+				// Non-fatal
+			}
+		}
+		// Close RunStore only if we created it (not injected)
+		if (runStore && ownRunStore) {
+			try {
+				runStore.close();
 			} catch {
 				// Non-fatal
 			}
