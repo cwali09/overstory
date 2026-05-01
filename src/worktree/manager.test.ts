@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, realpathSync } from "node:fs";
-import { mkdir, mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WorktreeError } from "../errors.ts";
@@ -9,6 +9,7 @@ import {
 	commitFile,
 	createTempGitRepo,
 	getDefaultBranch,
+	runGitInDir,
 } from "../test-helpers.ts";
 import {
 	createWorktree,
@@ -16,6 +17,7 @@ import {
 	listWorktrees,
 	removeWorktree,
 	rollbackWorktree,
+	validateWorktreeCreation,
 } from "./manager.ts";
 
 /**
@@ -144,6 +146,61 @@ describe("createWorktree", () => {
 			expect(wtErr.worktreePath).toBe(join(worktreesDir, "auth-login"));
 			expect(wtErr.branchName).toBe("overstory/auth-login/bead-abc123");
 		}
+	});
+
+	test("rejects creation when target branch is already checked out elsewhere", async () => {
+		// Pre-check should fail-fast with a precise diagnostic before git
+		// worktree add runs, so the operator sees the actual cause rather
+		// than git's generic "already exists" error or, worse, a silently
+		// half-built worktree (overstory-6878).
+		const first = await createWorktree({
+			repoRoot: repoDir,
+			baseDir: worktreesDir,
+			agentName: "auth-login",
+			baseBranch: defaultBranch,
+			taskId: "bead-abc123",
+		});
+
+		try {
+			await createWorktree({
+				repoRoot: repoDir,
+				baseDir: worktreesDir,
+				agentName: "auth-login",
+				baseBranch: defaultBranch,
+				taskId: "bead-abc123",
+			});
+			expect(true).toBe(false);
+		} catch (err: unknown) {
+			expect(err).toBeInstanceOf(WorktreeError);
+			const wtErr = err as WorktreeError;
+			expect(wtErr.message).toContain("already checked out");
+			expect(wtErr.message).toContain(first.path);
+			expect(wtErr.branchName).toBe("overstory/auth-login/bead-abc123");
+		}
+
+		// The original worktree must remain intact — the pre-check rejected
+		// before any state-mutating git command ran.
+		expect(existsSync(first.path)).toBe(true);
+		const entries = await listWorktrees(repoDir);
+		expect(entries.some((e) => e.path === first.path)).toBe(true);
+	});
+
+	test("post-creation: new worktree is registered and contains tracked files", async () => {
+		const { path: wtPath } = await createWorktree({
+			repoRoot: repoDir,
+			baseDir: worktreesDir,
+			agentName: "auth-login",
+			baseBranch: defaultBranch,
+			taskId: "bead-files",
+		});
+
+		// Registration check — listWorktrees must include the new path
+		const entries = await listWorktrees(repoDir);
+		expect(entries.map((e) => e.path)).toContain(wtPath);
+
+		// File-presence check — git ls-files inside the worktree must be non-empty
+		const lsFiles = await git(wtPath, ["ls-files"]);
+		expect(lsFiles.trim().length).toBeGreaterThan(0);
 	});
 });
 
@@ -499,5 +556,165 @@ describe("rollbackWorktree", () => {
 		// Branch still exists (we didn't delete it)
 		const branchList = await git(repoDir, ["branch", "--list"]);
 		expect(branchList).toContain("overstory/auth-login/bead-abc");
+	});
+});
+
+describe("validateWorktreeCreation", () => {
+	let repoDir: string;
+	let worktreesDir: string;
+	let defaultBranch: string;
+
+	beforeEach(async () => {
+		repoDir = realpathSync(await createTempGitRepo());
+		defaultBranch = await getDefaultBranch(repoDir);
+		worktreesDir = join(repoDir, ".overstory", "worktrees");
+		await mkdir(worktreesDir, { recursive: true });
+	});
+
+	afterEach(async () => {
+		await cleanupTempDir(repoDir);
+	});
+
+	test("passes for a normally created worktree", async () => {
+		const { path: wtPath, branch } = await createWorktree({
+			repoRoot: repoDir,
+			baseDir: worktreesDir,
+			agentName: "feature-agent",
+			baseBranch: defaultBranch,
+			taskId: "bead-ok",
+		});
+
+		// Re-running validation against the live worktree should be a no-op
+		await expect(
+			validateWorktreeCreation({
+				repoRoot: repoDir,
+				worktreePath: wtPath,
+				branchName: branch,
+			}),
+		).resolves.toBeUndefined();
+	});
+
+	test("throws when worktree path is not registered with git", async () => {
+		const fakePath = join(worktreesDir, "ghost-agent");
+
+		try {
+			await validateWorktreeCreation({
+				repoRoot: repoDir,
+				worktreePath: fakePath,
+				branchName: "overstory/ghost-agent/bead-missing",
+			});
+			expect(true).toBe(false);
+		} catch (err: unknown) {
+			expect(err).toBeInstanceOf(WorktreeError);
+			const wtErr = err as WorktreeError;
+			expect(wtErr.worktreePath).toBe(fakePath);
+			expect(wtErr.branchName).toBe("overstory/ghost-agent/bead-missing");
+			expect(wtErr.message).toContain("not registered with git");
+		}
+	});
+
+	test("rolls back the dangling branch when validation fails", async () => {
+		// Create a real branch that's not attached to any worktree, then ask
+		// validation to check a path it can't possibly be registered at.
+		await runGitInDir(repoDir, ["branch", "overstory/orphan-agent/bead-x", defaultBranch]);
+		const fakePath = join(worktreesDir, "orphan-agent");
+
+		await expect(
+			validateWorktreeCreation({
+				repoRoot: repoDir,
+				worktreePath: fakePath,
+				branchName: "overstory/orphan-agent/bead-x",
+			}),
+		).rejects.toThrow(WorktreeError);
+
+		// rollbackWorktree should have force-deleted the orphan branch
+		const branchList = await git(repoDir, ["branch", "--list"]);
+		expect(branchList).not.toContain("overstory/orphan-agent/bead-x");
+	});
+
+	test("throws when worktree contains zero tracked files", async () => {
+		// Build a base branch that points at an empty tree, then create a
+		// worktree from it. git happily registers the worktree, but ls-files
+		// returns nothing — the exact silent-failure shape from overstory-6878.
+		const emptyTree = (
+			await runGitInDir(repoDir, ["hash-object", "-t", "tree", "/dev/null"])
+		).trim();
+		const emptyCommit = (
+			await runGitInDir(repoDir, ["commit-tree", emptyTree, "-m", "empty base"])
+		).trim();
+		await runGitInDir(repoDir, ["branch", "empty-base", emptyCommit]);
+
+		const wtPath = join(worktreesDir, "empty-agent");
+		const branchName = "overstory/empty-agent/bead-empty";
+		await runGitInDir(repoDir, ["worktree", "add", "-b", branchName, wtPath, "empty-base"]);
+
+		try {
+			await validateWorktreeCreation({
+				repoRoot: repoDir,
+				worktreePath: wtPath,
+				branchName,
+			});
+			expect(true).toBe(false);
+		} catch (err: unknown) {
+			expect(err).toBeInstanceOf(WorktreeError);
+			const wtErr = err as WorktreeError;
+			expect(wtErr.worktreePath).toBe(wtPath);
+			expect(wtErr.branchName).toBe(branchName);
+			expect(wtErr.message).toContain("zero tracked files");
+		}
+
+		// Rollback removed both worktree and branch
+		expect(existsSync(wtPath)).toBe(false);
+		const branchList = await git(repoDir, ["branch", "--list"]);
+		expect(branchList).not.toContain(branchName);
+	});
+
+	test("createWorktree rejects when base branch has no tracked files", async () => {
+		// End-to-end: createWorktree should surface the same error and clean
+		// up after itself, so sling never sees a half-built worktree.
+		const emptyTree = (
+			await runGitInDir(repoDir, ["hash-object", "-t", "tree", "/dev/null"])
+		).trim();
+		const emptyCommit = (
+			await runGitInDir(repoDir, ["commit-tree", emptyTree, "-m", "empty base"])
+		).trim();
+		await runGitInDir(repoDir, ["branch", "empty-base", emptyCommit]);
+
+		await expect(
+			createWorktree({
+				repoRoot: repoDir,
+				baseDir: worktreesDir,
+				agentName: "empty-agent",
+				baseBranch: "empty-base",
+				taskId: "bead-empty",
+			}),
+		).rejects.toThrow(WorktreeError);
+
+		// Caller observes a clean repo: no worktree dir, no leaked branch
+		expect(existsSync(join(worktreesDir, "empty-agent"))).toBe(false);
+		const branchList = await git(repoDir, ["branch", "--list"]);
+		expect(branchList).not.toContain("overstory/empty-agent/bead-empty");
+	});
+
+	test("createWorktree rejects when target dir pre-exists with files", async () => {
+		// Simulates the witnessed scenario: a stale directory survives at the
+		// target path from a previous run. createWorktree must surface a
+		// WorktreeError rather than returning a path that points at non-git
+		// state — the contract that protects the agent from being trapped.
+		const wtPath = join(worktreesDir, "preexisting-agent");
+		await mkdir(wtPath, { recursive: true });
+		await Bun.write(join(wtPath, "stale.txt"), "leftover from a previous run");
+
+		await expect(
+			createWorktree({
+				repoRoot: repoDir,
+				baseDir: worktreesDir,
+				agentName: "preexisting-agent",
+				baseBranch: defaultBranch,
+				taskId: "bead-pre",
+			}),
+		).rejects.toThrow(WorktreeError);
+
+		await rm(wtPath, { recursive: true, force: true });
 	});
 });
