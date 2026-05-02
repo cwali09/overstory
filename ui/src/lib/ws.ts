@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
+import type { AgentState } from "./api";
 import { useRegisterWsStatus } from "./ws-status";
 
 // ── Types (mirrored locally — do not import server types) ──────────────────
@@ -40,7 +41,7 @@ export interface StoredEvent {
 export type Frame =
 	| { type: "event"; ts: string; payload: StoredEvent | { batched: true; events: StoredEvent[] } }
 	| { type: "mail"; ts: string; payload: { message: unknown } }
-	| { type: "agent_state"; ts: string; payload: { agentName: string; state: string } };
+	| { type: "agent_state"; ts: string; payload: { agentName: string; state: AgentState } };
 
 // ── Hook ───────────────────────────────────────────────────────────────────
 

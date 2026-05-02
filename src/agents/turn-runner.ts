@@ -993,11 +993,18 @@ export async function runTurn(opts: RunTurnOpts): Promise<TurnResult> {
 					opts._onLastActivityRefresh?.();
 				}
 
+				// First parser event of a turn → settle into `in_turn`. Allowed
+				// predecessors are `booting` (initial dispatch), `between_turns`
+				// (next mail batch on a healthy worker), or already-`in_turn`
+				// (idempotent — covers the case where a prior turn somehow left
+				// the row at in_turn). Legacy `working` rows are intentionally
+				// not in the matrix predecessor set (overstory-3087): spawn-
+				// per-turn workers should not flow through `working`, so the
+				// matrix keeps the substate path disjoint and a stale `working`
+				// row is left alone rather than silently coerced.
 				if (
 					!transitionedToInTurn &&
-					(initialState === "booting" ||
-						initialState === "between_turns" ||
-						initialState === "working")
+					(initialState === "booting" || initialState === "between_turns")
 				) {
 					transitionedToInTurn = true;
 					updateSessionState(

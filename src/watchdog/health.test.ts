@@ -502,7 +502,11 @@ describe("spawn-per-turn workers (overstory-7a34)", () => {
 	// the TUI/tmux path where tmuxAlive=false → ZFC Rule 1 → zombie within
 	// seconds of sling, despite being actively executing tools (overstory-7a34).
 
-	test("freshly slung spawn-per-turn lead (booting, no pid, no tmux) → working", () => {
+	test("freshly slung spawn-per-turn lead (booting, no pid, no tmux) → between_turns (overstory-3087)", () => {
+		// Spec change: spawn-per-turn workers report `between_turns` instead
+		// of `working` for the healthy classification, including the booting
+		// → healthy transition. The turn-runner authoritatively writes
+		// `in_turn` once the first parser event of a turn arrives.
 		const session = makeSession({
 			tmuxSession: "",
 			pid: null,
@@ -512,12 +516,18 @@ describe("spawn-per-turn workers (overstory-7a34)", () => {
 		});
 		const check = evaluateHealth(session, false, THRESHOLDS);
 
-		expect(check.state).toBe("working");
+		expect(check.state).toBe("between_turns");
 		expect(check.action).toBe("none");
 		expect(check.reconciliationNote).toBeNull();
 	});
 
-	test("active spawn-per-turn worker (working, recent activity) → stays working", () => {
+	test("legacy spawn-per-turn worker still at 'working' is reported as between_turns (overstory-3087)", () => {
+		// A row that predates the substate split (state=working) gets
+		// reclassified to `between_turns` by the watchdog's healthy-state
+		// reporter. transitionState then promotes the row forward (working
+		// and between_turns share rank 1 in STATE_ORDER, so the actual
+		// promotion happens via tryTransitionState elsewhere — here we just
+		// verify the check itself reports the new substate).
 		const session = makeSession({
 			tmuxSession: "",
 			pid: null,
@@ -527,13 +537,16 @@ describe("spawn-per-turn workers (overstory-7a34)", () => {
 		});
 		const check = evaluateHealth(session, false, THRESHOLDS);
 
-		expect(check.state).toBe("working");
+		expect(check.state).toBe("between_turns");
 		expect(check.action).toBe("none");
 	});
 
-	test("spawn-per-turn worker between turns (state working, very recent) → working, NOT zombie", () => {
-		// Repro: ov sling --capability lead any-task; within ~30s ov dashboard
-		// previously showed state='zombie' while ov feed showed live tool calls.
+	test("spawn-per-turn worker between turns (recent activity) → between_turns, NOT zombie (overstory-3087)", () => {
+		// Repro of overstory-7a34: ov sling --capability lead any-task; within
+		// ~30s ov dashboard previously showed state='zombie' while ov feed
+		// showed live tool calls. The healthy classification now lands
+		// between_turns; the test still verifies that recent activity does
+		// not trigger zombie classification.
 		const session = makeSession({
 			tmuxSession: "",
 			pid: null,
@@ -543,7 +556,7 @@ describe("spawn-per-turn workers (overstory-7a34)", () => {
 		});
 		const check = evaluateHealth(session, false, THRESHOLDS);
 
-		expect(check.state).toBe("working");
+		expect(check.state).toBe("between_turns");
 		expect(check.action).toBe("none");
 	});
 

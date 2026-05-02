@@ -157,24 +157,38 @@ function evaluateTimeBased(
 		};
 	}
 
-	// booting → transition to working once there's recent activity
+	// Spawn-per-turn workers (overstory-3087): healthy classification reports
+	// `between_turns` instead of `working`, including the booting → healthy
+	// transition. The turn-runner authoritatively writes `in_turn` /
+	// `between_turns` while a turn is alive; in_turn is preserved here when
+	// already set so a watchdog tick mid-turn does not overwrite it.
+	const isSpawnPerTurn = isSpawnPerTurnSession(session);
+
+	// booting → transition to the healthy state once there's recent activity.
 	if (session.state === "booting") {
 		return {
 			...base,
 			processAlive: true,
-			state: "working",
+			state: isSpawnPerTurn ? "between_turns" : "working",
 			action: "none",
 			reconciliationNote: null,
 		};
 	}
 
-	// Default: healthy active state. Preserve in_turn/between_turns when the
-	// turn-runner has already moved a spawn-per-turn worker out of the legacy
-	// `working` rank — the watchdog only knows the agent is alive, not whether
-	// it is mid-turn or idling, so it must not stomp on the more specific
-	// state set by the turn-runner (overstory-3087).
-	const healthyState =
-		session.state === "in_turn" || session.state === "between_turns" ? session.state : "working";
+	// Default: healthy active state. For spawn-per-turn workers report the
+	// existing in_turn/between_turns substate; for tmux/long-lived agents
+	// report `working`. The turn-runner is authoritative for in_turn ↔
+	// between_turns transitions, so the watchdog must not stomp the more
+	// specific state — same rank in STATE_ORDER ensures `transitionState`
+	// also leaves the row alone.
+	let healthyState: AgentState;
+	if (session.state === "in_turn" || session.state === "between_turns") {
+		healthyState = session.state;
+	} else if (isSpawnPerTurn) {
+		healthyState = "between_turns";
+	} else {
+		healthyState = "working";
+	}
 	return {
 		...base,
 		processAlive: true,

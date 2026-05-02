@@ -33,17 +33,18 @@ import type {
  *     alive (overstory-3087): turn-runner advances `between_turns → in_turn`
  *     when the next batch produces its first parser event and settles back
  *     `in_turn → between_turns` when the turn ends without a terminal mail.
- *     Both can advance forward to `stalled`/`zombie`/`completed` like
- *     `working` does, and either can come from a legacy `working` state so
- *     existing rows survive the schema bump.
+ *     Both can advance forward to `stalled`/`zombie`/`completed`. The two
+ *     paths are kept separate from the tmux/long-lived `working` rank — a
+ *     spawn-per-turn worker should not flow through `working` during normal
+ *     operation — so neither lists `working` as a predecessor.
  *
  * See overstory-a993 for the race symptoms this guard prevents.
  */
 const TRANSITION_ALLOWED_FROM: Record<AgentState, readonly AgentState[]> = {
 	booting: [],
 	working: ["booting", "working", "stalled"],
-	in_turn: ["booting", "working", "in_turn", "between_turns", "stalled"],
-	between_turns: ["booting", "working", "in_turn", "between_turns", "stalled"],
+	in_turn: ["booting", "in_turn", "between_turns", "stalled"],
+	between_turns: ["in_turn", "between_turns", "stalled"],
 	stalled: ["booting", "working", "in_turn", "between_turns", "stalled"],
 	completed: ["booting", "working", "in_turn", "between_turns", "stalled", "zombie", "completed"],
 	zombie: ["booting", "working", "in_turn", "between_turns", "stalled", "zombie"],
@@ -158,8 +159,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   branch_name TEXT NOT NULL,
   task_id TEXT NOT NULL,
   tmux_session TEXT NOT NULL,
-  state TEXT NOT NULL DEFAULT 'booting'
-    CHECK(state IN ('booting','working','in_turn','between_turns','completed','stalled','zombie')),
+  state TEXT NOT NULL DEFAULT 'booting',
   pid INTEGER,
   parent_agent TEXT,
   depth INTEGER NOT NULL DEFAULT 0,
@@ -268,70 +268,72 @@ function migrateAddClaudeSessionId(db: Database): void {
 }
 
 /**
- * Migrate an existing sessions table whose CHECK(state IN (...)) constraint
- * predates the in_turn / between_turns split (overstory-3087).
+ * Drop the inline CHECK(state IN (...)) constraint from the sessions table
+ * (overstory-3087).
  *
- * SQLite cannot alter a CHECK constraint in place — the column definition is
- * baked into the original CREATE TABLE SQL stored in sqlite_master. We detect
- * the old constraint by looking for the absence of `in_turn` in the recorded
- * DDL, then rebuild the table by copying rows into a new schema and renaming.
+ * The CHECK was defensive — the TypeScript `AgentState` union enforces values
+ * at the writer boundary. With the spawn-per-turn substate split (`in_turn` /
+ * `between_turns`) and likely future state extensions, keeping the constraint
+ * in sync with the union via inline-CHECK rebuilds becomes a recurring tax.
+ * Drop it and rely on the type system.
  *
- * The copy preserves every column verbatim (no in-flight state remap is
- * needed: existing `working` rows remain `working` and continue to satisfy
- * the new CHECK). Indexes are dropped by the table swap and re-created by
- * the caller via CREATE_INDEXES, which is idempotent.
+ * SQLite has no `ALTER TABLE DROP CONSTRAINT`, so we detect the old constraint
+ * via `sqlite_master.sql` (the recorded CREATE TABLE DDL), then rebuild the
+ * table inside a transaction: copy rows verbatim into a new constraint-free
+ * schema, drop the original, and rename. Indexes are dropped by the swap and
+ * re-created by the caller via CREATE_INDEXES, which is idempotent.
  *
- * Safe to call multiple times — short-circuits when the recorded DDL already
- * mentions `in_turn`. Wrapped in a single transaction so a failure mid-copy
- * leaves the original table intact.
+ * Safe to call multiple times — short-circuits when the recorded DDL no
+ * longer contains a CHECK on `state`. Must run BEFORE indexes are created
+ * (the swap drops them) and BEFORE the column-add migrations that read
+ * `PRAGMA table_info` on the legacy table (the new table inherits any added
+ * columns via the rebuild, so the column-add migrations become idempotent).
  */
-function migrateExpandStateCheck(db: Database): void {
+function migrateRelaxStateCheck(db: Database): void {
 	const row = db
 		.prepare<{ sql: string | null }, []>(
 			"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
 		)
 		.get();
 	if (!row || row.sql === null) return;
-	if (row.sql.includes("'in_turn'")) return;
+	// Detect the inline CHECK on the `state` column. Match conservatively on
+	// the literal "CHECK(state IN" — any whitespace variant SQLite stores
+	// will still contain this substring.
+	if (!row.sql.includes("CHECK(state IN")) return;
+
+	// Discover the columns that exist on the LIVE table so the rebuild copies
+	// every column the column-add migrations have layered on. Hard-coding the
+	// column list would silently drop newer columns when this migration runs
+	// against a DB that earlier migrations have already extended.
+	const colInfo = db.prepare("PRAGMA table_info(sessions)").all() as Array<{
+		name: string;
+		type: string;
+		notnull: number;
+		dflt_value: string | null;
+		pk: number;
+	}>;
+
+	// Render each column for the new CREATE TABLE. PRIMARY KEY and UNIQUE are
+	// preserved on `id` and `agent_name` respectively to match the original
+	// schema; everything else is straight type + nullability + default.
+	const colDefs = colInfo
+		.map((c) => {
+			const parts: string[] = [c.name, c.type || "TEXT"];
+			if (c.pk === 1) parts.push("PRIMARY KEY");
+			if (c.notnull === 1) parts.push("NOT NULL");
+			if (c.dflt_value !== null) parts.push(`DEFAULT ${c.dflt_value}`);
+			if (c.name === "agent_name") parts.push("UNIQUE");
+			return `\t\t\t\t${parts.join(" ")}`;
+		})
+		.join(",\n");
+	const colNames = colInfo.map((c) => c.name).join(", ");
 
 	db.exec("BEGIN");
 	try {
+		db.exec(`CREATE TABLE sessions__new_3087 (\n${colDefs}\n\t\t\t)`);
 		db.exec(`
-			CREATE TABLE sessions__new_3087 (
-				id TEXT PRIMARY KEY,
-				agent_name TEXT NOT NULL UNIQUE,
-				capability TEXT NOT NULL,
-				worktree_path TEXT NOT NULL,
-				branch_name TEXT NOT NULL,
-				task_id TEXT NOT NULL,
-				tmux_session TEXT NOT NULL,
-				state TEXT NOT NULL DEFAULT 'booting'
-					CHECK(state IN ('booting','working','in_turn','between_turns','completed','stalled','zombie')),
-				pid INTEGER,
-				parent_agent TEXT,
-				depth INTEGER NOT NULL DEFAULT 0,
-				run_id TEXT,
-				started_at TEXT NOT NULL,
-				last_activity TEXT NOT NULL,
-				escalation_level INTEGER NOT NULL DEFAULT 0,
-				stalled_since TEXT,
-				transcript_path TEXT,
-				prompt_version TEXT,
-				claude_session_id TEXT
-			)
-		`);
-		db.exec(`
-			INSERT INTO sessions__new_3087
-				(id, agent_name, capability, worktree_path, branch_name, task_id,
-				 tmux_session, state, pid, parent_agent, depth, run_id,
-				 started_at, last_activity, escalation_level, stalled_since,
-				 transcript_path, prompt_version, claude_session_id)
-			SELECT
-				id, agent_name, capability, worktree_path, branch_name, task_id,
-				tmux_session, state, pid, parent_agent, depth, run_id,
-				started_at, last_activity, escalation_level, stalled_since,
-				transcript_path, prompt_version, claude_session_id
-			FROM sessions
+			INSERT INTO sessions__new_3087 (${colNames})
+			SELECT ${colNames} FROM sessions
 		`);
 		db.exec("DROP TABLE sessions");
 		db.exec("ALTER TABLE sessions__new_3087 RENAME TO sessions");
@@ -373,11 +375,14 @@ export function createSessionStore(dbPath: string): SessionStore {
 	db.exec(CREATE_RUNS_TABLE);
 
 	// Migrate existing tables BEFORE creating indexes that reference new columns.
+	// `migrateRelaxStateCheck` runs FIRST so the column-add migrations that
+	// follow operate on the rebuilt table — they read PRAGMA table_info and
+	// ADD COLUMN, both of which work on the new constraint-free schema.
+	migrateRelaxStateCheck(db);
 	migrateBeadIdToTaskId(db);
 	migrateAddTranscriptPath(db);
 	migrateAddPromptVersion(db);
 	migrateAddClaudeSessionId(db);
-	migrateExpandStateCheck(db);
 	migrateAddCoordinatorName(db);
 
 	// Now safe to create indexes (all columns exist).
