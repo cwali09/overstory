@@ -1091,9 +1091,9 @@
 			"overstory-8e61",
 			"overstory-de3c"
 		],
-		"status": "active",
+		"status": "completed",
 		"createdAt": "2026-05-01T15:22:06.886Z",
-		"completedAt": null
+		"completedAt": "2026-05-02T16:15:07.436Z"
 	},
 	{
 		"id": "group-88067f3e",
@@ -1135,8 +1135,23 @@
 			"overstory-7291",
 			"overstory-c92c"
 		],
-		"status": "active",
+		"status": "completed",
 		"createdAt": "2026-05-01T22:08:18.592Z",
+		"completedAt": "2026-05-01T22:21:10.110Z"
+	},
+	{
+		"id": "group-10490a20",
+		"name": "sweep-2026-05-02",
+		"memberIssueIds": [
+			"overstory-9f4d",
+			"overstory-f76a",
+			"overstory-inxu",
+			"overstory-3087",
+			"overstory-2e18",
+			"overstory-e174"
+		],
+		"status": "active",
+		"createdAt": "2026-05-02T16:16:05.952Z",
 		"completedAt": null
 	}
 ]
