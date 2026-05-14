@@ -1,13 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, realpathSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { mkdir, mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ValidationError } from "../errors.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import { cleanupTempDir, commitFile, createTempGitRepo, runGitInDir } from "../test-helpers.ts";
 import type { AgentSession } from "../types.ts";
 import { createWorktree } from "../worktree/manager.ts";
-import { worktreeCommand } from "./worktree.ts";
+import { checkLiveChildren, worktreeCommand } from "./worktree.ts";
 
 /**
  * Tests for `overstory worktree` command.
@@ -974,5 +975,320 @@ describe("worktreeCommand", () => {
 			expect(parsed.cleaned).toContain(branch);
 			expect(parsed.seedsPreserved).toContain(branch);
 		});
+
+		describe("live-children guard", () => {
+			/**
+			 * Write sessions into a nested .overstory/sessions.db inside a worktree.
+			 * Simulates a lead worktree that has spawned builder children.
+			 */
+			function writeNestedSessions(worktreePath: string, sessions: AgentSession[]): void {
+				const nestedOverstory = join(worktreePath, ".overstory");
+				mkdirSync(nestedOverstory, { recursive: true });
+				const store = createSessionStore(join(nestedOverstory, "sessions.db"));
+				for (const s of sessions) {
+					store.upsert(s);
+				}
+				store.close();
+			}
+
+			test("clean skipped when live children present (no --force)", async () => {
+				const worktreesDir = join(tempDir, ".overstory", "worktrees");
+				await mkdir(worktreesDir, { recursive: true });
+
+				const { path: wtPath } = await createWorktree({
+					repoRoot: tempDir,
+					baseDir: worktreesDir,
+					agentName: "lead-with-children",
+					baseBranch: "main",
+					taskId: "task-lead",
+				});
+
+				// Parent session is completed
+				writeSessionsToStore([
+					makeSession({
+						id: "session-lead",
+						agentName: "lead-with-children",
+						capability: "lead",
+						worktreePath: wtPath,
+						branchName: "overstory/lead-with-children/task-lead",
+						taskId: "task-lead",
+						state: "completed",
+					}),
+				]);
+
+				// Nested session with process.pid (guaranteed alive)
+				writeNestedSessions(wtPath, [
+					{
+						id: "nested-builder",
+						agentName: "nested-builder",
+						capability: "builder",
+						worktreePath: join(wtPath, ".overstory", "worktrees", "nested-builder"),
+						branchName: "overstory/nested-builder/task-child",
+						taskId: "task-child",
+						tmuxSession: "overstory-nested-builder-fake",
+						state: "working",
+						pid: process.pid, // current process — guaranteed alive
+						parentAgent: "lead-with-children",
+						depth: 2,
+						runId: null,
+						startedAt: new Date().toISOString(),
+						lastActivity: new Date().toISOString(),
+						escalationLevel: 0,
+						stalledSince: null,
+						transcriptPath: null,
+					},
+				]);
+
+				await worktreeCommand(["clean", "--completed", "--json"]);
+				const out = output();
+
+				const parsed = JSON.parse(out.trim()) as {
+					cleaned: string[];
+					blockedByChildren: string[];
+				};
+
+				expect(parsed.cleaned).toEqual([]);
+				expect(parsed.blockedByChildren).toContain("overstory/lead-with-children/task-lead");
+				// Worktree still exists
+				expect(existsSync(wtPath)).toBe(true);
+			});
+
+			test("clean proceeds when nested sessions are dead (pid unreachable)", async () => {
+				const worktreesDir = join(tempDir, ".overstory", "worktrees");
+				await mkdir(worktreesDir, { recursive: true });
+
+				const { path: wtPath } = await createWorktree({
+					repoRoot: tempDir,
+					baseDir: worktreesDir,
+					agentName: "lead-dead-children",
+					baseBranch: "main",
+					taskId: "task-dead",
+				});
+
+				writeSessionsToStore([
+					makeSession({
+						id: "session-lead-dead",
+						agentName: "lead-dead-children",
+						capability: "lead",
+						worktreePath: wtPath,
+						branchName: "overstory/lead-dead-children/task-dead",
+						taskId: "task-dead",
+						state: "completed",
+					}),
+				]);
+
+				// Nested session with a dead pid (extremely high, will not exist)
+				writeNestedSessions(wtPath, [
+					{
+						id: "nested-dead",
+						agentName: "nested-dead",
+						capability: "builder",
+						worktreePath: join(wtPath, ".overstory", "worktrees", "nested-dead"),
+						branchName: "overstory/nested-dead/task-dead-child",
+						taskId: "task-dead-child",
+						tmuxSession: "overstory-nested-dead-fake",
+						state: "working",
+						pid: 999999999, // dead pid
+						parentAgent: "lead-dead-children",
+						depth: 2,
+						runId: null,
+						startedAt: new Date().toISOString(),
+						lastActivity: new Date().toISOString(),
+						escalationLevel: 0,
+						stalledSince: null,
+						transcriptPath: null,
+					},
+				]);
+
+				await worktreeCommand(["clean", "--completed", "--json"]);
+				const out = output();
+
+				const parsed = JSON.parse(out.trim()) as {
+					cleaned: string[];
+					blockedByChildren: string[];
+				};
+
+				expect(parsed.cleaned).toContain("overstory/lead-dead-children/task-dead");
+				expect(parsed.blockedByChildren).toEqual([]);
+				expect(existsSync(wtPath)).toBe(false);
+			});
+
+			test("--force removes worktree even with live children", async () => {
+				const worktreesDir = join(tempDir, ".overstory", "worktrees");
+				await mkdir(worktreesDir, { recursive: true });
+
+				const { path: wtPath } = await createWorktree({
+					repoRoot: tempDir,
+					baseDir: worktreesDir,
+					agentName: "lead-force",
+					baseBranch: "main",
+					taskId: "task-force-children",
+				});
+
+				writeSessionsToStore([
+					makeSession({
+						id: "session-lead-force",
+						agentName: "lead-force",
+						capability: "lead",
+						worktreePath: wtPath,
+						branchName: "overstory/lead-force/task-force-children",
+						taskId: "task-force-children",
+						state: "completed",
+					}),
+				]);
+
+				// Use a dead pid — avoids actually killing any live process,
+				// but still exercises the --force code path.
+				writeNestedSessions(wtPath, [
+					{
+						id: "nested-force",
+						agentName: "nested-force",
+						capability: "builder",
+						worktreePath: join(wtPath, ".overstory", "worktrees", "nested-force"),
+						branchName: "overstory/nested-force/task-force-child",
+						taskId: "task-force-child",
+						tmuxSession: "overstory-nested-force-fake",
+						state: "working",
+						pid: 999999999, // dead pid, safe to kill
+						parentAgent: "lead-force",
+						depth: 2,
+						runId: null,
+						startedAt: new Date().toISOString(),
+						lastActivity: new Date().toISOString(),
+						escalationLevel: 0,
+						stalledSince: null,
+						transcriptPath: null,
+					},
+				]);
+
+				await worktreeCommand(["clean", "--force", "--json"]);
+				const out = output();
+
+				const parsed = JSON.parse(out.trim()) as {
+					cleaned: string[];
+					blockedByChildren: string[];
+				};
+
+				// Should be cleaned (not blocked) even though nested sessions existed
+				expect(parsed.cleaned).toContain("overstory/lead-force/task-force-children");
+				expect(existsSync(wtPath)).toBe(false);
+			});
+
+			test("no nested .overstory — treated as no live children, clean proceeds", async () => {
+				const worktreesDir = join(tempDir, ".overstory", "worktrees");
+				await mkdir(worktreesDir, { recursive: true });
+
+				const { path: wtPath } = await createWorktree({
+					repoRoot: tempDir,
+					baseDir: worktreesDir,
+					agentName: "lead-no-nested",
+					baseBranch: "main",
+					taskId: "task-no-nested",
+				});
+
+				writeSessionsToStore([
+					makeSession({
+						id: "session-lead-no-nested",
+						agentName: "lead-no-nested",
+						capability: "lead",
+						worktreePath: wtPath,
+						branchName: "overstory/lead-no-nested/task-no-nested",
+						taskId: "task-no-nested",
+						state: "completed",
+					}),
+				]);
+
+				// No nested .overstory/ directory written
+
+				await worktreeCommand(["clean", "--completed", "--json"]);
+				const out = output();
+
+				const parsed = JSON.parse(out.trim()) as {
+					cleaned: string[];
+					blockedByChildren: string[];
+				};
+
+				expect(parsed.cleaned).toContain("overstory/lead-no-nested/task-no-nested");
+				expect(parsed.blockedByChildren).toEqual([]);
+				expect(existsSync(wtPath)).toBe(false);
+			});
+		});
+	});
+});
+
+describe("checkLiveChildren", () => {
+	let tempDir: string;
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "overstory-checkchildren-"));
+	});
+
+	afterEach(async () => {
+		await cleanupTempDir(tempDir);
+	});
+
+	test("returns empty array when no nested .overstory/sessions.db", async () => {
+		const result = await checkLiveChildren(tempDir);
+		expect(result).toEqual([]);
+	});
+
+	test("returns empty array when all sessions are completed", async () => {
+		const nestedOverstory = join(tempDir, ".overstory");
+		mkdirSync(nestedOverstory, { recursive: true });
+		const store = createSessionStore(join(nestedOverstory, "sessions.db"));
+		store.upsert({
+			id: "s1",
+			agentName: "done-agent",
+			capability: "builder",
+			worktreePath: "/fake/wt",
+			branchName: "overstory/done/task",
+			taskId: "task",
+			tmuxSession: "",
+			state: "completed",
+			pid: process.pid,
+			parentAgent: null,
+			depth: 2,
+			runId: null,
+			startedAt: new Date().toISOString(),
+			lastActivity: new Date().toISOString(),
+			escalationLevel: 0,
+			stalledSince: null,
+			transcriptPath: null,
+		});
+		store.close();
+
+		const result = await checkLiveChildren(tempDir);
+		expect(result).toEqual([]);
+	});
+
+	test("returns live children when working session with alive pid exists", async () => {
+		const nestedOverstory = join(tempDir, ".overstory");
+		mkdirSync(nestedOverstory, { recursive: true });
+		const store = createSessionStore(join(nestedOverstory, "sessions.db"));
+		store.upsert({
+			id: "s1",
+			agentName: "live-agent",
+			capability: "builder",
+			worktreePath: "/fake/wt",
+			branchName: "overstory/live/task",
+			taskId: "task",
+			tmuxSession: "",
+			state: "working",
+			pid: process.pid, // current process — alive
+			parentAgent: null,
+			depth: 2,
+			runId: null,
+			startedAt: new Date().toISOString(),
+			lastActivity: new Date().toISOString(),
+			escalationLevel: 0,
+			stalledSince: null,
+			transcriptPath: null,
+		});
+		store.close();
+
+		const result = await checkLiveChildren(tempDir);
+		expect(result).toHaveLength(1);
+		expect(result[0]?.agentName).toBe("live-agent");
+		expect(result[0]?.pid).toBe(process.pid);
 	});
 });

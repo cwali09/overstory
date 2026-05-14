@@ -1177,6 +1177,84 @@ describe("resolveProjectRoot", () => {
 	});
 });
 
+describe("resolveProjectRoot — env var and walk-up", () => {
+	let tempDir: string;
+	let savedEnv: string | undefined;
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "overstory-envtest-"));
+		savedEnv = process.env.OVERSTORY_PROJECT_ROOT;
+		delete process.env.OVERSTORY_PROJECT_ROOT;
+		clearProjectRootOverride();
+	});
+
+	afterEach(async () => {
+		if (savedEnv !== undefined) {
+			process.env.OVERSTORY_PROJECT_ROOT = savedEnv;
+		} else {
+			delete process.env.OVERSTORY_PROJECT_ROOT;
+		}
+		clearProjectRootOverride();
+		await cleanupTempDir(tempDir);
+	});
+
+	test("OVERSTORY_PROJECT_ROOT env var is returned immediately", async () => {
+		await mkdir(join(tempDir, ".overstory"), { recursive: true });
+		await Bun.write(
+			join(tempDir, ".overstory", "config.yaml"),
+			"project:\n  canonicalBranch: main\n",
+		);
+		process.env.OVERSTORY_PROJECT_ROOT = tempDir;
+		const result = await resolveProjectRoot("/some/unrelated/path");
+		expect(result).toBe(tempDir);
+	});
+
+	test("env var beats walk-up worktree resolution", async () => {
+		// Set up a parent root with config.yaml
+		const parentRoot = tempDir;
+		await mkdir(join(parentRoot, ".overstory", "worktrees", "some-agent"), { recursive: true });
+		await Bun.write(
+			join(parentRoot, ".overstory", "config.yaml"),
+			"project:\n  canonicalBranch: main\n",
+		);
+		const worktreePath = join(parentRoot, ".overstory", "worktrees", "some-agent");
+		// Even though walk-up would resolve parentRoot, env var pointing elsewhere wins
+		const envTarget = await mkdtemp(join(tmpdir(), "overstory-envtarget-"));
+		try {
+			process.env.OVERSTORY_PROJECT_ROOT = envTarget;
+			const result = await resolveProjectRoot(worktreePath);
+			expect(result).toBe(envTarget);
+		} finally {
+			await cleanupTempDir(envTarget);
+		}
+	});
+
+	test("walk-up resolves submodule path without git", async () => {
+		// Simulate a submodule worktree: {tempDir}/.overstory/worktrees/my-agent/sub
+		// config.yaml exists at {tempDir}/.overstory/config.yaml
+		const worktreeBase = join(tempDir, ".overstory", "worktrees", "my-agent");
+		const subDir = join(worktreeBase, "sub");
+		await mkdir(subDir, { recursive: true });
+		await mkdir(join(tempDir, ".overstory"), { recursive: true });
+		await Bun.write(
+			join(tempDir, ".overstory", "config.yaml"),
+			"project:\n  canonicalBranch: main\n",
+		);
+		const result = await resolveProjectRoot(subDir);
+		expect(result).toBe(tempDir);
+	});
+
+	test("walk-up is skipped when parent has no config.yaml", async () => {
+		// Same path structure but NO config.yaml at parentRoot
+		const worktreeBase = join(tempDir, ".overstory", "worktrees", "my-agent");
+		await mkdir(worktreeBase, { recursive: true });
+		// No config.yaml written — walk-up guard should prevent false resolution
+		const result = await resolveProjectRoot(worktreeBase);
+		// Falls through to startDir fallback
+		expect(result).toBe(worktreeBase);
+	});
+});
+
 describe("projectRootOverride", () => {
 	let tempDir: string;
 

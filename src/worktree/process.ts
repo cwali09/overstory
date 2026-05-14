@@ -1,15 +1,20 @@
 /**
  * Headless subprocess management for non-tmux agent runtimes.
  *
- * Used by `ov sling` when runtime.headless === true to bypass tmux entirely.
- * Provides spawnHeadlessAgent() for direct Bun.spawn() invocation of
- * headless agent processes (e.g., Sapling running with --json).
+ * Used by long-lived headless runtimes that bypass tmux (e.g., Sapling running
+ * with --json). Provides spawnHeadlessAgent() for direct Bun.spawn() invocation.
+ *
+ * Headless Claude Code does NOT use this path — under spawn-per-turn (Phase 3),
+ * Claude agents have no persistent process; each turn spawns a fresh claude
+ * inside `runTurn` (src/agents/turn-runner.ts). This module remains for
+ * runtimes that genuinely need a long-lived RPC channel.
  *
  * Note: isProcessAlive() and killProcessTree() for headless process lifecycle
  * management already exist in src/worktree/tmux.ts — not duplicated here.
  */
 
 import { AgentError } from "../errors.ts";
+import { registerHeadlessConnection } from "../runtimes/connections.ts";
 
 /**
  * Handle to a spawned headless agent subprocess.
@@ -57,6 +62,15 @@ export interface SpawnHeadlessOptions {
 	 * When set, redirect subprocess stderr to this file path instead of a pipe.
 	 */
 	stderrFile?: string;
+	/**
+	 * When set, registers the spawned process as a `RuntimeConnection` keyed by
+	 * this agent name (sibling of Sapling's RPC connect() flow). Lets `ov nudge`,
+	 * the watchdog's liveness/abort path, etc. find the live process via
+	 * `getConnection(agentName)`.
+	 *
+	 * Same namespace as AgentSession.agentName.
+	 */
+	agentName?: string;
 }
 
 /**
@@ -103,9 +117,15 @@ export async function spawnHeadlessAgent(
 		stdin: "pipe",
 	});
 
-	return {
+	const result: HeadlessProcess = {
 		pid: proc.pid,
-		stdin: proc.stdin,
+		stdin: proc.stdin as HeadlessProcess["stdin"],
 		stdout: opts.stdoutFile ? null : (proc.stdout as ReadableStream<Uint8Array>),
 	};
+
+	if (opts.agentName) {
+		registerHeadlessConnection(opts.agentName, result);
+	}
+
+	return result;
 }

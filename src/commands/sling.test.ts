@@ -4,7 +4,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveModel, resolveProviderEnv } from "../agents/manifest.ts";
-import { HierarchyError } from "../errors.ts";
+import { HierarchyError, ValidationError } from "../errors.ts";
 import { ClaudeRuntime } from "../runtimes/claude.ts";
 import { getRuntime } from "../runtimes/registry.ts";
 import { cleanupTempDir, createTempGitRepo } from "../test-helpers.ts";
@@ -25,7 +25,11 @@ import {
 	getSharedWritableDirs,
 	inferDomainsFromFiles,
 	isRunningAsRoot,
+	isTaskWorkable,
 	parentHasScouts,
+	parseSiblings,
+	resolveParentAgent,
+	resolveUseHeadless,
 	shouldShowScoutWarning,
 	validateHierarchy,
 } from "./sling.ts";
@@ -766,6 +770,67 @@ function makeLeadSession(
 	return { agentName, taskId, capability };
 }
 
+describe("isTaskWorkable", () => {
+	test("accepts open and in_progress without recover", () => {
+		expect(isTaskWorkable("open", false)).toBe(true);
+		expect(isTaskWorkable("in_progress", false)).toBe(true);
+	});
+
+	test("rejects closed and other terminal statuses without recover", () => {
+		expect(isTaskWorkable("closed", false)).toBe(false);
+		expect(isTaskWorkable("cancelled", false)).toBe(false);
+		expect(isTaskWorkable("done", false)).toBe(false);
+	});
+
+	test("accepts any status when recover is true", () => {
+		expect(isTaskWorkable("closed", true)).toBe(true);
+		expect(isTaskWorkable("cancelled", true)).toBe(true);
+		expect(isTaskWorkable("open", true)).toBe(true);
+	});
+});
+
+// --- resolveParentAgent (overstory-de3c) ---
+//
+// Witnessed bug: a coordinator/lead recovered a zombie spawn-per-turn worker
+// via `ov sling --recover --name <existing>` without threading `--parent`.
+// The pre-fix `parentAgent = opts.parent ?? null` overwrote the prior
+// `parent_agent` row to null on upsert, so the runner could not emit
+// `worker_died` on a resumed-turn parser stall — the lead waited forever.
+// The fix: when --parent is not explicitly passed, fall back to the prior
+// session row's parentAgent. Explicit caller intent (any string, including
+// empty) always wins.
+describe("resolveParentAgent", () => {
+	test("case A: explicit --parent wins over prior session linkage", () => {
+		const existing = { parentAgent: "old-lead" };
+		expect(resolveParentAgent("new-lead", existing)).toBe("new-lead");
+	});
+
+	test("case B: --parent omitted preserves prior session's parentAgent on re-spawn", () => {
+		// THE REGRESSION CHECK. Pre-fix this returned null, severing the link
+		// the runner needs to emit worker_died (overstory-de3c).
+		const existing = { parentAgent: "lead-r" };
+		expect(resolveParentAgent(undefined, existing)).toBe("lead-r");
+	});
+
+	test("--parent omitted with no prior session yields null (fresh agent)", () => {
+		expect(resolveParentAgent(undefined, null)).toBeNull();
+	});
+
+	test("--parent omitted with prior session whose parent is null yields null", () => {
+		// A coordinator-spawned root agent has parentAgent=null. Re-spawn must
+		// not synthesize a parent.
+		const existing = { parentAgent: null };
+		expect(resolveParentAgent(undefined, existing)).toBeNull();
+	});
+
+	test("explicit --parent='' (empty string) is honored — caller intent wins", () => {
+		// Empty string is `defined` but `null`-y; we honor it as caller intent
+		// rather than silently falling back to the prior linkage.
+		const existing = { parentAgent: "lead-r" };
+		expect(resolveParentAgent("", existing)).toBe("");
+	});
+});
+
 describe("checkDuplicateLead", () => {
 	test("returns lead agent name when an active lead exists for the task", () => {
 		const sessions = [
@@ -1038,6 +1103,18 @@ describe("sling provider env injection building blocks", () => {
 		expect(combined.OVERSTORY_TASK_ID).toBe("overstory-1234");
 	});
 
+	test("env dict includes OVERSTORY_PROJECT_ROOT", () => {
+		const env = { MODEL_KEY: "value" };
+		const combined = {
+			...env,
+			OVERSTORY_AGENT_NAME: "test-builder",
+			OVERSTORY_WORKTREE_PATH: "/path/to/wt",
+			OVERSTORY_TASK_ID: "task-1",
+			OVERSTORY_PROJECT_ROOT: "/path/to/project",
+		};
+		expect(combined.OVERSTORY_PROJECT_ROOT).toBe("/path/to/project");
+	});
+
 	test("resolveModel returns no env for native anthropic provider", () => {
 		const config = makeConfig({ builder: "sonnet" }, { anthropic: { type: "native" } });
 		const manifest = makeManifest();
@@ -1134,6 +1211,7 @@ function makeAutoDispatchOpts(overrides?: Partial<AutoDispatchOptions>): AutoDis
 		capability: "builder",
 		specPath: "/path/to/spec.md",
 		parentAgent: "lead-alpha",
+		slingerName: null,
 		instructionPath: ".claude/CLAUDE.md",
 		...overrides,
 	};
@@ -1147,6 +1225,7 @@ describe("buildAutoDispatch", () => {
 			capability: "builder",
 			specPath: "/path/to/spec.md",
 			parentAgent: "lead-alpha",
+			slingerName: null,
 			instructionPath: ".claude/CLAUDE.md",
 		});
 		expect(dispatch.from).toBe("lead-alpha");
@@ -1162,6 +1241,7 @@ describe("buildAutoDispatch", () => {
 			capability: "lead",
 			specPath: null,
 			parentAgent: null,
+			slingerName: null,
 			instructionPath: ".claude/CLAUDE.md",
 		});
 		expect(dispatch.from).toBe("orchestrator");
@@ -1175,6 +1255,7 @@ describe("buildAutoDispatch", () => {
 			capability: "scout",
 			specPath: null,
 			parentAgent: "lead-alpha",
+			slingerName: null,
 			instructionPath: ".claude/CLAUDE.md",
 		});
 		expect(dispatch.body).toContain("scout");
@@ -1187,9 +1268,31 @@ describe("buildAutoDispatch", () => {
 			capability: "builder",
 			specPath: "/abs/path/to/spec.md",
 			parentAgent: "lead-alpha",
+			slingerName: null,
 			instructionPath: ".claude/CLAUDE.md",
 		});
 		expect(dispatch.body).toContain("/abs/path/to/spec.md");
+	});
+
+	test("slinger takes precedence over parent agent for from field", () => {
+		const dispatch = buildAutoDispatch(
+			makeAutoDispatchOpts({ slingerName: "coordinator", parentAgent: "lead-alpha" }),
+		);
+		expect(dispatch.from).toBe("coordinator");
+	});
+
+	test("slinger fills in when parent agent is null", () => {
+		const dispatch = buildAutoDispatch(
+			makeAutoDispatchOpts({ slingerName: "coordinator", parentAgent: null }),
+		);
+		expect(dispatch.from).toBe("coordinator");
+	});
+
+	test("falls back to orchestrator when both slinger and parent are null", () => {
+		const dispatch = buildAutoDispatch(
+			makeAutoDispatchOpts({ slingerName: null, parentAgent: null }),
+		);
+		expect(dispatch.from).toBe("orchestrator");
 	});
 
 	test("subject contains task ID", () => {
@@ -1391,5 +1494,90 @@ describe("getCurrentBranch", () => {
 		} finally {
 			await cleanupTempDir(tmpDir);
 		}
+	});
+});
+
+describe("resolveUseHeadless", () => {
+	const claudeLike = { id: "claude", buildDirectSpawn: () => [] as string[] };
+	const claudeNoSpawn = { id: "claude" };
+	const saplingLike = {
+		id: "sapling",
+		headless: true as const,
+		buildDirectSpawn: () => [] as string[],
+	};
+	const codexLike = { id: "codex" };
+	const baseConfig = {} as OverstoryConfig;
+	const headlessByDefaultConfig = {
+		runtime: { default: "claude", claudeHeadlessByDefault: true },
+	} as unknown as OverstoryConfig;
+
+	test("statically headless runtime returns true regardless of flag", () => {
+		expect(resolveUseHeadless(saplingLike, undefined, baseConfig)).toBe(true);
+	});
+
+	test("claude + no flag + base config returns false (default tmux)", () => {
+		expect(resolveUseHeadless(claudeLike, undefined, baseConfig)).toBe(false);
+	});
+
+	test("claude + no flag + claudeHeadlessByDefault:true returns true", () => {
+		expect(resolveUseHeadless(claudeLike, undefined, headlessByDefaultConfig)).toBe(true);
+	});
+
+	test("claude + flag:true + base config returns true", () => {
+		expect(resolveUseHeadless(claudeLike, true, baseConfig)).toBe(true);
+	});
+
+	test("claude + flag:false + claudeHeadlessByDefault:true returns false (flag wins)", () => {
+		expect(resolveUseHeadless(claudeLike, false, headlessByDefaultConfig)).toBe(false);
+	});
+
+	test("claude without buildDirectSpawn + flag:true throws ValidationError", () => {
+		expect(() => resolveUseHeadless(claudeNoSpawn, true, baseConfig)).toThrow(ValidationError);
+	});
+
+	test("codex + claudeHeadlessByDefault:true returns false (config knob is Claude-only)", () => {
+		expect(resolveUseHeadless(codexLike, undefined, headlessByDefaultConfig)).toBe(false);
+	});
+
+	test("codex + flag:true throws ValidationError (no buildDirectSpawn)", () => {
+		expect(() => resolveUseHeadless(codexLike, true, baseConfig)).toThrow(ValidationError);
+	});
+
+	test("sapling + flag:false returns true (statically headless wins over flag)", () => {
+		expect(resolveUseHeadless(saplingLike, false, baseConfig)).toBe(true);
+	});
+});
+
+describe("parseSiblings (overstory-f76a)", () => {
+	test("undefined input returns empty array", () => {
+		expect(parseSiblings(undefined)).toEqual([]);
+	});
+
+	test("empty string returns empty array", () => {
+		expect(parseSiblings("")).toEqual([]);
+	});
+
+	test("single name returns one-element array", () => {
+		expect(parseSiblings("sibling-a")).toEqual(["sibling-a"]);
+	});
+
+	test("comma-separated names are split and trimmed", () => {
+		expect(parseSiblings("sibling-a, sibling-b ,sibling-c")).toEqual([
+			"sibling-a",
+			"sibling-b",
+			"sibling-c",
+		]);
+	});
+
+	test("blank entries between commas are dropped", () => {
+		expect(parseSiblings("sibling-a,,sibling-b, ,sibling-c")).toEqual([
+			"sibling-a",
+			"sibling-b",
+			"sibling-c",
+		]);
+	});
+
+	test("whitespace-only input returns empty array", () => {
+		expect(parseSiblings("   ")).toEqual([]);
 	});
 });

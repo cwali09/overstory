@@ -7,7 +7,7 @@
  */
 
 import { MailError } from "../errors.ts";
-import type { MailMessage, MailPayloadMap, MailProtocolType } from "../types.ts";
+import type { MailMessage, MailMessageType, MailPayloadMap, MailProtocolType } from "../types.ts";
 import type { MailStore } from "./store.ts";
 
 export interface MailClient {
@@ -42,13 +42,21 @@ export interface MailClient {
 	checkInject(agentName: string): string;
 
 	/** List messages with optional filters. */
-	list(filters?: { from?: string; to?: string; unread?: boolean }): MailMessage[];
+	list(filters?: {
+		from?: string;
+		to?: string;
+		unread?: boolean;
+		type?: MailMessageType;
+	}): MailMessage[];
 
 	/** Mark a message as read by ID. Returns whether the message was already read. */
 	markRead(id: string): { alreadyRead: boolean };
 
 	/** Reply to a message. Returns the new message ID. */
 	reply(messageId: string, body: string, from: string): string;
+
+	/** Delete a single message by id. Returns true if a row was deleted. */
+	deleteById(id: string): boolean;
 
 	/** Close the underlying store. */
 	close(): void;
@@ -75,6 +83,7 @@ export function parsePayload<T extends MailProtocolType>(
 /** Protocol types that represent structured coordination messages. */
 const PROTOCOL_TYPES = new Set<string>([
 	"worker_done",
+	"worker_died",
 	"merge_ready",
 	"merged",
 	"merge_failed",
@@ -185,6 +194,10 @@ export function createMailClient(store: MailStore): MailClient {
 			}
 			store.markRead(id);
 			return { alreadyRead: false };
+		},
+
+		deleteById(id): boolean {
+			return store.deleteById(id);
 		},
 
 		reply(messageId, body, from): string {

@@ -6,6 +6,7 @@
  * Logs are never auto-deleted.
  */
 
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Command } from "commander";
 import { loadConfig } from "../config.ts";
@@ -14,6 +15,7 @@ import { jsonOutput } from "../json.ts";
 import { printHint, printSuccess, printWarning } from "../logging/color.ts";
 import { createMailStore } from "../mail/store.ts";
 import { openSessionStore } from "../sessions/compat.ts";
+import { createSessionStore } from "../sessions/store.ts";
 import type { AgentSession } from "../types.ts";
 import {
 	isBranchMerged,
@@ -22,6 +24,51 @@ import {
 	removeWorktree,
 } from "../worktree/manager.ts";
 import { isSessionAlive, killSession } from "../worktree/tmux.ts";
+
+/**
+ * Check for live child sessions nested inside a worktree's own .overstory/sessions.db.
+ *
+ * Returns the live children (agentName + pid). Empty array if no nested DB or no live children.
+ */
+export async function checkLiveChildren(
+	worktreePath: string,
+): Promise<{ agentName: string; pid: number }[]> {
+	const nestedDb = join(worktreePath, ".overstory", "sessions.db");
+	if (!existsSync(nestedDb)) {
+		return [];
+	}
+
+	const store = createSessionStore(nestedDb);
+	let sessions: AgentSession[];
+	try {
+		sessions = store.getAll();
+	} finally {
+		store.close();
+	}
+
+	const deadStates = new Set(["completed", "zombie"]);
+	const liveChildren: { agentName: string; pid: number }[] = [];
+
+	for (const session of sessions) {
+		if (deadStates.has(session.state)) continue;
+		if (session.pid === null) continue;
+
+		// process.kill(pid, 0) throws if the process is dead (ESRCH)
+		let alive = false;
+		try {
+			process.kill(session.pid, 0);
+			alive = true;
+		} catch {
+			// ESRCH — process is dead
+		}
+
+		if (alive) {
+			liveChildren.push({ agentName: session.agentName, pid: session.pid });
+		}
+	}
+
+	return liveChildren;
+}
 
 /**
  * Handle `ov worktree list`.
@@ -100,6 +147,7 @@ async function handleClean(
 	const failed: string[] = [];
 	const skipped: string[] = [];
 	const seedsPreserved: string[] = [];
+	const blockedByChildren: string[] = [];
 
 	try {
 		for (const wt of overstoryWts) {
@@ -127,6 +175,33 @@ async function handleClean(
 					skipped.push(wt.branch);
 					continue;
 				}
+			}
+
+			// Live-children guard: refuse to remove a worktree that has active nested agents.
+			// Nested sessions live in {wt.path}/.overstory/sessions.db (lead worktrees).
+			const liveChildren = await checkLiveChildren(wt.path);
+			if (liveChildren.length > 0) {
+				if (!force) {
+					blockedByChildren.push(wt.branch);
+					continue;
+				}
+				// --force: SIGTERM each live child, wait briefly, then proceed.
+				if (!json) {
+					printWarning(
+						`Force-terminating ${liveChildren.length} live child${liveChildren.length === 1 ? "" : "ren"} in ${wt.branch}`,
+					);
+					for (const child of liveChildren) {
+						process.stdout.write(`  ${child.agentName} (pid ${child.pid})\n`);
+					}
+				}
+				for (const child of liveChildren) {
+					try {
+						process.kill(child.pid, "SIGTERM");
+					} catch {
+						// Best effort
+					}
+				}
+				await Bun.sleep(500);
 			}
 
 			// If --all, clean everything
@@ -243,6 +318,7 @@ async function handleClean(
 				cleaned,
 				failed,
 				skipped,
+				blockedByChildren,
 				pruned: pruneCount,
 				mailPurged,
 				seedsPreserved,
@@ -252,6 +328,7 @@ async function handleClean(
 			pruneCount === 0 &&
 			failed.length === 0 &&
 			skipped.length === 0 &&
+			blockedByChildren.length === 0 &&
 			seedsPreserved.length === 0
 		) {
 			printHint("No worktrees to clean");
@@ -285,6 +362,15 @@ async function handleClean(
 					process.stdout.write(`  ${branch}\n`);
 				}
 				printHint("Use --force to delete unmerged branches");
+			}
+			if (blockedByChildren.length > 0) {
+				printWarning(
+					`Skipped ${blockedByChildren.length} worktree${blockedByChildren.length === 1 ? "" : "s"} with live child agents`,
+				);
+				for (const branch of blockedByChildren) {
+					process.stdout.write(`  ${branch}\n`);
+				}
+				printHint("Use --force to cascade-terminate live children");
 			}
 		}
 	} finally {

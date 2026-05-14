@@ -3,6 +3,26 @@ import { dirname, join, resolve } from "node:path";
 import { DEFAULT_QUALITY_GATES } from "../config.ts";
 import { AgentError } from "../errors.ts";
 import type { OverlayConfig, QualityGate } from "../types.ts";
+import { terminalMailTypesFor } from "./capabilities.ts";
+
+/**
+ * Capability-specific completion-mail guidance for the dynamic overlay.
+ *
+ * Returns the terminal mail-type name and a one-line example fragment so the
+ * overlay can render: "ov mail send ... --type <terminalType> ...".
+ *
+ * Crucial: this MUST stay in sync with `terminalMailTypesFor()` — overstory-1a4c
+ * found that overlay text saying `--type result` while the runner watched only
+ * for `worker_done` left worker sessions stuck in `working`.
+ */
+function completionMailTypeFor(capability: string): string {
+	const types = terminalMailTypesFor(capability);
+	// `terminalMailTypesFor` returns the canonical type first
+	// (worker_done for workers, merged for mergers). Use that for prose;
+	// agents may also use the secondary types (`merge_failed`, etc.) where
+	// applicable per their base prompt.
+	return types[0] ?? "worker_done";
+}
 
 /**
  * Resolve the path to the overlay template file.
@@ -11,6 +31,38 @@ import type { OverlayConfig, QualityGate } from "../types.ts";
 function getTemplatePath(): string {
 	// src/agents/overlay.ts -> repo root is ../../
 	return join(dirname(import.meta.dir), "..", "templates", "overlay.md.tmpl");
+}
+
+/**
+ * Format the parallel-siblings section (overstory-f76a). Returns empty string
+ * when no siblings are configured. When set, renders a markdown section that
+ * names each sibling and instructs the agent to rebase onto `main` BEFORE
+ * sending `merge_ready`. Reason: parallel leads branch off pre-merge `main`;
+ * whichever merges second carries a stale base and risks reverting sibling
+ * work (mx-c0c122 stale-base-revert).
+ *
+ * Exported for unit-testing.
+ */
+export function formatSiblings(config: OverlayConfig): string {
+	const siblings = config.siblings;
+	if (!siblings || siblings.length === 0) return "";
+
+	const bullets = siblings.map((name) => `- ${name}`).join("\n");
+	return [
+		"## Parallel Siblings",
+		"",
+		"The coordinator has dispatched the following sibling agents in parallel that may share file scope with you:",
+		"",
+		bullets,
+		"",
+		"**CRITICAL**: rebase your branch onto the latest `main` BEFORE sending `merge_ready`, then re-run quality gates AFTER the rebase. Sibling work may have landed on `main` while you were working — sending `merge_ready` from a stale base risks reverting their changes (mx-c0c122 stale-base-revert).",
+		"",
+		"```bash",
+		"git fetch origin main:main",
+		"git rebase main",
+		"# re-run quality gates here, then signal merge_ready",
+		"```",
+	].join("\n");
 }
 
 /**
@@ -105,14 +157,14 @@ function formatDispatchOverrides(config: OverlayConfig): string {
 		if (config.maxAgentsOverride === 1) {
 			sections.push(
 				"- **MAX AGENTS**: Your per-lead agent ceiling has been set to **1**. " +
-					"Operate as a combined **lead/worker**: implement the task yourself unless a single specialist is absolutely necessary. " +
-					"Do not spend your only slot on a scout or reviewer unless that specialist work is the real bottleneck.",
+					"Spend that slot on a single builder for the whole task — skip scouts and reviewers and self-verify the builder's diff yourself. " +
+					"Leads cannot implement directly (Write/Edit/`git add`/`git commit` are blocked by the harness), so the one slot must be a builder.",
 			);
 		} else if (config.maxAgentsOverride === 2) {
 			sections.push(
 				"- **MAX AGENTS**: Your per-lead agent ceiling has been set to **2**. " +
-					"Operate in compressed mode: use at most one helper at a time when possible, then complete the remaining implementation and verification yourself. " +
-					"Prefer self-verification over spawning a separate reviewer.",
+					"Operate in compressed mode: spend the slots on builders (one or two), skip scouts and reviewers, and self-verify each diff yourself. " +
+					"Leads do not implement; every change requires a builder spawn.",
 			);
 		} else {
 			sections.push(
@@ -202,14 +254,15 @@ export function formatQualityGatesCapabilities(gates: QualityGate[] | undefined)
 
 function formatQualityGates(config: OverlayConfig): string {
 	if (READ_ONLY_CAPABILITIES.has(config.capability)) {
+		const completionType = completionMailTypeFor(config.capability);
 		return [
 			"## Completion",
 			"",
 			"Before reporting completion:",
 			"",
 			`1. **Record mulch learnings:** \`ml record <domain> --type <convention|pattern|reference> --description "..."\` — capture reusable knowledge from your work`,
-			`2. **Close issue:** \`${config.trackerCli ?? "sd"} close ${config.taskId} --reason "summary of findings"\``,
-			`3. **Send results:** \`ov mail send --to ${config.parentAgent ?? "coordinator"} --subject "done" --body "Summary" --type result --agent ${config.agentName}\``,
+			`2. **Signal completion:** send \`${completionType}\` mail to ${config.parentAgent ?? "coordinator"}: \`ov mail send --to ${config.parentAgent ?? "coordinator"} --subject "Worker done: ${config.taskId}" --body "Summary of findings" --type ${completionType} --agent ${config.agentName}\``,
+			`3. **Close issue:** \`${config.trackerCli ?? "sd"} close ${config.taskId} --reason "summary of findings"\``,
 			"",
 			"You are a read-only agent. Do NOT commit, modify files, or run quality gates.",
 		].join("\n");
@@ -245,13 +298,14 @@ function formatQualityGates(config: OverlayConfig): string {
  * Writable agents get file-scope and branch constraints.
  */
 function formatConstraints(config: OverlayConfig): string {
+	const completionType = completionMailTypeFor(config.capability);
 	if (READ_ONLY_CAPABILITIES.has(config.capability)) {
 		return [
 			"## Constraints",
 			"",
 			"- You are **read-only**: do NOT modify, create, or delete any files",
 			"- Do NOT commit, push, or make any git state changes",
-			`- Report completion via \`${config.trackerCli ?? "sd"} close\` AND \`ov mail send --type result\``,
+			`- Report completion via \`${config.trackerCli ?? "sd"} close\` AND \`ov mail send --type ${completionType}\``,
 			"- If you encounter a blocking issue, send mail with `--priority urgent --type error`",
 		].join("\n");
 	}
@@ -264,7 +318,7 @@ function formatConstraints(config: OverlayConfig): string {
 		"- Only modify files in your File Scope",
 		`- Commit only to your branch: ${config.branchName}`,
 		"- Never push to the canonical branch",
-		`- Report completion via \`${config.trackerCli ?? "sd"} close\` AND \`ov mail send --type result\``,
+		`- Report completion via \`${config.trackerCli ?? "sd"} close\` AND \`ov mail send --type ${completionType}\``,
 		"- If you encounter a blocking issue, send mail with `--priority urgent --type error`",
 	].join("\n");
 }
@@ -339,6 +393,7 @@ export async function generateOverlay(config: OverlayConfig): Promise<string> {
 		"{{SPEC_INSTRUCTION}}": specInstruction,
 		"{{SKIP_SCOUT}}": config.skipScout ? SKIP_SCOUT_SECTION : "",
 		"{{DISPATCH_OVERRIDES}}": formatDispatchOverrides(config),
+		"{{SIBLINGS}}": formatSiblings(config),
 		"{{BASE_DEFINITION}}": config.baseDefinition,
 		"{{PROFILE_INSTRUCTIONS}}": formatProfile(config.profileContent),
 		"{{QUALITY_GATE_INLINE}}": formatQualityGatesInline(config.qualityGates),

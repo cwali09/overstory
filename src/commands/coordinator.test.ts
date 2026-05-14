@@ -28,6 +28,7 @@ import {
 	coordinatorCommand,
 	createCoordinatorCommand,
 	resolveAttach,
+	startCoordinatorSession,
 } from "./coordinator.ts";
 import {
 	buildOrchestratorBeacon,
@@ -1600,6 +1601,133 @@ describe("watchdog integration", () => {
 			expect(output).toContain("--watchdog");
 			expect(output).toContain("watchdog");
 		});
+
+		test("start help text includes --accept-existing-watchdog flag", async () => {
+			const cmd = createCoordinatorCommand({});
+			for (const sub of cmd.commands) {
+				sub.exitOverride();
+			}
+			const output = await captureStdout(async () => {
+				await cmd.parseAsync(["start", "--help"], { from: "user" }).catch(() => {});
+			});
+			expect(output).toContain("--accept-existing-watchdog");
+		});
+	});
+
+	// overstory-3f0c: detect leftover watchdog from a previous session before
+	// spawning, so operators do not get unexpected watchdog supervision.
+	describe("orphan watchdog detection (overstory-3f0c)", () => {
+		// (a) start (no --watchdog) + isRunning=true -> throws AgentError with PID
+		// and mention of --accept-existing-watchdog in the message
+		test("rejects start with AgentError when no flag passed and watchdog already running", async () => {
+			const { deps, watchdogCalls } = makeDeps({}, { running: true, startSuccess: true });
+			const originalSleep = Bun.sleep;
+			Bun.sleep = (() => Promise.resolve()) as typeof Bun.sleep;
+
+			try {
+				await coordinatorCommand(["start", "--json"], deps);
+				expect.unreachable("should have thrown AgentError");
+			} catch (err) {
+				expect(err).toBeInstanceOf(AgentError);
+				const ae = err as AgentError;
+				expect(ae.message).toContain("Watchdog daemon");
+				// PID is unavailable from the fake watchdog (no PID file written),
+				// so the message reports "unknown PID" — but it must reference the
+				// concept and the suppress flag explicitly.
+				expect(ae.message).toMatch(/PID/);
+				expect(ae.message).toContain("--accept-existing-watchdog");
+				expect(ae.message).toContain("--watchdog");
+				expect(ae.message).toContain("ov watch --kill-others");
+			} finally {
+				Bun.sleep = originalSleep;
+			}
+
+			// Detection ran but auto-start did NOT — the throw fired first.
+			expect(watchdogCalls?.isRunning).toBeGreaterThanOrEqual(1);
+			expect(watchdogCalls?.start).toBe(0);
+		});
+
+		// (b) start --watchdog + isRunning=true -> does NOT throw;
+		//     watchdog.start() is still called once
+		test("--watchdog with already-running daemon does NOT throw and still calls start()", async () => {
+			const { deps, watchdogCalls } = makeDeps(
+				{},
+				{ running: true, startSuccess: false }, // startSuccess:false simulates the no-op-when-already-running return
+			);
+			const originalSleep = Bun.sleep;
+			Bun.sleep = (() => Promise.resolve()) as typeof Bun.sleep;
+
+			let output: string;
+			try {
+				output = await captureStdout(() =>
+					coordinatorCommand(["start", "--watchdog", "--json"], deps),
+				);
+			} finally {
+				Bun.sleep = originalSleep;
+			}
+
+			expect(watchdogCalls?.start).toBe(1);
+			const parsed = JSON.parse(output) as Record<string, unknown>;
+			// reused-daemon sentinel keeps watchdog truthy in the JSON output
+			expect(parsed.watchdog).toBe(true);
+			expect(parsed.watchdogPreexisting).toBe(true);
+		});
+
+		// (c) start --accept-existing-watchdog + isRunning=true -> does NOT throw;
+		//     coordinator starts normally; watchdog.start() is NOT called
+		test("--accept-existing-watchdog allows start without calling watchdog.start()", async () => {
+			const { deps, watchdogCalls } = makeDeps({}, { running: true, startSuccess: true });
+			const originalSleep = Bun.sleep;
+			Bun.sleep = (() => Promise.resolve()) as typeof Bun.sleep;
+
+			let output: string;
+			try {
+				output = await captureStdout(() =>
+					coordinatorCommand(["start", "--accept-existing-watchdog", "--json"], deps),
+				);
+			} finally {
+				Bun.sleep = originalSleep;
+			}
+
+			expect(watchdogCalls?.start).toBe(0);
+			const parsed = JSON.parse(output) as Record<string, unknown>;
+			expect(parsed.watchdog).toBe(true);
+			expect(parsed.watchdogPreexisting).toBe(true);
+		});
+
+		// (d) start (no --watchdog) + isRunning=false -> no error, no start
+		// (regression — preserves the original "no flag, no daemon activity" path)
+		test("no flag + watchdog not running: starts normally without calling start()", async () => {
+			const { deps, watchdogCalls } = makeDeps({}, { running: false, startSuccess: true });
+			const originalSleep = Bun.sleep;
+			Bun.sleep = (() => Promise.resolve()) as typeof Bun.sleep;
+
+			let output: string;
+			try {
+				output = await captureStdout(() => coordinatorCommand(["start", "--json"], deps));
+			} finally {
+				Bun.sleep = originalSleep;
+			}
+
+			expect(watchdogCalls?.start).toBe(0);
+			const parsed = JSON.parse(output) as Record<string, unknown>;
+			expect(parsed.watchdog).toBe(false);
+			expect(parsed.watchdogPreexisting).toBe(false);
+		});
+
+		test("orchestrator inherits the same orphan-watchdog detection", async () => {
+			const { deps, watchdogCalls } = makeDeps({}, { running: true });
+			const originalSleep = Bun.sleep;
+			Bun.sleep = (() => Promise.resolve()) as typeof Bun.sleep;
+
+			try {
+				await expect(orchestratorCommand(["start", "--json"], deps)).rejects.toThrow(AgentError);
+			} finally {
+				Bun.sleep = originalSleep;
+			}
+
+			expect(watchdogCalls?.start).toBe(0);
+		});
 	});
 });
 
@@ -2663,5 +2791,131 @@ describe("checkComplete", () => {
 		const cmd = createCoordinatorCommand({});
 		const subcommandNames = cmd.commands.map((c) => c.name());
 		expect(subcommandNames).toContain("check-complete");
+	});
+});
+
+describe("startCoordinatorSession headless", () => {
+	test("with headless: true, calls spawnHeadlessAgent and skips tmux", async () => {
+		const { tmux, calls: tmuxCalls } = makeFakeTmux();
+		const { watchdog } = makeFakeWatchdog();
+		const { monitor } = makeFakeMonitor();
+
+		const spawnCalls: Array<{
+			argv: string[];
+			cwd: string;
+			agentName?: string;
+		}> = [];
+		const writes: string[] = [];
+
+		const fakeSpawn = async (
+			argv: string[],
+			opts: { cwd: string; env: Record<string, string>; agentName?: string },
+		): Promise<{
+			pid: number;
+			stdin: { write(data: string | Uint8Array): number | Promise<number> };
+			stdout: ReadableStream<Uint8Array> | null;
+		}> => {
+			spawnCalls.push({ argv, cwd: opts.cwd, agentName: opts.agentName });
+			return {
+				pid: 55555,
+				stdin: {
+					write(data: string | Uint8Array): number {
+						writes.push(typeof data === "string" ? data : new TextDecoder().decode(data));
+						return 0;
+					},
+				},
+				stdout: null,
+			};
+		};
+
+		const deps: CoordinatorDeps = {
+			_tmux: tmux,
+			_watchdog: watchdog,
+			_monitor: monitor,
+			_spawnHeadless: fakeSpawn,
+		};
+
+		await captureStdout(async () => {
+			await startCoordinatorSession(
+				{
+					json: true,
+					attach: false,
+					watchdog: false,
+					monitor: false,
+					headless: true,
+				},
+				deps,
+			);
+		});
+
+		// spawnHeadlessAgent was called exactly once with agentName: "coordinator"
+		expect(spawnCalls.length).toBe(1);
+		expect(spawnCalls[0]?.agentName).toBe("coordinator");
+		expect(spawnCalls[0]?.cwd).toBe(tempDir);
+
+		// initial stdin prompt was written
+		expect(writes.length).toBeGreaterThanOrEqual(1);
+
+		// tmux helpers were never called for the headless path
+		expect(tmuxCalls.createSession.length).toBe(0);
+		expect(tmuxCalls.sendKeys.length).toBe(0);
+		expect(tmuxCalls.waitForTuiReady.length).toBe(0);
+		expect(tmuxCalls.ensureTmuxAvailable).toBe(0);
+
+		// Session row records empty tmuxSession + the headless spawn pid
+		const sessions = loadSessionsFromDb();
+		expect(sessions.length).toBe(1);
+		expect(sessions[0]?.agentName).toBe("coordinator");
+		expect(sessions[0]?.tmuxSession).toBe("");
+		expect(sessions[0]?.pid).toBe(55555);
+		expect(sessions[0]?.state).toBe("booting");
+
+		// current-run.txt was written for downstream consumers
+		const runFile = Bun.file(join(overstoryDir, "current-run.txt"));
+		expect(await runFile.exists()).toBe(true);
+	});
+
+	test("rejects when runtime has no buildDirectSpawn", async () => {
+		// Override config to route the coordinator capability to a runtime that
+		// lacks buildDirectSpawn (e.g. cursor). The headless path must reject.
+		await Bun.write(
+			join(overstoryDir, "config.yaml"),
+			[
+				"project:",
+				"  name: test-project",
+				`  root: ${tempDir}`,
+				"  canonicalBranch: main",
+				"watchdog:",
+				"  tier2Enabled: true",
+				"runtime:",
+				"  capabilities:",
+				"    coordinator: cursor",
+			].join("\n"),
+		);
+
+		const { tmux } = makeFakeTmux();
+		const { watchdog } = makeFakeWatchdog();
+		const { monitor } = makeFakeMonitor();
+		const deps: CoordinatorDeps = {
+			_tmux: tmux,
+			_watchdog: watchdog,
+			_monitor: monitor,
+			_spawnHeadless: async () => {
+				throw new Error("should not be called");
+			},
+		};
+
+		await expect(
+			startCoordinatorSession(
+				{
+					json: true,
+					attach: false,
+					watchdog: false,
+					monitor: false,
+					headless: true,
+				},
+				deps,
+			),
+		).rejects.toThrow(ValidationError);
 	});
 });

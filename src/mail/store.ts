@@ -8,7 +8,7 @@
 
 import { Database } from "bun:sqlite";
 import { MailError } from "../errors.ts";
-import type { MailMessage } from "../types.ts";
+import type { MailMessage, MailMessageType } from "../types.ts";
 import { MAIL_MESSAGE_TYPES } from "../types.ts";
 
 export interface MailStore {
@@ -16,10 +16,18 @@ export interface MailStore {
 		message: Omit<MailMessage, "read" | "createdAt" | "payload"> & { payload?: string | null },
 	): MailMessage;
 	getUnread(agentName: string): MailMessage[];
-	getAll(filters?: { from?: string; to?: string; unread?: boolean; limit?: number }): MailMessage[];
+	getAll(filters?: {
+		from?: string;
+		to?: string;
+		unread?: boolean;
+		type?: MailMessageType;
+		limit?: number;
+	}): MailMessage[];
 	getById(id: string): MailMessage | null;
 	getByThread(threadId: string): MailMessage[];
 	markRead(id: string): void;
+	/** Delete a single message by id. Returns true if a row was deleted. */
+	deleteById(id: string): boolean;
 	/** Delete messages matching the given criteria. Returns the number of messages deleted. */
 	purge(options: { all?: boolean; olderThanMs?: number; agent?: string }): number;
 	close(): void;
@@ -84,14 +92,21 @@ function migrateSchema(db: Database): void {
 	const hasPayloadColumn = row.sql.includes("payload");
 	const hasProtocolTypes = row.sql.includes("worker_done");
 	const hasDecisionGate = row.sql.includes("decision_gate");
+	const hasWorkerDied = row.sql.includes("worker_died");
 
 	// If schema is fully up to date, nothing to do
-	if (hasCheckConstraints && hasPayloadColumn && hasProtocolTypes && hasDecisionGate) {
+	if (
+		hasCheckConstraints &&
+		hasPayloadColumn &&
+		hasProtocolTypes &&
+		hasDecisionGate &&
+		hasWorkerDied
+	) {
 		return;
 	}
 
 	// If only missing the payload column (has correct CHECK constraints), use ALTER TABLE
-	if (hasCheckConstraints && hasProtocolTypes && !hasPayloadColumn) {
+	if (hasCheckConstraints && hasProtocolTypes && hasWorkerDied && !hasPayloadColumn) {
 		db.exec("ALTER TABLE messages ADD COLUMN payload TEXT");
 		return;
 	}
@@ -232,11 +247,16 @@ export function createMailStore(dbPath: string): MailStore {
 		UPDATE messages SET read = 1 WHERE id = $id
 	`);
 
+	const deleteByIdStmt = db.prepare<void, { $id: string }>(`
+		DELETE FROM messages WHERE id = $id
+	`);
+
 	// Dynamic filter queries are built at call time since the WHERE clause varies
 	function buildFilterQuery(filters?: {
 		from?: string;
 		to?: string;
 		unread?: boolean;
+		type?: MailMessageType;
 		limit?: number;
 	}): MailMessage[] {
 		const conditions: string[] = [];
@@ -253,6 +273,10 @@ export function createMailStore(dbPath: string): MailStore {
 		if (filters?.unread !== undefined) {
 			conditions.push("read = $read");
 			params.$read = filters.unread ? 0 : 1;
+		}
+		if (filters?.type !== undefined) {
+			conditions.push("type = $type");
+			params.$type = filters.type;
 		}
 
 		const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -315,6 +339,7 @@ export function createMailStore(dbPath: string): MailStore {
 			from?: string;
 			to?: string;
 			unread?: boolean;
+			type?: MailMessageType;
 			limit?: number;
 		}): MailMessage[] {
 			return buildFilterQuery(filters);
@@ -332,6 +357,18 @@ export function createMailStore(dbPath: string): MailStore {
 
 		markRead(id: string): void {
 			markReadStmt.run({ $id: id });
+		},
+
+		deleteById(id: string): boolean {
+			try {
+				const result = deleteByIdStmt.run({ $id: id });
+				return result.changes > 0;
+			} catch (err) {
+				throw new MailError(`Failed to delete message: ${id}`, {
+					messageId: id,
+					cause: err instanceof Error ? err : undefined,
+				});
+			}
 		},
 
 		purge(options: { all?: boolean; olderThanMs?: number; agent?: string }): number {

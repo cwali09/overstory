@@ -149,6 +149,16 @@ Prefix with `fix:`, `feat:`, or `docs:` when the category is clear. Plain descri
 - **Passing CI.** All PRs must pass CI checks (lint + typecheck + test) before merge.
 - **Description.** Briefly explain what the PR does and why. Link to any relevant issues.
 
+## Review Cadence
+
+Overstory is maintained part-time alongside a full-time role. Setting honest expectations up front:
+
+- **Review cycle.** PRs are reviewed in roughly 2-week batches. Changes touching hot paths (`src/worktree/`, `src/runtimes/`, agent spawn flows, mail) are prioritized and aim for weekly review.
+- **Rebase requests.** Main moves quickly. If your PR diverges while waiting, you will be asked to rebase. Please do so within 2 weeks of the request — after that, the rebase surface usually grows beyond what's worth re-reviewing.
+- **Stale PRs.** No activity for 30 days after a rebase or changes-request will be closed with a note. This is not a rejection — reopen anytime when you have bandwidth to continue. The work isn't lost.
+- **Propose first for large changes.** For features larger than ~200 lines, open an issue or discussion before writing code. A quick "is this direction right?" exchange saves the cost of a large PR sitting unreviewed while main drifts underneath it.
+- **Silence is not rejection.** If you want a status check, ping the PR — it simply means the batch hasn't reached you yet.
+
 ## Reporting Issues
 
 Use [GitHub Issues](https://github.com/jayminwest/overstory/issues) for bug reports and feature requests. For security vulnerabilities, see [SECURITY.md](SECURITY.md).

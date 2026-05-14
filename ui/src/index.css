@@ -1,0 +1,164 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+	--color-background: var(--background);
+	--color-foreground: var(--foreground);
+	--color-card: var(--card);
+	--color-card-foreground: var(--card-foreground);
+	--color-popover: var(--popover);
+	--color-popover-foreground: var(--popover-foreground);
+	--color-primary: var(--primary);
+	--color-primary-foreground: var(--primary-foreground);
+	--color-secondary: var(--secondary);
+	--color-secondary-foreground: var(--secondary-foreground);
+	--color-muted: var(--muted);
+	--color-muted-foreground: var(--muted-foreground);
+	--color-accent: var(--accent);
+	--color-accent-foreground: var(--accent-foreground);
+	--color-destructive: var(--destructive);
+	--color-destructive-foreground: var(--destructive-foreground);
+	--color-success: var(--success);
+	--color-success-foreground: var(--success-foreground);
+	--color-warning: var(--warning);
+	--color-warning-foreground: var(--warning-foreground);
+	--color-border: var(--border);
+	--color-input: var(--input);
+	--color-ring: var(--ring);
+	--color-chart-1: var(--chart-1);
+	--color-chart-2: var(--chart-2);
+	--color-chart-3: var(--chart-3);
+	--color-chart-4: var(--chart-4);
+	--color-chart-5: var(--chart-5);
+	--radius-sm: calc(var(--radius) - 4px);
+	--radius-md: calc(var(--radius) - 2px);
+	--radius-lg: var(--radius);
+	--radius-xl: calc(var(--radius) + 4px);
+}
+
+/*
+ * os-eco forest palette (overstory operator console)
+ *
+ * Source: ../../../branding/visual-spec.md
+ *   primary    → forest green   46,125,50  (overstory brand)
+ *   accent     → amber          255,183,77 (IDs, references, highlights)
+ *   muted      → stone gray     120,120,110
+ *
+ * Tool RGB triples live in `@/lib/brand` — never hardcode tool colors.
+ *
+ * Light vs dark deviation:
+ *   Light primary lifted from L=34% → L=36% so default buttons don't feel heavy.
+ *   Dark primary lifted to L=45% so the brand reads against a near-black canvas
+ *   while still passing AA contrast against white foreground (4.6:1).
+ *   The deeper 27,94,32 shade ships as `--primary-strong` for logo top-bars and
+ *   theme-color meta tags — closer to the rendered logo.png.
+ *
+ * Chart slots map to ecosystem tools (1-based: seeds, sapling, canopy, overstory,
+ * mulch). When greenhouse needs a slot, alias chart-2/sapling-or-seeds-equivalent.
+ */
+
+:root {
+	--radius: 0.5rem;
+	--background: hsl(0 0% 100%);
+	--foreground: hsl(140 25% 8%);
+	--card: hsl(0 0% 100%);
+	--card-foreground: hsl(140 25% 8%);
+	--popover: hsl(0 0% 100%);
+	--popover-foreground: hsl(140 25% 8%);
+	--primary: hsl(123 46% 36%);
+	--primary-foreground: hsl(0 0% 100%);
+	--primary-strong: hsl(123 55% 24%);
+	--secondary: hsl(80 18% 94%);
+	--secondary-foreground: hsl(140 25% 12%);
+	--muted: hsl(80 12% 95%);
+	--muted-foreground: hsl(60 4% 38%);
+	--accent: hsl(36 100% 65%);
+	--accent-foreground: hsl(28 60% 14%);
+	--destructive: hsl(0 75% 48%);
+	--destructive-foreground: hsl(0 0% 100%);
+	--success: hsl(123 43% 39%);
+	--success-foreground: hsl(0 0% 100%);
+	--warning: hsl(43 96% 50%);
+	--warning-foreground: hsl(28 60% 14%);
+	--border: hsl(80 12% 88%);
+	--input: hsl(80 12% 88%);
+	--ring: hsl(123 46% 40%);
+	--chart-1: hsl(89 46% 48%); /* seeds */
+	--chart-2: hsl(122 39% 49%); /* sapling */
+	--chart-3: hsl(123 43% 39%); /* canopy */
+	--chart-4: hsl(123 46% 34%); /* overstory */
+	--chart-5: hsl(29 53% 36%); /* mulch */
+}
+
+.dark {
+	--background: hsl(140 18% 6%);
+	--foreground: hsl(80 10% 92%);
+	--card: hsl(140 18% 6%);
+	--card-foreground: hsl(80 10% 92%);
+	--popover: hsl(140 18% 6%);
+	--popover-foreground: hsl(80 10% 92%);
+	--primary: hsl(122 39% 45%);
+	--primary-foreground: hsl(0 0% 100%);
+	--primary-strong: hsl(123 55% 24%);
+	--secondary: hsl(140 14% 14%);
+	--secondary-foreground: hsl(80 10% 92%);
+	--muted: hsl(140 14% 14%);
+	--muted-foreground: hsl(60 6% 65%);
+	--accent: hsl(36 90% 58%);
+	--accent-foreground: hsl(28 60% 12%);
+	--destructive: hsl(0 62% 45%);
+	--destructive-foreground: hsl(0 0% 100%);
+	--success: hsl(122 39% 49%);
+	--success-foreground: hsl(0 0% 100%);
+	--warning: hsl(43 96% 56%);
+	--warning-foreground: hsl(28 60% 12%);
+	--border: hsl(140 14% 16%);
+	--input: hsl(140 14% 16%);
+	--ring: hsl(122 39% 52%);
+	--chart-1: hsl(89 50% 55%); /* seeds */
+	--chart-2: hsl(122 39% 55%); /* sapling */
+	--chart-3: hsl(123 43% 48%); /* canopy */
+	--chart-4: hsl(123 46% 42%); /* overstory */
+	--chart-5: hsl(29 53% 50%); /* mulch */
+}
+
+/*
+ * UI scale (operator console polish)
+ *
+ * Spacing tokens — apply via Tailwind utilities, not raw values:
+ *   page shell        → px-6 py-4   (header/topbar; content rows in routes)
+ *   page content      → p-6         (Fleet/Mail/Agent body)
+ *   section header    → px-6 py-3   (route h1 strip)
+ *   thread/feed       → px-6 py-5   (Thread/AgentDetail timeline)
+ *   panel             → px-5 py-3   (mail filter strip, status banners)
+ *   bubble/card       → px-4 py-3   (Thread bubbles, EventRow cards)
+ *   composer          → px-6 py-4   (Coordinator composer)
+ *   form input        → px-3 py-2   (textarea/input/select)
+ *
+ * Vertical rhythm:
+ *   between page sections        → gap-6
+ *   between thread turns         → gap-4
+ *   between bubble subject/body  → gap-1.5
+ *   between header items         → gap-3
+ *
+ * Typography:
+ *   route h1   → text-xl font-semibold tracking-tight
+ *   section h2 → text-base font-semibold
+ *   body       → text-sm leading-relaxed
+ *   meta       → text-xs text-muted-foreground (never smaller)
+ *
+ * Borders:
+ *   default 1px (`border` + `border-border`)
+ *   dashed only for system/pending bubbles
+ *   rounded-md for inputs/buttons; rounded-xl for cards/panels
+ */
+
+@layer base {
+	* {
+		@apply border-border outline-ring/50;
+	}
+	body {
+		@apply bg-background text-foreground antialiased;
+	}
+}

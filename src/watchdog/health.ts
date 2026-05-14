@@ -30,22 +30,25 @@
  * table are always up-to-date because they reflect real kernel state.
  */
 
+import { isPersistentCapability } from "../agents/capabilities.ts";
 import type { AgentSession, AgentState, HealthCheck } from "../types.ts";
 
 /**
- * Agent capabilities that run as persistent interactive sessions.
- * These agents are expected to have long idle periods (e.g. coordinator waiting
- * for worker mail) and should NOT be flagged stale/zombie based on lastActivity.
- * Only tmux/pid liveness checks apply to them.
+ * Numeric ordering for forward-only state transitions.
  *
- * Shared concept with src/commands/log.ts:PERSISTENT_CAPABILITIES.
+ * `in_turn` and `between_turns` share the `working` rank (1) because, from
+ * the watchdog's perspective, all three are "agent is alive and active" —
+ * they only differ in whether the spawn-per-turn worker is currently
+ * mid-execution or idling between mail batches (overstory-3087). Same rank
+ * means a healthy-classification check (`check.state === "working"`) will
+ * not stomp on the more specific in_turn/between_turns states the
+ * turn-runner has already written.
  */
-const PERSISTENT_CAPABILITIES = new Set(["coordinator", "orchestrator", "monitor"]);
-
-/** Numeric ordering for forward-only state transitions. */
 const STATE_ORDER: Record<AgentState, number> = {
 	booting: 0,
 	working: 1,
+	in_turn: 1,
+	between_turns: 1,
 	completed: 2,
 	stalled: 3,
 	zombie: 4,
@@ -71,13 +74,32 @@ export function isProcessRunning(pid: number): boolean {
 }
 
 /**
- * Detect whether a session is a headless agent.
+ * Detect whether a session is a long-lived headless agent.
  *
- * Headless agents are spawned without a tmux session (tmuxSession === '') and
- * are tracked solely by PID. For these agents, PID is the primary liveness signal.
+ * Long-lived headless agents (coordinator, orchestrator, monitor, sapling, etc.)
+ * have no tmux session (tmuxSession === '') but do have a persistent process —
+ * so `session.pid` is non-null and PID is the primary liveness signal.
  */
 function isHeadlessSession(session: AgentSession): boolean {
 	return session.tmuxSession === "" && session.pid !== null;
+}
+
+/**
+ * Detect whether a session is a spawn-per-turn worker between turns.
+ *
+ * Spawn-per-turn workers (task-scoped capabilities under the new headless
+ * default — builder/scout/reviewer/lead/merger) have no tmux session AND no
+ * persistent process: `tmuxSession === ''` and `session.pid === null` from
+ * sling onward. The per-turn claude PID lives in
+ * `.overstory/agents/<name>/turn.pid` only while a turn is in flight.
+ *
+ * "No process" is the normal state between turns, so neither tmux liveness nor
+ * pid liveness can be used as a death signal — only `lastActivity` recency
+ * (refreshed by the turn-runner on every event and by the watchdog from
+ * events.db) can. (overstory-7a34)
+ */
+export function isSpawnPerTurnSession(session: AgentSession): boolean {
+	return session.tmuxSession === "" && session.pid === null;
 }
 
 /**
@@ -98,7 +120,7 @@ function evaluateTimeBased(
 	// Persistent capabilities (coordinator, monitor) are expected to have long idle
 	// periods waiting for mail/events. Skip time-based stale/zombie detection for
 	// them — only tmux/pid liveness matters (checked above).
-	if (PERSISTENT_CAPABILITIES.has(session.capability)) {
+	if (isPersistentCapability(session.capability)) {
 		// Transition booting → working if we reach here (process alive)
 		const state = session.state === "booting" ? "working" : session.state;
 		return {
@@ -135,22 +157,42 @@ function evaluateTimeBased(
 		};
 	}
 
-	// booting → transition to working once there's recent activity
+	// Spawn-per-turn workers (overstory-3087): healthy classification reports
+	// `between_turns` instead of `working`, including the booting → healthy
+	// transition. The turn-runner authoritatively writes `in_turn` /
+	// `between_turns` while a turn is alive; in_turn is preserved here when
+	// already set so a watchdog tick mid-turn does not overwrite it.
+	const isSpawnPerTurn = isSpawnPerTurnSession(session);
+
+	// booting → transition to the healthy state once there's recent activity.
 	if (session.state === "booting") {
 		return {
 			...base,
 			processAlive: true,
-			state: "working",
+			state: isSpawnPerTurn ? "between_turns" : "working",
 			action: "none",
 			reconciliationNote: null,
 		};
 	}
 
-	// Default: healthy and working
+	// Default: healthy active state. For spawn-per-turn workers report the
+	// existing in_turn/between_turns substate; for tmux/long-lived agents
+	// report `working`. The turn-runner is authoritative for in_turn ↔
+	// between_turns transitions, so the watchdog must not stomp the more
+	// specific state — same rank in STATE_ORDER ensures `transitionState`
+	// also leaves the row alone.
+	let healthyState: AgentState;
+	if (session.state === "in_turn" || session.state === "between_turns") {
+		healthyState = session.state;
+	} else if (isSpawnPerTurn) {
+		healthyState = "between_turns";
+	} else {
+		healthyState = "working";
+	}
 	return {
 		...base,
 		processAlive: true,
-		state: "working",
+		state: healthyState,
 		action: "none",
 		reconciliationNote: null,
 	};
@@ -165,19 +207,23 @@ function evaluateTimeBased(
  * Decision logic (in priority order):
  *
  * 1. Completed agents skip monitoring entirely.
- * 2. Headless agents (tmuxSession === ''): PID is primary liveness signal.
+ * 2. Spawn-per-turn workers (tmuxSession === '' && pid === null): no
+ *    persistent process between turns — fall straight through to time-based
+ *    checks driven by lastActivity. PID/tmux liveness are meaningless here.
+ * 3. Headless agents with persistent process (tmuxSession === '' && pid !== null):
+ *    PID is primary liveness signal.
  *    - pid dead → zombie, terminate.
  *    - pid alive + state zombie → investigate.
  *    - pid alive → fall through to time-based checks.
- * 3. tmux dead → zombie, terminate (regardless of what sessions.json says).
- * 4. tmux alive + sessions.json says zombie → investigate (don't auto-kill).
+ * 4. tmux dead → zombie, terminate (regardless of what sessions.json says).
+ * 5. tmux alive + sessions.json says zombie → investigate (don't auto-kill).
  *    Something external marked this zombie, but the process is still running.
- * 5. pid dead + tmux alive → zombie, terminate. The agent process exited but
+ * 6. pid dead + tmux alive → zombie, terminate. The agent process exited but
  *    the tmux pane shell survived. The agent is not doing work.
- * 6. lastActivity older than zombieMs → zombie, terminate.
- * 7. lastActivity older than staleMs → stalled, escalate.
- * 8. booting with recent activity → working.
- * 9. Otherwise → working, healthy.
+ * 7. lastActivity older than zombieMs → zombie, terminate.
+ * 8. lastActivity older than staleMs → stalled, escalate.
+ * 9. booting with recent activity → working.
+ * 10. Otherwise → working, healthy.
  *
  * @param session - The agent session to evaluate
  * @param tmuxAlive - Whether the agent's tmux session is still running
@@ -222,10 +268,37 @@ export function evaluateHealth(
 		};
 	}
 
+	// === Spawn-per-turn path: no persistent process between turns ===
+	// For these workers (overstory-7a34) `session.pid` is null by design and
+	// there is no tmux session. Liveness signals reduce to lastActivity
+	// recency: the turn-runner updates it on every parser event during a
+	// turn, and the watchdog refreshes it from events.db between turns. PID
+	// and tmux checks would always say "dead" and false-positive every fresh
+	// agent as zombie within seconds of sling.
+	if (isSpawnPerTurnSession(session)) {
+		return evaluateTimeBased(session, base, elapsedMs, thresholds);
+	}
+
 	// === Headless path: PID is the primary liveness signal ===
 	if (isHeadlessSession(session)) {
-		// pid dead → zombie immediately (equivalent to ZFC Rule 1 for headless)
+		// pid dead: zombie OR completed-with-missed-signal.
+		// Distinguish by lastActivity age — recent activity means the agent
+		// crashed mid-work (true zombie); stale activity means it likely
+		// finished naturally and only the session-end hook didn't deliver
+		// (treat as completed). (overstory-e74b)
 		if (pidAlive === false) {
+			if (
+				elapsedMs > thresholds.staleMs &&
+				(session.state === "working" || session.state === "booting" || session.state === "stalled")
+			) {
+				return {
+					...base,
+					processAlive: false,
+					state: "completed",
+					action: "complete",
+					reconciliationNote: `ZFC: headless pid ${session.pid} dead + stale lastActivity (${Math.round(elapsedMs / 1000)}s ago) — assumed completed (missed session-end signal)`,
+				};
+			}
 			return {
 				...base,
 				processAlive: false,
@@ -253,9 +326,25 @@ export function evaluateHealth(
 
 	// === TUI/tmux path ===
 
-	// ZFC Rule 1: tmux dead → zombie immediately, regardless of recorded state.
-	// Observable state says the process is gone.
+	// ZFC Rule 1: tmux dead → zombie OR completed-with-missed-signal.
+	// Distinguish by lastActivity age — recent activity means the agent
+	// crashed mid-work (true zombie); stale activity means it likely
+	// finished naturally and only the session-end hook didn't deliver
+	// (treat as completed). (overstory-e74b)
 	if (!tmuxAlive) {
+		if (
+			elapsedMs > thresholds.staleMs &&
+			(session.state === "working" || session.state === "booting" || session.state === "stalled")
+		) {
+			return {
+				...base,
+				processAlive: false,
+				state: "completed",
+				action: "complete",
+				reconciliationNote: `ZFC: tmux dead + stale lastActivity (${Math.round(elapsedMs / 1000)}s ago) — assumed completed (missed session-end signal)`,
+			};
+		}
+
 		const note =
 			session.state === "working" || session.state === "booting"
 				? `ZFC: tmux dead but sessions.json says "${session.state}" — marking zombie (observable state wins)`
@@ -321,6 +410,16 @@ export function transitionState(currentState: AgentState, check: HealthCheck): A
 	// ZFC: investigate means signals conflict — hold state until reviewed
 	if (check.action === "investigate") {
 		return currentState;
+	}
+
+	// `complete` is a terminal classification triggered when observable state
+	// proves the agent finished naturally (missed session-end signal —
+	// overstory-e74b). It bypasses the forward-only STATE_ORDER guard because
+	// `completed` (order 2) sits before `stalled` (order 3) and would
+	// otherwise be blocked from advancing the recorded state. The matrix in
+	// SessionStore.tryTransitionState still gates the actual write.
+	if (check.action === "complete") {
+		return check.state;
 	}
 
 	const currentOrder = STATE_ORDER[currentState];

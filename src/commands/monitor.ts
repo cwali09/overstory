@@ -29,6 +29,7 @@ import {
 	createSession,
 	isSessionAlive,
 	killSession,
+	sanitizeTmuxName,
 	sendKeys,
 	TMUX_SOCKET,
 } from "../worktree/tmux.ts";
@@ -42,7 +43,7 @@ const MONITOR_NAME = "monitor";
  * Includes the project name to prevent cross-project collisions (overstory-pcef).
  */
 function monitorTmuxSession(projectName: string): string {
-	return `overstory-${projectName}-${MONITOR_NAME}`;
+	return `overstory-${sanitizeTmuxName(projectName)}-${MONITOR_NAME}`;
 }
 
 /**

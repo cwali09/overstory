@@ -22,6 +22,19 @@ import type { ReadyState } from "../runtimes/types.ts";
 export const TMUX_SOCKET = "overstory";
 
 /**
+ * Sanitize a name component for use in tmux session names.
+ *
+ * Tmux interprets dots (.) as session.window.pane separators and colons (:)
+ * as session:window separators in target strings (`-t`). If a project name
+ * contains these characters (e.g., "consulting.jayminwest.com"), the session
+ * is created fine but subsequent lookups via `-t` parse the dots as delimiters
+ * and fail to find the session. Replace both with underscores.
+ */
+export function sanitizeTmuxName(name: string): string {
+	return name.replace(/[.:]/g, "_");
+}
+
+/**
  * Build a tmux command array with the dedicated server socket.
  * All agent session operations should use this to ensure isolation.
  */
@@ -136,9 +149,16 @@ export async function createSession(
 	// causes the session to die instantly. Single-quote wrapping with escaped
 	// single quotes prevents any intermediate shell from expanding variables
 	// before bash receives them. (GitHub #86)
-	const startupScript = exports.length > 0 ? `${exports.join(" && ")} && ${command}` : command;
-	const wrappedCommand =
-		exports.length > 0 ? `/bin/bash -c '${startupScript.replace(/'/g, "'\\''")}'` : command;
+	//
+	// The `exec` prefix replaces the bash wrapper with the spawned command
+	// so there is no separate wrapper PID to orphan if the tmux server dies
+	// externally. Without exec, bash receives SIGHUP on tmux teardown but its
+	// claude child gets reparented to init and continues running. With exec,
+	// the wrapper IS the command — SIGHUP is delivered directly to claude.
+	// (overstory-505d)
+	const startupScript =
+		exports.length > 0 ? `${exports.join(" && ")} && exec ${command}` : `exec ${command}`;
+	const wrappedCommand = `/bin/bash -c '${startupScript.replace(/'/g, "'\\''")}'`;
 
 	const { exitCode, stderr } = await runCommand(
 		tmuxCmd("new-session", "-d", "-s", name, "-c", cwd, wrappedCommand),
@@ -384,6 +404,17 @@ function sendSignal(pid: number, signal: "SIGTERM" | "SIGKILL"): void {
  *         failures are silently handled since the goal is best-effort cleanup)
  */
 export async function killSession(name: string): Promise<void> {
+	// Defense in depth: an empty session name passed to `tmux -t` is prefix-matched
+	// against every session in the server, wildcard-killing the entire overstory
+	// swarm (overstory-74ce). Reject empty names at the boundary so a regression in
+	// any caller surfaces loudly instead of silently nuking the tmux server.
+	if (name === "") {
+		throw new AgentError(
+			"killSession called with empty session name (would wildcard-kill all tmux sessions due to prefix matching)",
+			{ agentName: name },
+		);
+	}
+
 	// Step 1: Get the pane PID before killing the tmux session
 	const panePid = await getPanePid(name);
 
@@ -437,6 +468,12 @@ export async function getCurrentSessionName(): Promise<string | null> {
  * @returns true if the session exists, false otherwise
  */
 export async function isSessionAlive(name: string): Promise<boolean> {
+	// Defense in depth: an empty `-t` argument is prefix-matched against every
+	// session, so `has-session` would return true whenever any overstory session
+	// exists. Treat empty as "not alive" without contacting tmux (overstory-74ce).
+	if (name === "") {
+		return false;
+	}
 	const { exitCode } = await runCommand(tmuxCmd("has-session", "-t", name));
 	return exitCode === 0;
 }

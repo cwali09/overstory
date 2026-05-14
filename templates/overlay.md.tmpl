@@ -25,6 +25,8 @@
 
 {{DISPATCH_OVERRIDES}}
 
+{{SIBLINGS}}
+
 ## Working Directory
 
 Your worktree root is: `{{WORKTREE_PATH}}`
@@ -68,9 +70,10 @@ ov mail send --to {{PARENT_AGENT}} --subject "status" \
 ov mail send --to {{PARENT_AGENT}} --subject "question" \
   --body "Your question here" --type question --priority high --agent {{AGENT_NAME}}
 
-# Report completion
+# Report completion (terminal exit signal — workers send worker_done; merger
+# sends merged/merge_failed; see "Constraints" / "Completion" sections below).
 ov mail send --to {{PARENT_AGENT}} --subject "done" \
-  --body "Summary of what was done" --type result --agent {{AGENT_NAME}}
+  --body "Summary of what was done" --type worker_done --agent {{AGENT_NAME}}
 
 # Reply to a message
 ov mail reply <message-id> --body "Your reply" --agent {{AGENT_NAME}}

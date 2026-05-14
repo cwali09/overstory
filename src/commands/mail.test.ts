@@ -118,6 +118,54 @@ describe("mailCommand", () => {
 			expect(output).toContain("Explore API");
 			expect(output).toContain("Total: 2 messages");
 		});
+
+		test("--type filters by message type", async () => {
+			// Add a typed message to the seeded inbox
+			const store = createMailStore(join(tempDir, ".overstory", "mail.db"));
+			const client = createMailClient(store);
+			client.send({
+				from: "lead-x",
+				to: "coordinator",
+				subject: "merge_ready: t1",
+				body: "ready to merge",
+				type: "merge_ready",
+			});
+			client.close();
+
+			await mailCommand(["list", "--type", "merge_ready"]);
+			expect(output).toContain("merge_ready: t1");
+			expect(output).not.toContain("Build task");
+			expect(output).not.toContain("Explore API");
+			expect(output).toContain("Total: 1 message");
+		});
+
+		test("--type combined with --from filters by both", async () => {
+			const store = createMailStore(join(tempDir, ".overstory", "mail.db"));
+			const client = createMailClient(store);
+			client.send({
+				from: "lead-x",
+				to: "coordinator",
+				subject: "merge_ready: t1",
+				body: "ready",
+				type: "merge_ready",
+			});
+			client.send({
+				from: "lead-y",
+				to: "coordinator",
+				subject: "merge_ready: t2",
+				body: "ready",
+				type: "merge_ready",
+			});
+			client.close();
+
+			await mailCommand(["list", "--from", "lead-x", "--type", "merge_ready"]);
+			expect(output).toContain("merge_ready: t1");
+			expect(output).not.toContain("merge_ready: t2");
+		});
+
+		test("--type rejects invalid type with ValidationError", async () => {
+			await expect(mailCommand(["list", "--type", "bogus"])).rejects.toThrow(/Invalid --type/);
+		});
 	});
 
 	describe("reply", () => {
@@ -1272,6 +1320,120 @@ describe("mailCommand", () => {
 
 			// No warning should be emitted for non-merge_ready types
 			expect(stderrOutput).toBe("");
+		});
+	});
+
+	describe("terminal-state recipient rejection (overstory-f5be)", () => {
+		async function seedRecipient(name: string, state: "working" | "completed" | "zombie") {
+			const { createSessionStore } = await import("../sessions/store.ts");
+			const sessionsDbPath = join(tempDir, ".overstory", "sessions.db");
+			const sessionStore = createSessionStore(sessionsDbPath);
+			sessionStore.upsert({
+				id: `session-${name}`,
+				agentName: name,
+				capability: "builder",
+				worktreePath: `/worktrees/${name}`,
+				branchName: name,
+				taskId: "bead-x",
+				tmuxSession: `overstory-test-${name}`,
+				state,
+				pid: 99999,
+				parentAgent: "orchestrator",
+				depth: 1,
+				runId: "run-001",
+				startedAt: new Date().toISOString(),
+				lastActivity: new Date().toISOString(),
+				escalationLevel: 0,
+				stalledSince: null,
+				transcriptPath: null,
+			});
+			sessionStore.close();
+		}
+
+		test("rejects send to recipient in completed state", async () => {
+			await seedRecipient("dead-builder", "completed");
+
+			let caught: unknown;
+			try {
+				await mailCommand([
+					"send",
+					"--to",
+					"dead-builder",
+					"--subject",
+					"Hello",
+					"--body",
+					"Are you there?",
+				]);
+			} catch (err) {
+				caught = err;
+			}
+
+			expect(caught).toBeDefined();
+			expect((caught as Error).name).toBe("MailError");
+			expect((caught as Error).message).toContain("dead-builder");
+			expect((caught as Error).message).toContain("completed");
+
+			// Confirm no message was inserted
+			const store = createMailStore(join(tempDir, ".overstory", "mail.db"));
+			const client = createMailClient(store);
+			const messages = client.list({ to: "dead-builder" });
+			expect(messages.length).toBe(0);
+			client.close();
+		});
+
+		test("rejects send to recipient in zombie state", async () => {
+			await seedRecipient("crashed-builder", "zombie");
+
+			let caught: unknown;
+			try {
+				await mailCommand([
+					"send",
+					"--to",
+					"crashed-builder",
+					"--subject",
+					"Status?",
+					"--body",
+					"Ping",
+				]);
+			} catch (err) {
+				caught = err;
+			}
+
+			expect(caught).toBeDefined();
+			expect((caught as Error).name).toBe("MailError");
+			expect((caught as Error).message).toContain("zombie");
+		});
+
+		test("allows send when recipient has no session row (e.g. orchestrator)", async () => {
+			// No session seeded for "orchestrator" — the existing beforeEach
+			// only inserts mail rows, not session rows.
+			await mailCommand([
+				"send",
+				"--to",
+				"orchestrator",
+				"--subject",
+				"Hello",
+				"--body",
+				"Top-level role",
+			]);
+
+			const store = createMailStore(join(tempDir, ".overstory", "mail.db"));
+			const client = createMailClient(store);
+			const messages = client.list({ to: "orchestrator" });
+			expect(messages.length).toBeGreaterThanOrEqual(1);
+			client.close();
+		});
+
+		test("allows send to active (working) recipient", async () => {
+			await seedRecipient("live-builder", "working");
+
+			await mailCommand(["send", "--to", "live-builder", "--subject", "Hello", "--body", "Active"]);
+
+			const store = createMailStore(join(tempDir, ".overstory", "mail.db"));
+			const client = createMailClient(store);
+			const messages = client.list({ to: "live-builder" });
+			expect(messages.length).toBe(1);
+			client.close();
 		});
 	});
 });

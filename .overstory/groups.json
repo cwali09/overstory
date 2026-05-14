@@ -956,8 +956,202 @@
 			"overstory-a655",
 			"overstory-ee23"
 		],
-		"status": "active",
+		"status": "completed",
 		"createdAt": "2026-03-23T19:57:17.357Z",
+		"completedAt": "2026-03-23T20:09:46.648Z"
+	},
+	{
+		"id": "group-c06c267a",
+		"name": "submodule-cascade-fix",
+		"memberIssueIds": [
+			"overstory-5804",
+			"overstory-329a"
+		],
+		"status": "completed",
+		"createdAt": "2026-04-07T21:11:43.098Z",
+		"completedAt": "2026-04-07T21:31:02.663Z"
+	},
+	{
+		"id": "group-80c27629",
+		"name": "phase1-ui-shell",
+		"memberIssueIds": [
+			"overstory-0820",
+			"overstory-ba9c",
+			"overstory-9e8b",
+			"overstory-22ac",
+			"overstory-9884",
+			"overstory-6c4f",
+			"overstory-fc04",
+			"overstory-0ddb"
+		],
+		"status": "completed",
+		"createdAt": "2026-04-28T04:10:58.855Z",
+		"completedAt": "2026-04-29T01:05:23.326Z"
+	},
+	{
+		"id": "group-34cb3102",
+		"name": "phase2-headless-claude",
+		"memberIssueIds": [
+			"overstory-f001",
+			"overstory-46ad",
+			"overstory-2916",
+			"overstory-d854",
+			"overstory-268b"
+		],
+		"status": "completed",
+		"createdAt": "2026-04-28T16:09:38.851Z",
+		"completedAt": "2026-04-28T17:54:17.676Z"
+	},
+	{
+		"id": "group-5b487137",
+		"name": "phase1-ui-shell-pipeline",
+		"memberIssueIds": [
+			"overstory-ba9c",
+			"overstory-9e8b",
+			"overstory-22ac",
+			"overstory-6c4f",
+			"overstory-fc04",
+			"overstory-0ddb"
+		],
+		"status": "completed",
+		"createdAt": "2026-04-28T20:56:04.355Z",
+		"completedAt": "2026-04-29T01:05:23.561Z"
+	},
+	{
+		"id": "group-b069979b",
+		"name": "phase3-wave1",
+		"memberIssueIds": [
+			"overstory-63d5",
+			"overstory-7dee",
+			"overstory-1c32",
+			"overstory-32cd",
+			"overstory-1f66"
+		],
+		"status": "completed",
+		"createdAt": "2026-04-29T01:07:41.104Z",
+		"completedAt": "2026-04-29T04:30:51.266Z"
+	},
+	{
+		"id": "group-585c8afd",
+		"name": "phase3.5-ui-console",
+		"memberIssueIds": [
+			"overstory-82b4",
+			"overstory-2740",
+			"overstory-d108"
+		],
+		"status": "completed",
+		"createdAt": "2026-04-29T15:32:27.543Z",
+		"completedAt": "2026-04-29T17:19:32.248Z"
+	},
+	{
+		"id": "group-2d13a018",
+		"name": "ui-coord-batch-2026-04-29",
+		"memberIssueIds": [
+			"overstory-55e6",
+			"overstory-08a3",
+			"overstory-0d64",
+			"overstory-e2f1"
+		],
+		"status": "completed",
+		"createdAt": "2026-04-29T18:55:19.620Z",
+		"completedAt": "2026-04-29T20:20:29.054Z"
+	},
+	{
+		"id": "group-ca3b2814",
+		"name": "headless-resume-migration",
+		"memberIssueIds": [
+			"overstory-b835",
+			"overstory-7b8c",
+			"overstory-2cf9",
+			"overstory-2724",
+			"overstory-5337",
+			"overstory-84f4"
+		],
+		"status": "completed",
+		"createdAt": "2026-04-29T20:56:38.318Z",
+		"completedAt": "2026-05-01T00:00:08.326Z"
+	},
+	{
+		"id": "group-59e2ae98",
+		"name": "reliability-batch-b",
+		"memberIssueIds": [
+			"overstory-e130",
+			"overstory-87bf",
+			"overstory-14c0",
+			"overstory-41fe"
+		],
+		"status": "completed",
+		"createdAt": "2026-05-01T00:01:15.899Z",
+		"completedAt": "2026-05-01T01:41:14.860Z"
+	},
+	{
+		"id": "group-51612f16",
+		"name": "turn-runner-stall",
+		"memberIssueIds": [
+			"overstory-8e61",
+			"overstory-de3c"
+		],
+		"status": "completed",
+		"createdAt": "2026-05-01T15:22:06.886Z",
+		"completedAt": "2026-05-02T16:15:07.436Z"
+	},
+	{
+		"id": "group-88067f3e",
+		"name": "watchdog-and-zombie-fix",
+		"memberIssueIds": [
+			"overstory-74ce",
+			"overstory-de3c"
+		],
+		"status": "completed",
+		"createdAt": "2026-05-01T20:45:55.068Z",
+		"completedAt": "2026-05-01T21:25:08.878Z"
+	},
+	{
+		"id": "group-be62f6b4",
+		"name": "sling-and-lead-poll-fix",
+		"memberIssueIds": [
+			"overstory-fa84",
+			"overstory-6878"
+		],
+		"status": "completed",
+		"createdAt": "2026-05-01T21:26:39.093Z",
+		"completedAt": "2026-05-01T21:42:47.010Z"
+	},
+	{
+		"id": "group-0f170996",
+		"name": "watchdog-detect-and-from-fix",
+		"memberIssueIds": [
+			"overstory-3f0c",
+			"overstory-235f"
+		],
+		"status": "completed",
+		"createdAt": "2026-05-01T21:43:32.083Z",
+		"completedAt": "2026-05-01T22:07:33.846Z"
+	},
+	{
+		"id": "group-24bec854",
+		"name": "low-pri-cleanup",
+		"memberIssueIds": [
+			"overstory-7291",
+			"overstory-c92c"
+		],
+		"status": "active",
+		"createdAt": "2026-05-01T22:08:18.592Z",
+		"completedAt": null
+	},
+	{
+		"id": "group-10490a20",
+		"name": "sweep-2026-05-02",
+		"memberIssueIds": [
+			"overstory-9f4d",
+			"overstory-f76a",
+			"overstory-inxu",
+			"overstory-3087",
+			"overstory-2e18",
+			"overstory-e174"
+		],
+		"status": "active",
+		"createdAt": "2026-05-02T16:16:05.952Z",
 		"completedAt": null
 	}
 ]

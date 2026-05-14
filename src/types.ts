@@ -108,6 +108,7 @@ export interface OverstoryConfig {
 		rpcTimeoutMs?: number; // Timeout for RPC getState() calls (default 5_000)
 		triageTimeoutMs?: number; // Timeout for Tier 1 AI triage calls (default 30_000)
 		maxEscalationLevel?: number; // Maximum escalation level before termination (default 3)
+		notifyParentOnDeath?: boolean; // Send synthetic worker_died mail to parent on watchdog termination (default true)
 	};
 	models: Partial<Record<string, ModelRef>>;
 	logging: {
@@ -141,6 +142,13 @@ export interface OverstoryConfig {
 		 * Default: 0 (no delay).
 		 */
 		shellInitDelayMs?: number;
+		/**
+		 * Project-level default for spawning Claude Code agents in headless mode
+		 * (Bun.spawn + stream-json) instead of the tmux interactive runtime.
+		 * Per-spawn `--headless` / `--no-headless` flags on `ov sling` override this.
+		 * Default: false (tmux).
+		 */
+		claudeHeadlessByDefault?: boolean;
 	};
 }
 
@@ -179,7 +187,49 @@ export type Capability = (typeof SUPPORTED_CAPABILITIES)[number];
 
 // === Agent Session ===
 
-export type AgentState = "booting" | "working" | "completed" | "stalled" | "zombie";
+/**
+ * Agent lifecycle states.
+ *
+ * `in_turn` and `between_turns` are spawn-per-turn-specific substates that
+ * split the legacy `working` state so the UI can distinguish a worker actively
+ * executing a turn from one idling between mail batches (overstory-3087):
+ *
+ *   - `in_turn`: the turn-runner has observed at least one parser event from
+ *     a live claude subprocess. The agent is mid-execution.
+ *   - `between_turns`: the turn-runner finished a turn without a terminal
+ *     mail; the agent is alive (process gone, session pinned) and waiting
+ *     for the next mail batch to spawn a fresh turn.
+ *
+ * `working` remains the active state for tmux/long-lived headless agents
+ * (coordinator, orchestrator, monitor, sapling) which have no per-turn
+ * boundary. Spawn-per-turn workers (builder/scout/reviewer/lead/merger
+ * under the headless default) transition through in_turn ↔ between_turns
+ * instead.
+ */
+export type AgentState =
+	| "booting"
+	| "working"
+	| "in_turn"
+	| "between_turns"
+	| "completed"
+	| "stalled"
+	| "zombie";
+
+/**
+ * Result of a guarded state transition attempt (`SessionStore.tryTransitionState`).
+ *
+ * Discriminated by `ok`. When `ok` is false, `reason` distinguishes:
+ *   - `not_found`: no session exists for the given name.
+ *   - `illegal_transition`: a session exists but the matrix forbids prev → attempted.
+ *
+ * `prev` is always the state observed by the SQL CAS. For `illegal_transition` it
+ * is the state that blocked the write (which may differ from what the caller read,
+ * if another writer landed first).
+ */
+export type TransitionOutcome =
+	| { ok: true; prev: AgentState; next: AgentState }
+	| { ok: false; reason: "not_found"; attempted: AgentState }
+	| { ok: false; reason: "illegal_transition"; prev: AgentState; attempted: AgentState };
 
 export interface AgentSession {
 	id: string; // Unique session ID
@@ -200,6 +250,7 @@ export interface AgentSession {
 	stalledSince: string | null; // ISO timestamp when agent first entered stalled state
 	transcriptPath: string | null; // Runtime-provided transcript JSONL path (decoupled from ~/.claude/)
 	promptVersion?: string | null; // Canopy prompt version used at sling time (e.g. "builder@17")
+	claudeSessionId?: string | null; // Runtime-provided session_id (Claude stream-json), eagerly pinned on first event
 }
 
 // === Agent Identity ===
@@ -225,6 +276,7 @@ export type MailSemanticType = "status" | "question" | "result" | "error";
 /** Protocol message types for structured agent coordination. */
 export type MailProtocolType =
 	| "worker_done"
+	| "worker_died"
 	| "merge_ready"
 	| "merged"
 	| "merge_failed"
@@ -244,6 +296,7 @@ export const MAIL_MESSAGE_TYPES: readonly MailMessageType[] = [
 	"result",
 	"error",
 	"worker_done",
+	"worker_died",
 	"merge_ready",
 	"merged",
 	"merge_failed",
@@ -276,6 +329,33 @@ export interface WorkerDonePayload {
 	branch: string;
 	exitCode: number;
 	filesModified: string[];
+}
+
+/**
+ * Watchdog signals the parent that one of its children was terminated.
+ *
+ * Synthetic mail injected by the Tier 0 daemon when it transitions a worker
+ * to `zombie` (overstory-c111). Without this, the parent — typically a lead
+ * waiting for `worker_done` from this child — would block indefinitely on
+ * mail that will never arrive. The parent reads this on its next mail-injector
+ * tick and decides whether to retry, escalate, or report up.
+ */
+export interface WorkerDiedPayload {
+	agentName: string;
+	capability: string;
+	taskId: string;
+	/** Reason the watchdog or runner terminated the child (e.g. "Process terminated"). */
+	reason: string;
+	/** ISO timestamp of the child's last observed activity. */
+	lastActivity: string;
+	/**
+	 * Source that detected the failure.
+	 * - `tier0`/`tier1`: watchdog daemon detected a dead/stuck process out-of-band.
+	 * - `runner`: the per-turn runner observed an in-band failure — either an
+	 *   abort/stall that forced SIGTERM/SIGKILL, or a clean exit without the
+	 *   capability's terminal mail (silent-no-op, overstory-4159 / overstory-c772).
+	 */
+	terminatedBy: "tier0" | "tier1" | "runner";
 }
 
 /** Supervisor signals branch is verified and ready for merge. */
@@ -349,6 +429,7 @@ export interface DecisionGatePayload {
 /** Maps protocol message types to their payload interfaces. */
 export interface MailPayloadMap {
 	worker_done: WorkerDonePayload;
+	worker_died: WorkerDiedPayload;
 	merge_ready: MergeReadyPayload;
 	merged: MergedPayload;
 	merge_failed: MergeFailedPayload;
@@ -391,6 +472,13 @@ export interface OverlayConfig {
 	qualityGates?: QualityGate[];
 	/** Relative path to the instruction file within the worktree (runtime-specific). Defaults to .claude/CLAUDE.md. */
 	instructionPath?: string;
+	/**
+	 * Names of sibling agents dispatched in parallel that may share file scope
+	 * with this agent. When set, the overlay renders a "Parallel Siblings"
+	 * section with rebase-before-merge_ready guidance (overstory-f76a). Empty
+	 * or unset → no overlay section.
+	 */
+	siblings?: string[];
 }
 
 // === Merge Queue ===
@@ -436,6 +524,23 @@ export interface ConflictHistory {
 	predictedConflictFiles: string[];
 }
 
+/**
+ * Side-effect-free prediction of how `ov merge` would resolve a branch.
+ * Produced by `predictConflicts` (src/merge/predict.ts) without touching HEAD,
+ * the working tree, or the merge lock — surfaced via `ov merge --dry-run` so a
+ * lead/operator/greenhouse can branch on `wouldRequireAgent`.
+ */
+export interface ConflictPrediction {
+	/** The tier `ov merge` would land in if invoked now. */
+	predictedTier: ResolutionTier;
+	/** Files that would conflict — empty for clean-merge. */
+	conflictFiles: string[];
+	/** True iff predictedTier is "ai-resolve" or "reimagine" (Tier 3+). */
+	wouldRequireAgent: boolean;
+	/** Short, operator-readable explanation for the predicted tier. */
+	reason: string;
+}
+
 // === Watchdog ===
 
 export interface HealthCheck {
@@ -446,7 +551,7 @@ export interface HealthCheck {
 	pidAlive: boolean | null; // null when pid is unavailable
 	lastActivity: string;
 	state: AgentState;
-	action: "none" | "escalate" | "terminate" | "investigate";
+	action: "none" | "escalate" | "terminate" | "investigate" | "complete";
 	/** Describes any conflict between observable state and recorded state. */
 	reconciliationNote: string | null;
 }

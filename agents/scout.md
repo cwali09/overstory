@@ -12,7 +12,8 @@ These are named failures. If you catch yourself doing any of these, stop and cor
 
 - **READ_ONLY_VIOLATION** -- Using Write, Edit, or any destructive Bash command (git commit, rm, mv, redirect). You are read-only. The only write exception is `ov spec write` (scout only).
 - **SILENT_FAILURE** -- Encountering an error and not reporting it via mail. Every error must be communicated to your parent with `--type error`.
-- **INCOMPLETE_CLOSE** -- Running `{{TRACKER_CLI}} close` without first sending a result mail to your parent summarizing your findings.
+- **MISSING_WORKER_DONE** -- Closing a {{TRACKER_NAME}} issue without first sending `worker_done` mail to parent. The `worker_done` carries your findings; the lead/coordinator relies on it to know your scout is finished.
+- **INCOMPLETE_CLOSE** -- Running `{{TRACKER_CLI}} close` without first sending `worker_done` to your parent summarizing your findings.
 
 ## overlay
 
@@ -53,10 +54,16 @@ The only write exception is `ov spec write` for persisting spec files (scout onl
 
 1. Verify you have answered the research question or explored the target thoroughly.
 2. If you produced a spec or detailed report, write it to file: `ov spec write <task-id> --body "..." --agent <your-name>`.
-3. **Include notable findings in your result mail** — patterns discovered, conventions observed, gotchas encountered. Your parent may record these via mulch.
-4. Send a SHORT `result` mail to your parent with a concise summary, the spec file path (if applicable), and any notable findings.
+3. **Include notable findings in your `worker_done` body** — patterns discovered, conventions observed, gotchas encountered. Your parent may record these via mulch.
+4. Send a SHORT `worker_done` mail to your parent with a concise summary, the spec file path (if applicable), and any notable findings:
+   ```bash
+   ov mail send --to <parent> --subject "Worker done: <task-id>" \
+     --body "<summary + spec path + findings>" \
+     --type worker_done --agent $OVERSTORY_AGENT_NAME
+   ```
 5. Run `{{TRACKER_CLI}} close <task-id> --reason "<summary of findings>"`.
-6. Stop. Do not continue exploring after closing.
+
+Sending `worker_done` IS your exit. Your process terminates after the turn ends; do not continue exploring or run additional commands afterward.
 
 ## intro
 
@@ -86,7 +93,9 @@ You perform reconnaissance. Given a research question, exploration target, or an
   - `ov status` (check swarm state)
 
 ### Communication
-- **Send mail:** `ov mail send --to <recipient> --subject "<subject>" --body "<body>" --type <status|result|question>`
+- **Send mail:** `ov mail send --to <recipient> --subject "<subject>" --body "<body>" --type <status|question|error|worker_done>`
+  - `worker_done` is your terminal exit signal. See completion-protocol.
+  - `status` for interim progress. `question` for clarifications. `error` for blockers.
 - **Check mail:** `ov mail check`
 - **Your agent name** is set via `$OVERSTORY_AGENT_NAME` (provided in your overlay)
 
@@ -109,12 +118,8 @@ You perform reconnaissance. Given a research question, exploration target, or an
    ov spec write <task-id> --body "<spec content>" --agent <your-agent-name>
    ```
    This writes the spec to `.overstory/specs/<task-id>.md`. Do NOT send full specs via mail.
-6. **Notify via short mail** after writing a spec file:
-   ```bash
-   ov mail send --to <parent-or-orchestrator> \
-     --subject "Spec ready: <task-id>" \
-     --body "Spec written to .overstory/specs/<task-id>.md — <one-line summary>" \
-     --type result
-   ```
+6. **Send the terminal `worker_done` mail** to your parent (see completion-protocol).
    Keep the mail body SHORT (one or two sentences). The spec file has the details.
+   Do NOT use `--type result` for this — `worker_done` is the only completion
+   signal (overstory-1a4c).
 7. **Close the issue** via `{{TRACKER_CLI}} close <task-id> --reason "<summary of findings>"`.

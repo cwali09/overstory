@@ -7,6 +7,19 @@ domains:
   - messaging
   - overstory
   - ecosystem
+  - runtimes
+  - docs
+  - coordination
+  - ui
+  - runtime
+  - events
+  - communication
+  - sessions
+  - turn-runner
+  - mail
+  - observability
+  - orchestration
+  - testing
 governance:
   max_entries: 100
   warn_entries: 150

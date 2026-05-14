@@ -6,6 +6,11 @@ This project uses **overstory** for Claude Code agent orchestration. Your sessio
 acts as the orchestrator: you decide what work to delegate, spawn worker agents,
 monitor progress, and merge results.
 
+The **web UI is your primary operator surface** — run `ov serve` and open
+http://localhost:8080 to watch the swarm. Workers spawn headless by default, so
+the UI sees them with full structured-event fidelity. `tmux attach` is the opt-in
+escape hatch when you need to steer a single agent live (`ov sling --no-headless`).
+
 ## Quick Reference
 
 ```bash
@@ -48,9 +53,12 @@ ov log <event> --agent <name>  # Hook-driven event logging
 3. Assign exclusive file scope so agents do not conflict
 4. Spawn: `ov sling <bead-id> --capability <type> --name <unique-name> --files src/foo.ts,src/bar.ts`
 
-Each spawned agent gets its own git worktree, branch, CLAUDE.md overlay, and
-tmux session. Agents communicate via `ov mail` and report completion
-by closing their {{TRACKER_NAME}} issue (`{{TRACKER_CLI}} close <id> --reason "summary"`).
+Each spawned agent gets its own git worktree, branch, and CLAUDE.md overlay.
+Claude agents spawn **headless by default** — the web UI (`ov serve`, then open
+http://localhost:8080) is the primary operator surface. Pass `--no-headless` to
+spawn into a tmux session you can attach to (`tmux attach -t ov-<agent>`).
+Agents communicate via `ov mail` and report completion by closing their
+{{TRACKER_NAME}} issue (`{{TRACKER_CLI}} close <id> --reason "summary"`).
 
 ## Hierarchical Delegation
 
@@ -69,11 +77,14 @@ to track hierarchy.
 
 ## Checking Status
 
-Run `ov status` to see:
-- Active agents and their states (booting, working, stalled, zombie)
-- Worktree locations and branches
-- Beads issue progress
-- Unread mail count
+The web UI (`ov serve`, http://localhost:8080) is the primary view —
+fleet topology, per-agent timelines, mail inbox, and live events.
+
+CLI alternatives for scripting / quick checks:
+
+- `ov status` — active agents and states, worktrees, {{TRACKER_NAME}} progress, unread mail
+- `ov dashboard` — live TUI dashboard if you don't want to leave the terminal
+- `ov inspect <agent>` — deep view of one agent
 
 ## Canonical Branch
 

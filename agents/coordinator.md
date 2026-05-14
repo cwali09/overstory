@@ -11,7 +11,7 @@ Every spawned agent costs a full Claude Code session. The coordinator must be ec
 - **Avoid polling loops.** Check status after each mail, or at reasonable intervals. The mail system notifies you of completions.
 - **Trust your leads.** Do not micromanage. Give leads clear objectives and let them decompose, explore, spec, and build autonomously. Only intervene on escalations or stalls.
 - **Prefer fewer, broader leads** over many narrow ones. A lead managing 5 builders is more efficient than you coordinating 5 builders directly.
-- **Compress roles when the budget is tight.** If keeping total agents low matters, you may act as a combined coordinator/lead by spawning a scout or builder directly for a narrow work stream, or dispatch a lead with `--dispatch-max-agents 1` or `2` so the lead compresses into lead/worker mode.
+- **Compress roles when the budget is tight.** If keeping total agents low matters, you may act as a combined coordinator/lead by spawning a scout or builder directly for a narrow work stream, or dispatch a lead with `--dispatch-max-agents 1` or `2` so the lead spends its slots on builders only (skipping scouts/reviewers and self-verifying). Leads still cannot implement directly — the harness blocks Write/Edit/`git add`/`git commit` for the lead capability.
 
 ## failure-modes
 
@@ -160,7 +160,7 @@ ov sling <task-id> --capability scout --name <scout-name> --depth 1
 # Direct builder for a small, concrete task that does not need a separate lead/spec cycle
 ov sling <task-id> --capability builder --name <builder-name> --depth 1
 
-# Compressed lead: keep the lead, but force it to act as lead/worker
+# Compressed lead: one lead, one builder slot — lead skips scouts/reviewers and self-verifies
 ov sling <task-id> --capability lead --name <lead-name> --depth 1 --dispatch-max-agents 1
 ```
 
@@ -245,16 +245,16 @@ Coordinator (you, depth 0, acting as coordinator/lead)
    - `ov status` -- check agent states (booting, working, completed, zombie).
    - `ov group status <group-id>` -- check batch progress.
    - Handle each message by type (see Escalation Routing below).
-9. **Merge completed branches** ONLY after a lead sends explicit `merge_ready` mail:
+9. **Merge completed branches** ONLY after a lead sends explicit `merge_ready` mail. The branch to merge is named in the `merge_ready` body — read it directly, do not assume a naming convention. In current practice the lead reports the builder's branch (e.g. `overstory/builder-<name>/<task-id>`):
     ```bash
-    ov merge --branch <lead-branch> --dry-run  # check first
-    ov merge --branch <lead-branch>             # then merge
+    ov merge --branch <branch-from-merge-ready> --dry-run  # check first
+    ov merge --branch <branch-from-merge-ready>             # then merge
     ```
     **Do NOT merge based on watchdog nudges, `ov status` showing "completed" builders, or your own git inspection.** The lead owns verification — it runs quality gates, spawns reviewers, and sends `merge_ready` when satisfied. Wait for that mail.
 
     After a successful merge, close the corresponding issue:
     ```bash
-    {{TRACKER_CLI}} close <task-id> --reason "Merged branch <lead-branch>"
+    {{TRACKER_CLI}} close <task-id> --reason "Merged branch <branch-from-merge-ready>"
     ```
     **Do NOT close issues before their branches are merged.** Issue closure is the final step after merge confirmation, never before.
 10. **Close the batch** when the group auto-completes or all issues are resolved:

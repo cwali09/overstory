@@ -12,12 +12,14 @@
 
 import { join } from "node:path";
 import { Command } from "commander";
+import { isStopHookPersistentCapability } from "../agents/capabilities.ts";
 import { updateIdentity } from "../agents/identity.ts";
 import { loadConfig } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import { createEventStore } from "../events/store.ts";
 import { filterToolArgs } from "../events/tool-filter.ts";
 import { analyzeSessionInsights } from "../insights/analyzer.ts";
+import { hasWorkToVerify, runQualityGates } from "../insights/quality-gates.ts";
 import { createLogger } from "../logging/logger.ts";
 import { createMailClient } from "../mail/client.ts";
 import { createMailStore } from "../mail/store.ts";
@@ -66,8 +68,12 @@ function updateLastActivity(projectRoot: string, agentName: string): void {
 			const session = store.getByName(agentName);
 			if (session) {
 				store.updateLastActivity(agentName);
-				if (session.state === "booting" || session.state === "zombie") {
-					store.updateState(agentName, "working");
+				// Tool-use observed: try booting → working. Matrix-guarded so a
+				// zombie classification (set by watchdog) is NOT silently revived
+				// here — that revival was a contributor to the schizophrenic
+				// state=zombie + tool-use-active symptom in overstory-a993.
+				if (session.state === "booting") {
+					store.tryTransitionState(agentName, "working");
 				}
 			}
 		} finally {
@@ -79,61 +85,142 @@ function updateLastActivity(projectRoot: string, agentName: string): void {
 }
 
 /**
- * Agent capabilities that run as persistent interactive sessions.
- * The Stop hook fires every turn for these agents (not just at session end),
- * so they must NOT auto-transition to 'completed' on session-end events.
+ * Maximum retry attempts for the session-end transition.
+ *
+ * The Stop hook is the only signal that turns sessions.db state from
+ * "working" to "completed" for headless legacy paths and tmux sessions.
+ * If it loses that signal due to a transient SQLite contention error
+ * (e.g. "database is locked" while the watchdog ticks against the same
+ * file), the row stays in "working" forever and the watchdog later
+ * promotes it to "zombie". Retrying with exponential backoff lets brief
+ * lock contention resolve before we give up. (overstory-e74b)
  */
-const PERSISTENT_CAPABILITIES = new Set(["coordinator", "orchestrator", "monitor"]);
+const TRANSITION_MAX_ATTEMPTS = 5;
+const TRANSITION_BACKOFF_BASE_MS = 50;
+
+/**
+ * One attempt at the session-end state transition.
+ *
+ * Throws on transient failures (e.g. SQLite "database is locked") so the
+ * caller can retry. The body is the original logic from
+ * `transitionToCompleted`.
+ */
+function transitionToCompletedOnce(projectRoot: string, agentName: string): void {
+	const overstoryDir = join(projectRoot, ".overstory");
+	const { store } = openSessionStore(overstoryDir);
+	try {
+		const session = store.getByName(agentName);
+		if (session && isStopHookPersistentCapability(session.capability)) {
+			// Check if a persistent top-level agent self-exited by verifying the run
+			// is already completed.
+			// If `ov run complete` was called before session-end, the run status is 'completed'
+			// and we should transition the persistent session to completed too.
+			if (
+				(session.capability === "coordinator" || session.capability === "orchestrator") &&
+				session.runId
+			) {
+				const runStore = createRunStore(join(overstoryDir, "sessions.db"));
+				try {
+					const run = runStore.getRun(session.runId);
+					if (run && run.status === "completed") {
+						// Self-exit: the persistent agent called ov run complete before session ended
+						store.updateState(agentName, "completed");
+						store.updateLastActivity(agentName);
+						return;
+					}
+				} finally {
+					runStore.close();
+				}
+			}
+			// Normal persistent agent: only update activity, don't mark completed
+			store.updateLastActivity(agentName);
+			return;
+		}
+		store.updateState(agentName, "completed");
+		store.updateLastActivity(agentName);
+	} finally {
+		store.close();
+	}
+}
+
+/**
+ * Best-effort: log a session-end hook failure to events.db so it surfaces in
+ * `ov errors` and trace timelines. Swallows secondary errors (events.db may
+ * also be locked when the primary write failed).
+ */
+async function logHookFailure(
+	projectRoot: string,
+	agentName: string,
+	hookName: string,
+	error: unknown,
+	attempts: number,
+): Promise<void> {
+	try {
+		const eventsDbPath = join(projectRoot, ".overstory", "events.db");
+		const eventStore = createEventStore(eventsDbPath);
+		try {
+			eventStore.insert({
+				runId: null,
+				agentName,
+				sessionId: null,
+				eventType: "error",
+				toolName: null,
+				toolArgs: null,
+				toolDurationMs: null,
+				level: "error",
+				data: JSON.stringify({
+					hook: hookName,
+					attempts,
+					message: error instanceof Error ? error.message : String(error),
+				}),
+			});
+		} finally {
+			eventStore.close();
+		}
+	} catch {
+		// Non-fatal: events.db may also be unavailable when the primary write failed.
+	}
+}
 
 /**
  * Transition agent state to 'completed' in the SessionStore.
  * Called when session-end event fires.
  *
- * Skips the transition for persistent agent types (coordinator, orchestrator, monitor)
- * whose Stop hook fires every turn, not just at true session end.
+ * Retries on transient SQLite contention with exponential backoff
+ * (50/100/200/400/800ms). On persistent failure, records an `error` event
+ * to events.db so the missed signal shows up in observability tooling and
+ * the watchdog's stale-but-tmux-dead fallback can recognize it.
+ * (overstory-e74b)
+ *
+ * Skips the transition for capabilities in `STOP_HOOK_PERSISTENT_CAPABILITIES`
+ * (coordinator, orchestrator, monitor, lead) whose Stop hook fires every model
+ * turn rather than once at true session end. See
+ * `src/agents/capabilities.ts` for the full rationale and consumer list.
  *
  * Non-fatal: silently ignores errors to avoid breaking hook execution.
  */
-function transitionToCompleted(projectRoot: string, agentName: string): void {
-	try {
-		const overstoryDir = join(projectRoot, ".overstory");
-		const { store } = openSessionStore(overstoryDir);
+async function transitionToCompleted(projectRoot: string, agentName: string): Promise<void> {
+	let lastError: unknown;
+	for (let attempt = 0; attempt < TRANSITION_MAX_ATTEMPTS; attempt++) {
 		try {
-			const session = store.getByName(agentName);
-			if (session && PERSISTENT_CAPABILITIES.has(session.capability)) {
-				// Check if a persistent top-level agent self-exited by verifying the run
-				// is already completed.
-				// If `ov run complete` was called before session-end, the run status is 'completed'
-				// and we should transition the persistent session to completed too.
-				if (
-					(session.capability === "coordinator" || session.capability === "orchestrator") &&
-					session.runId
-				) {
-					const runStore = createRunStore(join(overstoryDir, "sessions.db"));
-					try {
-						const run = runStore.getRun(session.runId);
-						if (run && run.status === "completed") {
-							// Self-exit: the persistent agent called ov run complete before session ended
-							store.updateState(agentName, "completed");
-							store.updateLastActivity(agentName);
-							return;
-						}
-					} finally {
-						runStore.close();
-					}
-				}
-				// Normal persistent agent: only update activity, don't mark completed
-				store.updateLastActivity(agentName);
-				return;
+			transitionToCompletedOnce(projectRoot, agentName);
+			return;
+		} catch (err) {
+			lastError = err;
+			if (attempt < TRANSITION_MAX_ATTEMPTS - 1) {
+				await Bun.sleep(TRANSITION_BACKOFF_BASE_MS * 2 ** attempt);
 			}
-			store.updateState(agentName, "completed");
-			store.updateLastActivity(agentName);
-		} finally {
-			store.close();
 		}
-	} catch {
-		// Non-fatal: don't break logging if session update fails
 	}
+
+	// All retries failed — surface the missed signal via events.db.
+	await logHookFailure(
+		projectRoot,
+		agentName,
+		"session-end:transitionToCompleted",
+		lastError,
+		TRANSITION_MAX_ATTEMPTS,
+	);
 }
 
 /**
@@ -293,6 +380,7 @@ export async function autoRecordExpertise(params: {
 	parentAgent: string | null;
 	projectRoot: string;
 	sessionStartedAt: string;
+	outcomeStatus?: "success" | "partial" | "failure";
 }): Promise<string[]> {
 	const learnResult = await params.mulchClient.learn({ since: "HEAD~1" });
 	if (learnResult.suggestedDomains.length === 0) {
@@ -309,6 +397,8 @@ export async function autoRecordExpertise(params: {
 				description: `${params.capability} agent ${params.agentName} completed work in this domain. Files: ${filesList}`,
 				tags: ["auto-session-end", params.capability],
 				evidenceBead: params.taskId ?? undefined,
+				outcomeStatus: params.outcomeStatus,
+				outcomeAgent: params.agentName,
 			});
 			recordedDomains.push(domain);
 		} catch {
@@ -348,6 +438,8 @@ export async function autoRecordExpertise(params: {
 					description: insight.description,
 					tags: insight.tags,
 					evidenceBead: params.taskId ?? undefined,
+					outcomeStatus: params.outcomeStatus,
+					outcomeAgent: params.agentName,
 				});
 				if (!recordedDomains.includes(insight.domain)) {
 					recordedDomains.push(insight.domain);
@@ -414,6 +506,7 @@ export async function appendOutcomeToAppliedRecords(params: {
 	capability: string;
 	taskId: string | null;
 	projectRoot: string;
+	outcomeStatus?: "success" | "partial" | "failure";
 }): Promise<number> {
 	const appliedRecordsPath = join(
 		params.projectRoot,
@@ -436,10 +529,12 @@ export async function appendOutcomeToAppliedRecords(params: {
 	if (!records || records.length === 0) return 0;
 
 	const taskSuffix = params.taskId ? ` for task ${params.taskId}` : "";
+	const status: "success" | "partial" | "failure" = params.outcomeStatus ?? "success";
+	const gateNote = params.outcomeStatus ? ` Quality gates: ${params.outcomeStatus}.` : "";
 	const outcome = {
-		status: "success" as const,
+		status,
 		agent: params.agentName,
-		notes: `Applied by ${params.capability} agent ${params.agentName}${taskSuffix}. Session completed.`,
+		notes: `Applied by ${params.capability} agent ${params.agentName}${taskSuffix}. Session completed.${gateNote}`,
 	};
 
 	let appended = 0;
@@ -629,8 +724,9 @@ async function runLog(opts: {
 		}
 		case "session-end":
 			logger.info("session.end", { agentName: opts.agent });
-			// Transition agent state to completed
-			transitionToCompleted(config.project.root, opts.agent);
+			// Transition agent state to completed (with retry/backoff and
+			// events.db fallback on persistent failure — overstory-e74b).
+			await transitionToCompleted(config.project.root, opts.agent);
 			// Look up agent session for identity update and metrics recording
 			{
 				const agentSession = getAgentSession(config.project.root, opts.agent);
@@ -645,28 +741,6 @@ async function runLog(opts: {
 					});
 				} catch {
 					// Non-fatal: identity may not exist for this agent
-				}
-
-				// Auto-nudge coordinator when a lead completes so it wakes up
-				// to process merge_ready / worker_done messages without waiting
-				// for user input (see decision mx-728f8d).
-				if (agentSession?.capability === "lead") {
-					try {
-						const nudgesDir = join(config.project.root, ".overstory", "pending-nudges");
-						const { mkdir } = await import("node:fs/promises");
-						await mkdir(nudgesDir, { recursive: true });
-						const markerPath = join(nudgesDir, "coordinator.json");
-						const marker = {
-							from: opts.agent,
-							reason: "lead_completed",
-							subject: `Lead ${opts.agent} completed — check mail for merge_ready/worker_done`,
-							messageId: `auto-nudge-${opts.agent}-${Date.now()}`,
-							createdAt: new Date().toISOString(),
-						};
-						await Bun.write(markerPath, `${JSON.stringify(marker, null, "\t")}\n`);
-					} catch {
-						// Non-fatal: nudge failure should not break session-end
-					}
 				}
 
 				// Record session metrics (with optional token data from transcript)
@@ -728,9 +802,33 @@ async function runLog(opts: {
 						// Non-fatal: metrics recording should not break session-end handling
 					}
 
+					// Resolve outcome status from quality-gate results, threaded into
+					// every session-end mulch record write so confirmation scoring
+					// reflects whether tests/lint/typecheck actually passed.
+					let outcomeStatus: "success" | "partial" | "failure" | undefined;
+					if (!isStopHookPersistentCapability(agentSession.capability)) {
+						try {
+							let baseRef = "main";
+							const baseBranchPath = join(config.project.root, ".overstory", "session-branch.txt");
+							const baseFile = Bun.file(baseBranchPath);
+							if (await baseFile.exists()) {
+								const txt = (await baseFile.text()).trim();
+								if (txt.length > 0) baseRef = txt;
+							}
+							const hasWork = await hasWorkToVerify(agentSession.worktreePath, baseRef);
+							if (hasWork) {
+								const gates = config.project.qualityGates ?? [];
+								const outcome = await runQualityGates(gates, agentSession.worktreePath);
+								if (outcome) outcomeStatus = outcome.status;
+							}
+						} catch {
+							// Non-fatal: outcome status is optional
+						}
+					}
+
 					// Auto-record expertise via mulch learn + record (post-session).
 					// Skip persistent agents whose Stop hook fires every turn.
-					if (!PERSISTENT_CAPABILITIES.has(agentSession.capability)) {
+					if (!isStopHookPersistentCapability(agentSession.capability)) {
 						try {
 							const mulchClient = createMulchClient(config.project.root);
 							const mailDbPath = join(config.project.root, ".overstory", "mail.db");
@@ -743,6 +841,7 @@ async function runLog(opts: {
 								parentAgent: agentSession.parentAgent,
 								projectRoot: config.project.root,
 								sessionStartedAt: agentSession.startedAt,
+								outcomeStatus,
 							});
 						} catch {
 							// Non-fatal: mulch learn/record should not break session-end handling
@@ -751,7 +850,7 @@ async function runLog(opts: {
 
 					// Append outcomes to applied mulch records (outcome feedback loop).
 					// Reads applied-records.json written by sling.ts at spawn time.
-					if (!PERSISTENT_CAPABILITIES.has(agentSession.capability)) {
+					if (!isStopHookPersistentCapability(agentSession.capability)) {
 						try {
 							const mulchClient = createMulchClient(config.project.root);
 							await appendOutcomeToAppliedRecords({
@@ -760,6 +859,7 @@ async function runLog(opts: {
 								capability: agentSession.capability,
 								taskId,
 								projectRoot: config.project.root,
+								outcomeStatus,
 							});
 						} catch {
 							// Non-fatal

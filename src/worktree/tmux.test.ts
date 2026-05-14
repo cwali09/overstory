@@ -13,6 +13,7 @@ import {
 	killProcessTree,
 	killSession,
 	listSessions,
+	sanitizeTmuxName,
 	sendKeys,
 	waitForTuiReady,
 } from "./tmux.ts";
@@ -111,6 +112,9 @@ describe("createSession", () => {
 		const wrappedCmd = cmd[9] as string;
 		expect(wrappedCmd).toContain("echo hello");
 		expect(wrappedCmd).toContain("export PATH=");
+		// `exec` replaces the bash wrapper with the command so SIGHUP from a
+		// dying tmux server is delivered directly to claude (overstory-505d).
+		expect(wrappedCmd).toContain("exec echo hello");
 
 		const opts = tmuxCallArgs[1] as { cwd: string };
 		expect(opts.cwd).toBe("/work/dir");
@@ -826,6 +830,22 @@ describe("killSession", () => {
 			expect(agentErr.agentName).toBe("ghost-agent");
 		}
 	});
+
+	test("throws AgentError when called with empty session name", async () => {
+		// Defense in depth (overstory-74ce): tmux's `-t` argument prefix-matches
+		// every session in the server when given an empty string. Without this
+		// guard a regression in any caller would wildcard-kill the entire
+		// overstory swarm. spawn must NOT be invoked.
+		await expect(killSession("")).rejects.toThrow(AgentError);
+		expect(spawnSpy).not.toHaveBeenCalled();
+
+		try {
+			await killSession("");
+		} catch (err: unknown) {
+			const agentErr = err as AgentError;
+			expect(agentErr.message).toContain("wildcard");
+		}
+	});
 });
 
 describe("isSessionAlive", () => {
@@ -864,6 +884,15 @@ describe("isSessionAlive", () => {
 		const callArgs = spawnSpy.mock.calls[0] as unknown[];
 		const cmd = callArgs[0] as string[];
 		expect(cmd).toEqual(["tmux", "-L", "overstory", "has-session", "-t", "my-agent"]);
+	});
+
+	test("returns false for empty session name without calling tmux", async () => {
+		// Defense in depth (overstory-74ce): an empty `-t` argument prefix-matches
+		// every overstory session, so `has-session` would falsely report alive
+		// whenever any agent is running. Short-circuit to false without invoking tmux.
+		const alive = await isSessionAlive("");
+		expect(alive).toBe(false);
+		expect(spawnSpy).not.toHaveBeenCalled();
 	});
 });
 
@@ -1548,5 +1577,40 @@ describe("ensureTmuxAvailable", () => {
 			const agentErr = err as AgentError;
 			expect(agentErr.message).toContain("tmux is not installed");
 		}
+	});
+});
+
+describe("sanitizeTmuxName", () => {
+	test("replaces dots with underscores", () => {
+		expect(sanitizeTmuxName("consulting.jayminwest.com")).toBe("consulting_jayminwest_com");
+	});
+
+	test("replaces colons with underscores", () => {
+		expect(sanitizeTmuxName("host:8080")).toBe("host_8080");
+	});
+
+	test("replaces mixed dots and colons", () => {
+		expect(sanitizeTmuxName("my.project:v2.0")).toBe("my_project_v2_0");
+	});
+
+	test("leaves names without special characters unchanged", () => {
+		expect(sanitizeTmuxName("my-project")).toBe("my-project");
+	});
+
+	test("handles empty string", () => {
+		expect(sanitizeTmuxName("")).toBe("");
+	});
+
+	test("handles name with only dots", () => {
+		expect(sanitizeTmuxName("...")).toBe("___");
+	});
+
+	test("produces valid tmux session name components", () => {
+		// A real-world project name that would break tmux target parsing
+		const projectName = "consulting.jayminwest.com";
+		const sessionName = `overstory-${sanitizeTmuxName(projectName)}-coordinator`;
+		expect(sessionName).toBe("overstory-consulting_jayminwest_com-coordinator");
+		// No dots or colons that tmux would interpret as separators
+		expect(sessionName).not.toMatch(/[.:]/);
 	});
 });

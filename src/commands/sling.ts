@@ -18,12 +18,13 @@
  * 14. Return AgentSession
  */
 
-import { mkdirSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { buildInitialHeadlessPrompt, formatMailSection } from "../agents/headless-prompt.ts";
 import { createIdentity, loadIdentity } from "../agents/identity.ts";
 import { createManifestLoader, resolveModel } from "../agents/manifest.ts";
 import { writeOverlay } from "../agents/overlay.ts";
+import { runTurn } from "../agents/turn-runner.ts";
 import { createCanopyClient } from "../canopy/client.ts";
 import { loadConfig } from "../config.ts";
 import { AgentError, HierarchyError, ValidationError } from "../errors.ts";
@@ -38,9 +39,8 @@ import { openSessionStore } from "../sessions/compat.ts";
 import { createRunStore } from "../sessions/store.ts";
 import type { TrackerIssue } from "../tracker/factory.ts";
 import { createTrackerClient, resolveBackend, trackerCliName } from "../tracker/factory.ts";
-import type { AgentSession, OverlayConfig } from "../types.ts";
+import type { AgentSession, OverlayConfig, OverstoryConfig } from "../types.ts";
 import { createWorktree, rollbackWorktree } from "../worktree/manager.ts";
-import { spawnHeadlessAgent } from "../worktree/process.ts";
 import {
 	capturePaneContent,
 	checkSessionState,
@@ -48,6 +48,7 @@ import {
 	ensureTmuxAvailable,
 	isSessionAlive,
 	killSession,
+	sanitizeTmuxName,
 	sendKeys,
 	waitForTuiReady,
 } from "../worktree/tmux.ts";
@@ -155,6 +156,75 @@ export interface SlingOptions {
 	noScoutCheck?: boolean;
 	baseBranch?: string;
 	profile?: string;
+	headless?: boolean;
+	recover?: boolean;
+	/**
+	 * Comma-separated list of sibling agent names dispatched in parallel that
+	 * may share file scope with this agent (overstory-f76a). Plumbed through
+	 * to `OverlayConfig.siblings` so the overlay renders rebase-before-merge_ready
+	 * guidance.
+	 */
+	siblings?: string;
+}
+
+/**
+ * Parse the `--siblings <names>` argument into a normalized string array.
+ * Trims whitespace, drops empty entries. Empty / undefined input → `[]`.
+ *
+ * Exported for unit-testing.
+ */
+export function parseSiblings(raw: string | undefined): string[] {
+	if (!raw) return [];
+	return raw
+		.split(",")
+		.map((s) => s.trim())
+		.filter((s) => s.length > 0);
+}
+
+const WORKABLE_STATUSES = ["open", "in_progress"] as const;
+
+/**
+ * Decide whether a task with the given tracker status can accept a fresh
+ * sling. Normal dispatch requires an `open` or `in_progress` task; passing
+ * `recover` accepts any status so a coordinator can re-dispatch against a
+ * task whose previous owner exited (e.g. closed by a dead lead). (overstory-629f)
+ */
+export function isTaskWorkable(status: string, recover: boolean): boolean {
+	if (recover) return true;
+	return (WORKABLE_STATUSES as readonly string[]).includes(status);
+}
+
+/**
+ * Resolve the effective `parentAgent` for a sling invocation, preserving the
+ * prior session's link on a re-spawn (`--recover`) when `--parent` was not
+ * explicitly passed.
+ *
+ * Pre-fix, sling always read `opts.parent ?? null` and upserted that into the
+ * session row, overwriting the prior `parent_agent` with null whenever a
+ * coordinator/lead invoked `ov sling --recover --name <existing>` without
+ * threading `--parent`. The runner then read `parentAgent === null` and
+ * skipped its in-band `worker_died` notify on a resumed-turn parser stall —
+ * the lead waited forever on a signal that never came (overstory-de3c).
+ *
+ * Resolution rules:
+ *   - **Explicit caller intent wins.** If `opts.parent` is defined (including
+ *     an empty string), use it verbatim. The caller may legitimately want to
+ *     change or clear the parent on re-spawn.
+ *   - **Caller silence preserves linkage.** If `opts.parent` is undefined and
+ *     a prior session row exists with a non-null `parentAgent`, fall back to
+ *     the prior value. Otherwise return null.
+ *
+ * Pure function so the regression test in `sling.test.ts` can assert behavior
+ * without spinning up the full sling command pipeline.
+ */
+export function resolveParentAgent(
+	optsParent: string | undefined,
+	existingSession: { parentAgent: string | null } | null,
+): string | null {
+	if (optsParent !== undefined) {
+		return optsParent;
+	}
+	return existingSession?.parentAgent ?? null;
 }
 
 export interface AutoDispatchOptions {
@@ -163,6 +233,12 @@ export interface AutoDispatchOptions {
 	capability: string;
 	specPath: string | null;
 	parentAgent: string | null;
+	/**
+	 * The agent who invoked `ov sling` (from `OVERSTORY_AGENT_NAME` env var);
+	 * takes precedence over `parentAgent` for the mail `from` field, since
+	 * `--parent` describes the new agent's hierarchical parent, not the slinger.
+	 */
+	slingerName: string | null;
 	instructionPath: string;
 }
 
@@ -179,7 +255,7 @@ export function buildAutoDispatch(opts: AutoDispatchOptions): {
 	subject: string;
 	body: string;
 } {
-	const from = opts.parentAgent ?? "orchestrator";
+	const from = opts.slingerName ?? opts.parentAgent ?? "orchestrator";
 	const specLine = opts.specPath
 		? `Spec file: ${opts.specPath}`
 		: "No spec file provided. Check your overlay for task details.";
@@ -465,6 +541,44 @@ export async function getCurrentBranch(repoRoot: string): Promise<string | null>
 }
 
 /**
+ * Resolve whether to use the headless spawn path for a given runtime + flags + config.
+ *
+ * Precedence (highest first):
+ *   1. runtime.headless === true (statically headless runtimes always use headless)
+ *   2. Explicit --headless / --no-headless flag (boolean | undefined from commander)
+ *   3. config.runtime.claudeHeadlessByDefault (only applies when runtime.id === "claude")
+ *   4. Default: false (tmux)
+ *
+ * Throws ValidationError when --headless is explicitly true but the runtime has no
+ * buildDirectSpawn implementation.
+ */
+export function resolveUseHeadless(
+	runtime: { id: string; headless?: boolean; buildDirectSpawn?: unknown },
+	flag: boolean | undefined,
+	config: OverstoryConfig,
+): boolean {
+	if (runtime.headless === true) return true;
+
+	if (flag === true) {
+		if (typeof runtime.buildDirectSpawn !== "function") {
+			throw new ValidationError(
+				`--headless requires a runtime with headless support. Runtime "${runtime.id}" does not implement buildDirectSpawn.`,
+				{ field: "headless", value: true },
+			);
+		}
+		return true;
+	}
+	if (flag === false) return false;
+
+	if (runtime.id === "claude" && config.runtime?.claudeHeadlessByDefault === true) {
+		if (typeof runtime.buildDirectSpawn !== "function") return false;
+		return true;
+	}
+
+	return false;
+}
+
+/**
  * Entry point for `ov sling <task-id> [flags]`.
  *
  * @param taskId - The task ID to assign to the agent
@@ -483,12 +597,15 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 	let name = nameWasAutoGenerated ? `${capability}-${taskId}` : rawName;
 	const specPath = opts.spec ?? null;
 	const filesRaw = opts.files;
-	const parentAgent = opts.parent ?? null;
+	// Reassigned later when re-spawning an existing agent to preserve the prior
+	// row's parentAgent — see overstory-de3c at the existingSession lookup below.
+	let parentAgent = opts.parent ?? null;
 	const depthStr = opts.depth;
 	const depth = depthStr !== undefined ? Number.parseInt(depthStr, 10) : 0;
 	const forceHierarchy = opts.forceHierarchy ?? false;
 	const skipScout = opts.skipScout ?? false;
 	const skipTaskCheck = opts.skipTaskCheck ?? false;
+	const recover = opts.recover ?? false;
 
 	if (Number.isNaN(depth) || depth < 0) {
 		throw new ValidationError("--depth must be a non-negative integer", {
@@ -558,6 +675,8 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 				.map((f) => f.trim())
 				.filter((f) => f.length > 0)
 		: [];
+
+	const siblings = parseSiblings(opts.siblings);
 
 	// 1. Load config
 	const cwd = process.cwd();
@@ -660,17 +779,34 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 			);
 		}
 
+		// Track the prior session row when re-spawning against an existing agent
+		// name so downstream code can preserve linkage (parentAgent, claudeSessionId)
+		// that the upsert would otherwise erase. Auto-generated names are unique
+		// so there is never a prior row to preserve.
+		let existingSession: AgentSession | null = null;
 		if (nameWasAutoGenerated) {
 			const takenNames = activeSessions.map((s) => s.agentName);
 			name = generateAgentName(capability, taskId, takenNames);
 		} else {
-			const existing = store.getByName(name);
-			if (existing && existing.state !== "zombie" && existing.state !== "completed") {
-				throw new AgentError(`Agent name "${name}" is already in use (state: ${existing.state})`, {
-					agentName: name,
-				});
+			existingSession = store.getByName(name);
+			if (
+				existingSession &&
+				existingSession.state !== "zombie" &&
+				existingSession.state !== "completed"
+			) {
+				throw new AgentError(
+					`Agent name "${name}" is already in use (state: ${existingSession.state})`,
+					{
+						agentName: name,
+					},
+				);
 			}
 		}
+
+		// Preserve the prior session's parentAgent on re-spawn when --parent was
+		// not explicitly passed (overstory-de3c). See `resolveParentAgent` for the
+		// full rationale and resolution rules.
+		parentAgent = resolveParentAgent(opts.parent, existingSession);
 
 		// 5d. Task-level locking: prevent concurrent agents on the same task ID.
 		// Exception: the parent agent may delegate its own task to a child.
@@ -739,11 +875,15 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 				});
 			}
 
-			const workableStatuses = ["open", "in_progress"];
-			if (!workableStatuses.includes(issue.status)) {
+			if (!isTaskWorkable(issue.status, recover)) {
 				throw new ValidationError(
-					`Task "${taskId}" is not workable (status: ${issue.status}). Only open or in_progress issues can be assigned.`,
+					`Task "${taskId}" is not workable (status: ${issue.status}). Only open or in_progress issues can be assigned. Pass --recover to re-dispatch against a closed task.`,
 					{ field: "taskId", value: taskId },
+				);
+			}
+			if (recover && !(WORKABLE_STATUSES as readonly string[]).includes(issue.status)) {
+				process.stderr.write(
+					`Warning: --recover dispatching against task "${taskId}" with status "${issue.status}". Previous owner may have exited unexpectedly.\n`,
 				);
 			}
 		}
@@ -838,6 +978,7 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 				trackerCli: trackerCliName(resolvedBackend),
 				trackerName: resolvedBackend,
 				instructionPath: runtime.instructionPath,
+				siblings,
 			};
 
 			await writeOverlay(worktreePath, overlayConfig, config.project.root, runtime.instructionPath);
@@ -845,22 +986,32 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 			// 9. Resolve runtime + model (needed for deployConfig, spawn, and beacon)
 			const resolvedModel = resolveModel(config, manifest, capability, agentDef.model);
 
-			// 9a. Deploy hooks config (capability-specific guards)
+			// 9a. Resolve headless mode before deployConfig so hooks can be skipped for headless agents.
+			// resolveUseHeadless is also used at 11c for spawn routing — hoisted here to share the value.
+			const useHeadless = resolveUseHeadless(runtime, opts.headless, config);
+
+			// 9b. Deploy hooks config (capability-specific guards). In headless mode we deploy
+			// a PreToolUse-only subset (security guards) — overstory-e24b. Headless Claude Code
+			// dispatches settings.local.json hooks, so dropping them would leave destructive
+			// commands unblocked.
 			await runtime.deployConfig(worktreePath, undefined, {
 				agentName: name,
 				capability,
 				worktreePath,
 				qualityGates: config.project.qualityGates,
+				isHeadless: useHeadless,
 			});
 
 			// 9b. Send auto-dispatch mail so it exists when SessionStart hook fires.
 			// This eliminates the race where coordinator sends dispatch AFTER agent boots.
+			const slingerName = process.env.OVERSTORY_AGENT_NAME?.trim() || null;
 			const dispatch = buildAutoDispatch({
 				agentName: name,
 				taskId,
 				capability,
 				specPath: absoluteSpecPath,
 				parentAgent,
+				slingerName,
 				instructionPath: runtime.instructionPath,
 			});
 			const mailStore = createMailStore(join(overstoryDir, "mail.db"));
@@ -918,41 +1069,51 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 			}
 
 			// 11c. Spawn: headless runtimes bypass tmux entirely; tmux path is unchanged.
-			if (runtime.headless === true && runtime.buildDirectSpawn) {
-				const directEnv = {
-					...runtime.buildEnv(resolvedModel),
-					OVERSTORY_AGENT_NAME: name,
-					OVERSTORY_WORKTREE_PATH: worktreePath,
-					OVERSTORY_TASK_ID: taskId,
-				};
-				const argv = runtime.buildDirectSpawn({
-					cwd: worktreePath,
-					env: directEnv,
-					...(resolvedModel.isExplicitOverride ? { model: resolvedModel.model } : {}),
-					instructionPath: runtime.instructionPath,
-				});
+			// useHeadless was resolved at step 9a (hoisted so deployConfig can skip hooks for headless).
+			if (useHeadless && runtime.buildDirectSpawn) {
+				// Phase 3 spawn-per-turn: headless agents have NO long-lived process.
+				// sling builds the initial prompt, upserts the session row in
+				// "booting", then drives the first user turn synchronously through
+				// `runTurn`. The runner spawns claude with `--resume` (when a prior
+				// session id exists), writes the prompt to a real stdin pipe, drains
+				// stream-json, captures session id, transitions state to "working"
+				// (or "completed" if terminal mail observed), and exits. No persistent
+				// process remains after this returns; subsequent turns are driven by
+				// `ov serve` (mail) or `ov nudge`.
+				// `existingSession` was captured during the name-collision check (above).
+				// Re-using it here keeps re-spawn linkage (parentAgent + claudeSessionId)
+				// resolved from the same row.
+				const priorClaudeSessionId = existingSession?.claudeSessionId ?? null;
 
-				// Create a timestamped log dir for this headless agent session.
-				// Always redirect stdout to a file. This prevents SIGPIPE death:
-				// ov sling exits after spawning, closing the pipe's read end.
-				// If stdout is a pipe, the agent dies on the next write (SIGPIPE).
-				// File writes have no such limit, and the agent survives the CLI exit.
-				//
-				// Note: RPC connection wiring is intentionally omitted here. The RPC pipe
-				// is only useful when the spawner stays alive to consume it. ov sling is
-				// a short-lived CLI — any connection created here dies with the process.
-				const logTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
-				const agentLogDir = join(overstoryDir, "logs", name, logTimestamp);
-				mkdirSync(agentLogDir, { recursive: true });
+				// Build the initial prompt (mulch expertise + pending mail + beacon)
+				// as the first user turn.
+				const pendingMailStore = createMailStore(join(overstoryDir, "mail.db"));
+				let initialPrompt: string;
+				try {
+					const pendingMailClient = createMailClient(pendingMailStore);
+					const pendingMessages = pendingMailClient.check(name);
+					const mailSection = formatMailSection(pendingMessages);
+					const beacon = buildBeacon({
+						agentName: name,
+						capability,
+						taskId,
+						parentAgent,
+						depth,
+						instructionPath: runtime.instructionPath,
+					});
+					initialPrompt = buildInitialHeadlessPrompt(
+						mulchExpertise,
+						mailSection || undefined,
+						beacon,
+					);
+				} finally {
+					pendingMailStore.close();
+				}
 
-				const headlessProc = await spawnHeadlessAgent(argv, {
-					cwd: worktreePath,
-					env: { ...(process.env as Record<string, string>), ...directEnv },
-					stdoutFile: join(agentLogDir, "stdout.log"),
-					stderrFile: join(agentLogDir, "stderr.log"),
-				});
-
-				// 13. Record session with empty tmuxSession (no tmux pane for headless agents).
+				// 13. Record session BEFORE runTurn so the runner reads it under its
+				// lock. pid is null — there is no persistent process; the runner
+				// publishes a per-turn PID via .overstory/agents/<name>/turn.pid for
+				// the duration of each turn. Carry priorClaudeSessionId (mx-5c5ae6).
 				const session: AgentSession = {
 					id: `session-${Date.now()}-${name}`,
 					agentName: name,
@@ -962,7 +1123,7 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 					taskId: taskId,
 					tmuxSession: "",
 					state: "booting",
-					pid: headlessProc.pid,
+					pid: null,
 					parentAgent: parentAgent,
 					depth,
 					runId,
@@ -971,15 +1132,28 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 					escalationLevel: 0,
 					stalledSince: null,
 					transcriptPath: null,
+					...(priorClaudeSessionId !== null ? { claudeSessionId: priorClaudeSessionId } : {}),
 				};
 				store.upsert(session);
 
-				const runStore = createRunStore(join(overstoryDir, "sessions.db"));
-				try {
-					runStore.incrementAgentCount(runId);
-				} finally {
-					runStore.close();
-				}
+				// Drive the first user turn synchronously. runTurn manages spawn,
+				// stdin write+EOF, event drain, session_id capture, terminal-mail
+				// detection, and state transition.
+				const turnResult = await runTurn({
+					agentName: name,
+					capability,
+					overstoryDir,
+					worktreePath,
+					projectRoot: config.project.root,
+					taskId,
+					userTurnNdjson: initialPrompt,
+					runtime,
+					resolvedModel,
+					runId,
+					mailDbPath: join(overstoryDir, "mail.db"),
+					eventsDbPath: join(overstoryDir, "events.db"),
+					sessionsDbPath: join(overstoryDir, "sessions.db"),
+				});
 
 				// 14. Output result (headless)
 				if (opts.json ?? false) {
@@ -990,21 +1164,26 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 						branch: branchName,
 						worktree: worktreePath,
 						tmuxSession: "",
-						pid: headlessProc.pid,
+						pid: null,
+						initialTurnFinalState: turnResult.finalState,
+						claudeSessionId: turnResult.newSessionId,
 					});
 				} else {
-					printSuccess("Agent launched (headless)", name);
-					process.stdout.write(`   Task:     ${taskId}\n`);
-					process.stdout.write(`   Branch:   ${branchName}\n`);
-					process.stdout.write(`   Worktree: ${worktreePath}\n`);
-					process.stdout.write(`   PID:      ${headlessProc.pid}\n`);
+					printSuccess("Agent launched (headless, spawn-per-turn)", name);
+					process.stdout.write(`   Task:                  ${taskId}\n`);
+					process.stdout.write(`   Branch:                ${branchName}\n`);
+					process.stdout.write(`   Worktree:              ${worktreePath}\n`);
+					process.stdout.write(`   First-turn state:      ${turnResult.finalState}\n`);
+					if (turnResult.newSessionId) {
+						process.stdout.write(`   Claude session id:     ${turnResult.newSessionId}\n`);
+					}
 				}
 			} else {
 				// 11c. Preflight: verify tmux is available before attempting session creation
 				await ensureTmuxAvailable();
 
 				// 12. Create tmux session running claude in interactive mode
-				const tmuxSessionName = `overstory-${config.project.name}-${name}`;
+				const tmuxSessionName = `overstory-${sanitizeTmuxName(config.project.name)}-${name}`;
 				const spawnCmd = runtime.buildSpawnCommand({
 					model: resolvedModel.model,
 					permissionMode: "bypass",
@@ -1015,6 +1194,7 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 						OVERSTORY_AGENT_NAME: name,
 						OVERSTORY_WORKTREE_PATH: worktreePath,
 						OVERSTORY_TASK_ID: taskId,
+						OVERSTORY_PROJECT_ROOT: config.project.root,
 					},
 				});
 				const pid = await createSession(tmuxSessionName, worktreePath, spawnCmd, {
@@ -1022,6 +1202,7 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 					OVERSTORY_AGENT_NAME: name,
 					OVERSTORY_WORKTREE_PATH: worktreePath,
 					OVERSTORY_TASK_ID: taskId,
+					OVERSTORY_PROJECT_ROOT: config.project.root,
 				});
 
 				// 13. Record session BEFORE sending the beacon so that hook-triggered
@@ -1050,14 +1231,6 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 
 				store.upsert(session);
 
-				// Increment agent count for the run
-				const runStore = createRunStore(join(overstoryDir, "sessions.db"));
-				try {
-					runStore.incrementAgentCount(runId);
-				} finally {
-					runStore.close();
-				}
-
 				// 13b. Give slow shells time to finish initializing before polling for TUI readiness.
 				const shellDelay = config.runtime?.shellInitDelayMs ?? 0;
 				if (shellDelay > 0) {
@@ -1072,7 +1245,10 @@ export async function slingCommand(taskId: string, opts: SlingOptions): Promise<
 				);
 				if (!tuiReady) {
 					const alive = await isSessionAlive(tmuxSessionName);
-					store.updateState(name, "completed");
+					// Mark as zombie (not completed) so the watchdog detects this failed
+					// startup. 'completed' is a terminal success state that the watchdog
+					// skips entirely (overstory-c40e).
+					store.updateState(name, "zombie");
 
 					if (alive) {
 						await killSession(tmuxSessionName);

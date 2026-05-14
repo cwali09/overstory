@@ -7,9 +7,9 @@
  */
 
 import { join } from "node:path";
-import { Command } from "commander";
+import { Command, CommanderError } from "commander";
 import { resolveProjectRoot } from "../config.ts";
-import { ValidationError } from "../errors.ts";
+import { MailError, ValidationError } from "../errors.ts";
 import { createEventStore } from "../events/store.ts";
 import { jsonOutput } from "../json.ts";
 import { accent, printHint, printSuccess } from "../logging/color.ts";
@@ -253,6 +253,7 @@ interface ListOpts {
 	to?: string;
 	agent?: string;
 	unread?: boolean;
+	type?: string;
 	json?: boolean;
 }
 
@@ -400,6 +401,30 @@ async function handleSend(opts: SendOpts, cwd: string): Promise<void> {
 			}
 
 			return; // Early return — broadcast handled
+		} finally {
+			sessionStore.close();
+		}
+	}
+
+	// Reject sends to agents in a terminal state (completed/zombie).
+	// `installMailInjectors` reaps the per-agent dispatch loop the moment a
+	// session lands in a terminal state (serve.ts:378), so any mail addressed
+	// after that point would sit unread forever with no way to surface it.
+	// Sessions with no row at all (orchestrator, coordinator, operator roles)
+	// fall through — we only know about agents tracked in SessionStore.
+	// Group addresses already skip terminal agents via `getActive()`.
+	{
+		const overstoryDir = join(cwd, ".overstory");
+		const { store: sessionStore } = openSessionStore(overstoryDir);
+		try {
+			const recipient = sessionStore.getByName(to);
+			if (recipient && (recipient.state === "completed" || recipient.state === "zombie")) {
+				throw new MailError(
+					`Recipient "${to}" is in terminal state (${recipient.state}); message not sent. ` +
+						`The agent is no longer running, so this message would never be delivered.`,
+					{ agentName: to },
+				);
+			}
 		} finally {
 			sessionStore.close();
 		}
@@ -603,9 +628,20 @@ function handleList(opts: ListOpts, cwd: string): void {
 	const unread = opts.unread ? true : undefined;
 	const json = opts.json ?? false;
 
+	let type: MailMessageType | undefined;
+	if (opts.type !== undefined) {
+		if (!MAIL_MESSAGE_TYPES.includes(opts.type as MailMessageType)) {
+			throw new ValidationError(
+				`Invalid --type "${opts.type}". Must be one of: ${MAIL_MESSAGE_TYPES.join(", ")}`,
+				{ field: "type", value: opts.type },
+			);
+		}
+		type = opts.type as MailMessageType;
+	}
+
 	const client = openClient(cwd);
 	try {
-		const messages = client.list({ from, to, unread });
+		const messages = client.list({ from, to, unread, type });
 
 		if (json) {
 			jsonOutput("mail list", { messages });
@@ -732,8 +768,8 @@ export async function mailCommand(args: string[]): Promise<void> {
 
 	program
 		.command("check")
-		.description("Check inbox (unread messages)")
-		.option("--agent <name>", "Agent name")
+		.description("Check inbox for one agent and mark unread as read (per-agent scope)")
+		.option("--agent <name>", "Agent name (default: orchestrator)")
 		.option("--inject", "Inject format for hook context")
 		.option("--json", "Output as JSON")
 		.option("--debounce <ms>", "Debounce interval in milliseconds")
@@ -744,11 +780,12 @@ export async function mailCommand(args: string[]): Promise<void> {
 
 	program
 		.command("list")
-		.description("List messages with filters")
+		.description("List messages with filters (system-wide unless --to/--agent given)")
 		.option("--from <name>", "Filter by sender")
-		.option("--to <name>", "Filter by recipient")
+		.option("--to <name>", "Filter by recipient (scopes to one agent)")
 		.option("--agent <name>", "Alias for --to (filter by recipient)")
-		.option("--unread", "Show only unread messages")
+		.option("--unread", "Show only unread messages (does NOT mark them read)")
+		.option("--type <type>", "Filter by message type")
 		.option("--json", "Output as JSON")
 		.exitOverride()
 		.action((opts: ListOpts) => {
@@ -789,5 +826,23 @@ export async function mailCommand(args: string[]): Promise<void> {
 			handlePurge(opts, root);
 		});
 
-	await program.parseAsync(["node", "overstory-mail", ...args]);
+	try {
+		await program.parseAsync(["node", "overstory-mail", ...args]);
+	} catch (err) {
+		// `exitOverride()` turns Commander's help paths into thrown
+		// CommanderErrors after the help text was already written to stdout.
+		// Swallow both the explicit `--help` path (commander.helpDisplayed,
+		// exitCode 0) and the missing-subcommand path (commander.help,
+		// exitCode 1) — the user got what they asked for.
+		if (
+			err instanceof CommanderError &&
+			(err.code === "commander.helpDisplayed" || err.code === "commander.help")
+		) {
+			if (err.exitCode !== 0) {
+				process.exitCode = err.exitCode;
+			}
+			return;
+		}
+		throw err;
+	}
 }

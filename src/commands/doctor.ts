@@ -16,6 +16,7 @@ import { checkEcosystem } from "../doctor/ecosystem.ts";
 import { checkLogs } from "../doctor/logs.ts";
 import { checkMergeQueue } from "../doctor/merge-queue.ts";
 import { checkProviders } from "../doctor/providers.ts";
+import { checkServe } from "../doctor/serve.ts";
 import { checkStructure } from "../doctor/structure.ts";
 import type { DoctorCategory, DoctorCheck, DoctorCheckFn } from "../doctor/types.ts";
 import { checkVersion } from "../doctor/version.ts";
@@ -39,6 +40,7 @@ const ALL_CHECKS: Array<{ category: DoctorCategory; fn: DoctorCheckFn }> = [
 	{ category: "ecosystem", fn: checkEcosystem },
 	{ category: "providers", fn: checkProviders },
 	{ category: "watchdog", fn: checkWatchdog },
+	{ category: "serve", fn: checkServe },
 ];
 
 /**
@@ -158,10 +160,81 @@ export interface DoctorCommandOptions {
 	checkRunners?: Array<{ category: DoctorCategory; fn: DoctorCheckFn }>;
 }
 
+interface DoctorActionOpts {
+	json?: boolean;
+	verbose?: boolean;
+	category?: string;
+	fix?: boolean;
+}
+
 /**
- * Create the Commander command for `overstory doctor`.
+ * Run the doctor checks. Returns true if any check failed.
+ * Shared by both the Commander action and the programmatic entry point so the
+ * exit-code signal never has to travel through `process.exitCode` (which is
+ * global mutable state and races with other tests in parallel bun test runs).
  */
-export function createDoctorCommand(options?: DoctorCommandOptions): Command {
+async function runDoctorChecks(
+	opts: DoctorActionOpts,
+	checkRunners: Array<{ category: DoctorCategory; fn: DoctorCheckFn }>,
+): Promise<boolean> {
+	const json = opts.json ?? false;
+	const verbose = opts.verbose ?? false;
+	const categoryFilter = opts.category;
+	const fix = opts.fix ?? false;
+
+	if (categoryFilter !== undefined) {
+		const validCategories = ALL_CHECKS.map((c) => c.category);
+		if (!validCategories.includes(categoryFilter as DoctorCategory)) {
+			throw new ValidationError(
+				`Invalid category: ${categoryFilter}. Valid categories: ${validCategories.join(", ")}`,
+				{
+					field: "category",
+					value: categoryFilter,
+				},
+			);
+		}
+	}
+
+	const cwd = process.cwd();
+	const config = await loadConfig(cwd);
+	const overstoryDir = join(config.project.root, ".overstory");
+
+	const checksToRun = categoryFilter
+		? checkRunners.filter((c) => c.category === categoryFilter)
+		: checkRunners;
+
+	let results: DoctorCheck[] = [];
+	for (const { fn } of checksToRun) {
+		const checkResults = await fn(config, overstoryDir);
+		results.push(...checkResults);
+	}
+
+	let fixedItems: string[] | undefined;
+	if (fix) {
+		const applied = await applyFixes(results);
+		if (applied.length > 0) {
+			fixedItems = applied;
+			results = [];
+			for (const { fn } of checksToRun) {
+				const checkResults = await fn(config, overstoryDir);
+				results.push(...checkResults);
+			}
+		}
+	}
+
+	if (json) {
+		printJSON(results, fixedItems);
+	} else {
+		printHumanReadable(results, verbose, checkRunners, fixedItems);
+	}
+
+	return results.some((c) => c.status === "fail");
+}
+
+function buildDoctorCommand(
+	onResult: (hasFailures: boolean) => void,
+	checkRunners: Array<{ category: DoctorCategory; fn: DoctorCheckFn }>,
+): Command {
 	return new Command("doctor")
 		.description("Run health checks on overstory setup")
 		.option("--json", "Output as JSON")
@@ -170,75 +243,22 @@ export function createDoctorCommand(options?: DoctorCommandOptions): Command {
 		.option("--fix", "Attempt to auto-fix issues")
 		.addHelpText(
 			"after",
-			"\nCategories: dependencies, structure, config, databases, consistency, agents, merge, logs, version, ecosystem, providers, watchdog",
+			"\nCategories: dependencies, structure, config, databases, consistency, agents, merge, logs, version, ecosystem, providers, watchdog, serve",
 		)
-		.action(
-			async (opts: { json?: boolean; verbose?: boolean; category?: string; fix?: boolean }) => {
-				const json = opts.json ?? false;
-				const verbose = opts.verbose ?? false;
-				const categoryFilter = opts.category;
-				const fix = opts.fix ?? false;
+		.action(async (opts: DoctorActionOpts) => {
+			onResult(await runDoctorChecks(opts, checkRunners));
+		});
+}
 
-				// Validate category filter if provided
-				if (categoryFilter !== undefined) {
-					const validCategories = ALL_CHECKS.map((c) => c.category);
-					if (!validCategories.includes(categoryFilter as DoctorCategory)) {
-						throw new ValidationError(
-							`Invalid category: ${categoryFilter}. Valid categories: ${validCategories.join(", ")}`,
-							{
-								field: "category",
-								value: categoryFilter,
-							},
-						);
-					}
-				}
-
-				const cwd = process.cwd();
-				const config = await loadConfig(cwd);
-				const overstoryDir = join(config.project.root, ".overstory");
-
-				// Filter checks by category if specified
-				const allChecks = options?.checkRunners ?? ALL_CHECKS;
-				const checksToRun = categoryFilter
-					? allChecks.filter((c) => c.category === categoryFilter)
-					: allChecks;
-
-				// Run all checks sequentially
-				let results: DoctorCheck[] = [];
-				for (const { fn } of checksToRun) {
-					const checkResults = await fn(config, overstoryDir);
-					results.push(...checkResults);
-				}
-
-				// Apply fixes if requested
-				let fixedItems: string[] | undefined;
-				if (fix) {
-					const applied = await applyFixes(results);
-					if (applied.length > 0) {
-						fixedItems = applied;
-						// Re-run all checks to get fresh results after fixes
-						results = [];
-						for (const { fn } of checksToRun) {
-							const checkResults = await fn(config, overstoryDir);
-							results.push(...checkResults);
-						}
-					}
-				}
-
-				// Output results
-				if (json) {
-					printJSON(results, fixedItems);
-				} else {
-					printHumanReadable(results, verbose, allChecks, fixedItems);
-				}
-
-				// Set exit code if any check failed
-				const hasFailures = results.some((c) => c.status === "fail");
-				if (hasFailures) {
-					process.exitCode = 1;
-				}
-			},
-		);
+/**
+ * Create the Commander command for `overstory doctor`.
+ */
+export function createDoctorCommand(options?: DoctorCommandOptions): Command {
+	return buildDoctorCommand((hasFailures) => {
+		if (hasFailures) {
+			process.exitCode = 1;
+		}
+	}, options?.checkRunners ?? ALL_CHECKS);
 }
 
 /**
@@ -250,16 +270,15 @@ export async function doctorCommand(
 	args: string[],
 	options?: DoctorCommandOptions,
 ): Promise<number | undefined> {
-	const cmd = createDoctorCommand(options);
+	let hasFailures = false;
+	const cmd = buildDoctorCommand((result) => {
+		hasFailures = result;
+	}, options?.checkRunners ?? ALL_CHECKS);
 	cmd.exitOverride();
-
-	const prevExitCode = process.exitCode as number | undefined;
-	process.exitCode = undefined;
 
 	try {
 		await cmd.parseAsync(args, { from: "user" });
 	} catch (err: unknown) {
-		process.exitCode = prevExitCode;
 		if (err && typeof err === "object" && "code" in err) {
 			const code = (err as { code: string }).code;
 			if (code === "commander.helpDisplayed" || code === "commander.version") {
@@ -269,7 +288,5 @@ export async function doctorCommand(
 		throw err;
 	}
 
-	const exitCode = process.exitCode === 1 ? 1 : undefined;
-	process.exitCode = prevExitCode;
-	return exitCode;
+	return hasFailures ? 1 : undefined;
 }

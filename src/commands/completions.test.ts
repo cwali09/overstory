@@ -12,7 +12,10 @@ import {
 } from "./completions.ts";
 
 afterEach(() => {
-	process.exitCode = undefined;
+	// Use 0 not undefined — Bun doesn't reliably clear a nonzero exitCode when
+	// reassigned to undefined (see prior fix f3fde1a). If the 1 from completion
+	// tests leaks to bun test's shutdown, the suite exits 1 with 0 test failures.
+	process.exitCode = 0;
 });
 
 describe("COMMANDS array", () => {

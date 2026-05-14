@@ -7,6 +7,347 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-05-02
+
+### Added
+
+#### Spawn-per-turn substates split (overstory-3087)
+- **`in_turn` and `between_turns` AgentState variants** — split the legacy `working` state for spawn-per-turn workers so the UI distinguishes a worker actively executing a turn from one idling between mail batches. The turn-runner advances `between_turns → in_turn` on first parser event of a fresh turn and settles back `in_turn → between_turns` when the turn ends without a terminal mail. `working` remains the active state for tmux/long-lived headless capabilities (coordinator, orchestrator, monitor, sapling). Spawn-per-turn workers (builder/scout/reviewer/lead/merger under the headless default) transition through `in_turn ↔ between_turns` instead.
+- **`migrateRelaxStateCheck`** — drops the SQLite inline `CHECK(state IN (...))` constraint on `sessions.state` so future state extensions don't require schema rebuilds. Detects the constraint via `sqlite_master.sql` and rebuilds the table inside a transaction (copy → drop → rename); idempotent. Type system enforces values at writer boundary.
+- **`getActive()` widened** to return `booting | working | in_turn | between_turns | stalled` so watchdog/dashboards see spawn-per-turn workers as alive.
+- **Transition matrix updated** — `in_turn` and `between_turns` cycle freely; both can advance forward to `stalled`/`zombie`/`completed`. Kept separate from the tmux/long-lived `working` rank — neither lists `working` as a predecessor.
+
+#### Scope-violation detection + parallel sibling guidance (overstory-9f4d, overstory-f76a)
+- **`src/agents/scope-detect.ts`** — soft, advisory detection of files modified outside the agent's declared FILE_SCOPE without an `expansion_reason:` justification. Builder/merger only (`IMPLEMENTATION_CAPABILITIES`); read-only roles (scout/reviewer/lead) are no-ops. Glob-aware (`Bun.Glob`) and supports literal scope entries. Pre-existing `scope_expansion`-prefixed status mail from the agent suppresses the warning. Observability only — never a hard block; all errors swallowed.
+- **`ov sling --siblings <names>`** — comma-separated parallel sibling agent names. Renders a "Parallel Siblings" section into the overlay with rebase-before-`merge_ready` guidance so siblings working in adjacent files coordinate without conflict-amplification at merge time. `OverlayConfig.siblings` plumbed through sling → overlay generator → builder. `parseSiblings()` exported for unit tests.
+- **`resolveParentAgent()`** — preserves the prior session's `parent_agent` on `ov sling --recover` when `--parent` is not explicitly passed. Pre-fix, the recover path overwrote `parentAgent` with null whenever a coordinator/lead invoked `ov sling --recover --name <existing>` without threading `--parent`, and the runner's in-band `worker_died` notify on a resumed-turn parser stall silently skipped — leaving the lead waiting forever.
+
+#### Conflict prediction in `ov merge --dry-run` (overstory-inxu)
+- **`src/merge/predict.ts`** — side-effect-free `predictConflicts()` using `git merge-tree --write-tree --merge-base=<base> <ours> <theirs>` to compute the conflict set without mutating HEAD, the working tree, or the merge lock. Each conflict file is classified into a predicted resolution tier by reusing the same primitives the live resolver uses (`hasContentfulCanonical`, `checkMergeUnion`), so prediction stays in lock step with how `ov merge` would actually behave. Requires git ≥ 2.38.
+- **`ov merge --dry-run`** and **`ov merge --all --dry-run`** print the predicted tier, conflict files, and a short operator-readable reason. JSON output exposes the full `ConflictPrediction` envelope including `wouldRequireAgent` (true for ai-resolve / reimagine tiers) so a lead/operator/greenhouse can branch on agent-required vs auto-mergeable. Per-entry prediction failures are swallowed into a deterministic `ai-resolve` envelope so `--all --dry-run` keeps going.
+- **`ConflictPrediction`** type added to `src/types.ts`.
+- **Lead dispatch overlay** receives merge-prediction guidance so leads can sequence `merger` agents based on predicted tier.
+
+#### Quality-gate outcome status threaded into mulch records
+- **`src/insights/quality-gates.ts`** — `runQualityGates(gates, cwd)` runs each configured quality gate (test/lint/typecheck) at session-end and aggregates into `success` (all passed), `failure` (none passed), or `partial` (mixed). `hasWorkToVerify(worktreePath, baseRef)` cheap precheck lets read-only agents (scout/reviewer) skip gate execution entirely when no commits or uncommitted changes exist.
+- **`autoRecordExpertise` and `appendOutcomeToAppliedRecords`** thread `outcomeStatus` into every session-end mulch record write so confirmation scoring reflects whether tests/lint/typecheck actually passed. The outcome appears in record `outcomes[].status` and as a `Quality gates: <status>` note on applied-record outcomes.
+
+#### Bash mail-poll runtime backstop (overstory-c92c)
+- **`src/agents/mail-poll-detect.ts`** — defense-in-depth detector for forbidden Bash mail-polling patterns. The lead.md prompt forbids the pattern (overstory-fa84) as the primary mitigation; this is the runtime backstop if a future overlay or contributed agent definition silently reintroduces it. Detects `until`/`while` loops where the condition references `ov mail check`/`ov mail list` (directly, negated with `!`, or wrapped in `[ "$(...)" ... ]`) and the body contains `sleep`. Bounded `for` loops are never classified — `for i in 1 2 3; do ov mail send ...; done` is a legitimate batched send. Warn-only via custom event surfaced in `ov logs`/`ov feed`/UI.
+
+#### Worktree creation pre-check (overstory-6878)
+- **`WorktreeManager` pre-check rejects creation when branch is already checked out** elsewhere in the repo. Pre-fix, `git worktree add` reported success but produced an unusable worktree at the contested branch.
+- **Validates worktree creation before reporting success** — the manager confirms the worktree directory exists and is registered with git before returning.
+
+#### Per-event runner stall recovery (overstory-8e61)
+- **`lastActivity` refreshed inside the parser loop** on every event (throttled at `lastActivityRefreshIntervalMs`, default 2000ms) so a long turn doesn't appear stalled to the watchdog mid-flight. The watchdog at `src/watchdog/health.ts` documents its design as "the turn-runner updates lastActivity on every parser event during a turn, and the watchdog refreshes it from events.db between turns" — pre-fix, the runner only updated lastActivity at turn boundaries, so multi-minute turns were zombified despite live tool events.
+- **`_onLastActivityRefresh` test injection hook** lets tests count refresh attempts directly rather than inferring from observable timestamps.
+
+### Fixed
+
+#### Coordinator + sling
+- **`fix(coordinator)`: detect leftover watchdog before spawning (overstory-3f0c)** — coordinator startup now detects an orphaned watchdog from a prior run and aligns orphan-watchdog detection with the lead's spec, preventing duplicate watchdog daemons and the resulting double-zombie-classification storms.
+- **`fix(sling)`: use slinger env var for auto-dispatch `from` field (overstory-235f)** — `--parent` describes the new agent's hierarchical parent, not the slinger; auto-dispatch mail now reads `OVERSTORY_AGENT_NAME` for the `from` field and falls back to `parentAgent` only when unset.
+- **`fix(watchdog): never call tmux.killSession("") for headless agents`** — empty `tmux_session` (the spawn-per-turn convention; cleared on terminal transitions per overstory-14c0) no longer triggers a doomed `tmux kill-session ""` invocation that flooded stderr.
+- **`fix(agents): forbid lead Bash mail polling, document spawn-per-turn turn boundary (overstory-fa84)`** — lead.md updated; the lead capability does not have a "wait for mail" loop because spawn-per-turn means the lead exits between turns and is re-spawned by the mail-injection loop on new mail.
+
+#### CI + tests
+- **`ci`: build UI before tests** so root `bun test` can resolve react and `ui/dist`.
+- **`fix(tests)`: lead close-gate and serve static fallback tests CI-safe** — removed environment assumptions that diverged between local dev and the GitHub Actions runner.
+
+### Changed
+
+#### UI consolidation (overstory-e174)
+- **`ui/src/routes/mail/{api,ws}.ts` consolidated into `ui/src/lib/{api,ws}.ts`** — mail-route shims deleted; consumers point directly at `lib/*`. Reduces the in-tree surface area of duplicate fetch/WS plumbing.
+
+### Testing
+
+- 4374 tests across 137 files (10285 `expect()` calls) — up from 4213 / 133 / 9935 in 0.10.3
+- New `src/agents/mail-poll-detect.test.ts` (153 lines) covering loop-construct detection, negation/subshell variants, `for`-loop exclusion
+- New `src/agents/scope-detect.test.ts` (190 lines) covering glob matching, expansion-reason suppression, capability gating
+- New `src/insights/quality-gates.test.ts` (141 lines) covering `success`/`partial`/`failure` aggregation and `hasWorkToVerify` precheck
+- New `src/merge/predict.test.ts` (387 lines) covering tier classification, error envelopes, integration with the live resolver primitives
+- New `src/commands/coordinator.test.ts`, `src/commands/log.test.ts`, `src/commands/merge.test.ts`, `src/commands/sling.test.ts`, `src/commands/stop.test.ts` for the recovery, prediction-output, and parent-resolution paths above
+- Expanded coverage in `src/agents/turn-runner.test.ts` (mail-poll detection, scope-violation events, mid-turn `lastActivity` refresh), `src/sessions/store.test.ts` (substate transitions, `migrateRelaxStateCheck` idempotency), `src/worktree/manager.test.ts` (creation pre-check), and `src/watchdog/{daemon,health}.test.ts` (substate-aware health evaluation)
+
+## [0.10.3] - 2026-04-30
+
+### Added
+
+#### Recovery + parent-notification primitives
+- **`ov sling --recover`** (overstory-629f) — re-dispatch a fresh agent against an already-closed task. Bypasses the workable-status check via a new `isTaskWorkable` helper so a coordinator can recover when a lead exits without sending `merge_ready` and the task was auto-closed. The terminal-state nudge error now embeds the exact `ov sling --recover` form as a copy-paste recovery hint.
+- **Watchdog `worker_died` mail to parent** (overstory-c111) — the watchdog now sends a synthetic `worker_died` protocol mail from a dead child to `session.parentAgent` on first transition to `zombie`, fixing the #1 systemic cause of zombie cascades (parents blocking forever on `worker_done` that will never arrive). Dedup via pre-tick state-snapshot prevents re-fire on idempotent zombie→zombie transitions. Gated by `watchdog.notifyParentOnDeath` (default `true`).
+- **Runner-synthesized `worker_died` for in-band gaps** (overstory-4159, overstory-c772) — when a turn ends with `finalState=zombie` (runner aborted the subprocess) or `terminalMailMissing` (claude exited cleanly without sending the expected terminal mail), the runner itself emits `worker_died` so leads don't block when out-of-band death detection misses. `WorkerDiedPayload.terminatedBy` gains a `"runner"` variant.
+- **Per-event stall watchdog in spawn-per-turn engine** (overstory-ddb3) — `eventStallTimeoutMs` (default 600000ms) arms before parser iteration and resets on every parser event; on timeout the runner kills claude via the existing SIGTERM/SIGKILL escalation. Stall-aborted turns settle to `zombie`. Pre-fix a hung claude (Anthropic API stall, deadlock) hung the runner indefinitely. `TurnResult` gains `stallAborted` and `terminalMailMissing` booleans for caller-side auditing.
+- **`docs/direction-multi-swarm-and-containers.md`** — design/direction note for the next axis after the headless / UI-first shift: one always-running surface for many concurrent swarms, then per-swarm container isolation. Extends `docs/direction-ui-and-ipc.md`.
+
+### Changed
+
+#### Default port + spawn-per-turn observability
+- **`ov serve` default port is 7321** (overstory-eaba) — Colima's SSH mux tunnel and other dev proxies (Tomcat / Jenkins / Docker) listen on 8080, and the kernel routes `*:8080` vs `127.0.0.1:8080` inconsistently. Users saw foreign error JSON instead of the overstory UI. The constant is hoisted into `DEFAULT_SERVE_PORT` and imported by `dev.ts` and `doctor/serve.ts` so the three sites can't drift again.
+- **`PERSISTENT_CAPABILITIES` consolidated into a single source of truth** (overstory-2724, Phase 4 of the spawn-per-turn epic) — hoists the previously duplicated sets out of `log.ts`, `watchdog/health.ts`, and `watchdog/daemon.ts` into `src/agents/capabilities.ts`. Two sets now live there as canonical: `PERSISTENT_CAPABILITIES = {coordinator, orchestrator, monitor}` (watchdog stale/zombie exemption + run-completion accounting) and `STOP_HOOK_PERSISTENT_CAPABILITIES = PERSISTENT_CAPABILITIES + lead` (gates the per-turn Stop hook in `log.ts`). The split is load-bearing — tmux-mode leads span many model turns within a single dispatch, so the per-turn Stop hook is NOT a "done" signal, but leads still exit at terminal `worker_done` and should count toward run-completion.
+- **`agents/lead.md` tightened to coordination-only** (overstory-3172) — the lead capability docs advertised Edit/Write/git add/git commit, but the deployed PreToolUse hooks unconditionally block those for `lead`. Resolution is to tighten the docs, not loosen the hooks: forced delegation is the value proposition of the lead capability. Rewrote propulsion-principle, role, capabilities, constraints, failure-modes (replaced `UNNECESSARY_SPAWN` with `LEAD_DOES_WORK`), task-complexity-assessment (Simple Tasks now spawns a builder + self-verifies), and Phase 2 (use `ov spec write` CLI with `$OVERSTORY_PROJECT_ROOT` paths). `agents/coordinator.md` updated so `--dispatch-max-agents 1/2` means the lead spends slots on builders only (skipping scouts/reviewers, self-verifying), not that the lead acts as a worker. `src/agents/overlay.ts` MAX AGENTS=1/2 directive text rewritten to match.
+- **`ov mail send` rejects sends to terminal-state recipients** (overstory-f5be) — once an agent transitions to `completed`/`zombie`, `installMailInjectors` reaps the dispatch loop, so any mail addressed after that would sit unread forever. `handleSend` now checks the recipient's session state before insert and throws `MailError` on terminal states. Recipients without a session row (orchestrator, coordinator, operator roles) and group addresses are unaffected.
+
+### Fixed
+
+#### Spawn-per-turn engine + state machine
+- **`runs.agent_count` derived from sessions table at read time** (overstory-8e69) — the cached column drifted because only sling incremented it; coordinator startup never did, so for every run with a coordinator the count was off by one. Switch all run-row reads to `SELECT (SELECT COUNT(*) FROM sessions WHERE run_id = runs.id) AS agent_count` so the count always matches the sessions table. `RunStore` now ensures the sessions table exists when it opens. `incrementAgentCount()` kept as a no-op for API stability.
+- **Spawn-per-turn workers no longer misclassified as zombie** (overstory-7a34) — headless detection in `evaluateHealth`/dashboard/status/daemon required `pid !== null`, so spawn-per-turn workers (`pid=null` by design — `turn.pid` is per-turn) fell into the TUI/tmux path where `tmuxAlive=false → ZFC Rule 1 → zombie` within seconds of sling, despite `ov feed` showing live tool events. Adds `isSpawnPerTurnSession` + spawn-per-turn branch in `evaluateHealth` that skips PID/tmux checks and uses lastActivity-only time-based evaluation; daemon registers tailers and refreshes lastActivity from events for `pid=null` headless agents; dashboard/status add a third topology branch (alive iff state is non-terminal — between turns is normal idle).
+- **Matrix-guarded state CAS eliminates writer races** (overstory-a993) — three writers raced against `session.state` with no compare-and-swap (turn-runner end-of-turn settle, `ov stop`, watchdog terminate), producing observable e2e symptoms like `state=zombie` + `claude --resume` alive that no single code path produces. Adds `SessionStore.tryTransitionState` — atomic `UPDATE...WHERE state IN (allowed_from)` per target state — and wires the race-prone writers through it. Matrix: `completed` is sticky; `zombie` is sticky except `ov stop` may promote `zombie→completed`; `booting`/`working`/`stalled` can settle into `completed`/`zombie`. The PreToolUse hook revival in `log.ts` is also guarded so a zombie classification cannot be silently revived to `working`.
+- **Per-tick state guard closes `ov stop` mail-leak window** (overstory-eb7c) — `ov stop` wrote `state=completed` and killed the in-flight claude, but the per-agent injector setInterval kept ticking at 2s until the 5s `SessionStore` rescan in `serve.ts` reaped it. Within that window the loop saw unread mail and dispatched a fresh `runTurn` against the stopped agent. `startTurnRunnerMailLoop` now accepts an optional `isAgentLive` predicate re-checked on every tick; `serve.ts` wires a predicate that re-reads `SessionStore`.
+- **Clean exit without terminal mail surfaced as contract violation** (overstory-6071) — when the parser sees a `result` event with `isError:false` but the agent never sent the capability's terminal mail (`worker_done`/`merged`/etc.), the runner now logs at error level via the diagnostic sink and settles to `completed` instead of leaving the session at `working` forever.
+- **`turn.pid` write failure aborts the turn** (overstory-62a6) — `turn.pid` is the cross-process kill primitive for headless task-scoped agents. A warn-and-proceed write failure left `ov stop` and the watchdog unable to find the live PID, silently degrading the kill path. Upgrade the failure to error level, SIGKILL the just-spawned subprocess, and throw — symmetric with the cleanup-side contract assertion that `turn.pid` must not survive the runner.
+- **Mail snapshot baseline + parser-error subprocess kill + resume-mismatch event** (overstory-088b) — snapshot the terminal-mail baseline at `SELECT MAX(created_at)` of the agent's prior terminal mail rather than wall-clock `now()`, closing the misattribution window where a prior turn's `worker_done` landing between baseline capture and spawn would falsely trip `terminalMailObserved`. `onSessionId` emits a structured `custom/warn` event into `events.db` carrying `{requestedSessionId, observedSessionId}` on resume mismatch. The `parseEvents` iteration is wrapped in try/catch that SIGKILLs the live subprocess before rethrowing — without the kill, a parser throw orphaned the claude process past `lock.release`. Drops the transitional `DirectSpawnOptsWithResume` local alias.
+- **Headless mail metadata escapes pipe and newline** (overstory-2231) — the `[MAIL] From: ... | Subject: ... | Priority: ...\n\n<body>` framing used `|` as a field delimiter and `\n\n` as the metadata-body separator without escaping either in field values. A subject containing `|` or a newline could inject a fake field or smuggle a fake body. Backslash-escape `\`, `|`, `\r`, `\n` in metadata via a shared `formatMailBatch` helper.
+
+#### Tmux lifecycle + session bookkeeping
+- **Close tmux orphan, nudge, and session-end gaps** (overstory-505d, overstory-8ff4, overstory-e74b) — tmux wrapper now uses `exec` so claude replaces the bash wrapper and SIGHUP from a dying tmux server reaches claude directly. New `orphan-spawns` doctor check flags sessions with alive PIDs whose container is gone or whose state already terminal; `ov clean --all` reaps surviving spawn PIDs before `sessions.db` is wiped. Tmux nudge fallback waits for `paneAppearsBusy` (Claude Code's "esc to interrupt" marker) to clear before `send-keys`, returning a `deferred` result instead of corrupting the in-flight prompt. Session-end `transitionToCompleted` retries 5x with exponential backoff (50/100/200/400/800ms) on transient SQLite contention; persistent failure logs an `error` event so missed signals are auditable. Watchdog ZFC Rule 1 now distinguishes "completed but missed signal" from "true zombie" via new `HealthCheck.action="complete"`, preventing promotion of cleanly-exited agents.
+- **`tmux_session` cleared on terminal-state transitions** (overstory-14c0) — `updateState` and `tryTransitionState` now set `tmux_session = ''` when target state is `completed` or `zombie`. The tmux session is torn down by `ov stop`, the watchdog, or coordinator cleanup before the row lands at terminal state, so the stored string was stale immediately. Without the clear, `AgentSession` records returned by `data.agents` carried dead session names forever in `ov status`'s agents-side view.
+- **`zombie`-as-terminal in `checkRunCompletion` + defensive `current-run.txt` read** (overstory-e130, overstory-87bf) — closes a watchdog-side gap where runs containing zombie sessions failed to mark complete.
+- **`lead_completed` subject reflects `merge_ready` presence** (overstory-41fe) — `ov stop` outbound notification subject now indicates whether the lead managed to send `merge_ready` before stopping.
+
+#### Serve + UI shipping
+- **Ship prebuilt `ui/dist` and skip build when `ui/src` absent** (overstory-916d) — `ov serve` crashed on every fresh `ov init` because `ensureUiBuild` expected `<project>/ui/src` to exist while `ov init` does not create a `ui/` workspace. `ensureUiBuild` no-ops when `ui/src` is missing (production install); `resolveUiDistPath` prefers `<projectRoot>/ui/dist`, falls back to the package-bundled `ui/dist` via `import.meta.url`. `package.json` `files` += `ui/dist`; new `prepack` hook builds `ui/` before pack. `ServeDeps` gains `_resolveUiDistPath` so tests can force project-relative resolution (preserves the 503 branch coverage).
+
+#### CLI ergonomics + observability labels
+- **`ov mail send --help` (and other subcommands) now render correctly** (overstory-57d4) — Commander captured `--help` before delegating to the inner mail parser. Disable the outer help option for `mail` and swallow the inner `CommanderError` when help is the requested action.
+- **`--project <path>` accepted after a subcommand** (overstory-e736) — root-program options weren't accepted past the subcommand under `enablePositionalOptions()`. Recursively copy the propagated globals (`--project`, `-q/--quiet`, `--timing`) onto every non-delegated subcommand and read them via `actionCommand.optsWithGlobals()` in pre/post action hooks.
+- **`ov group <sub> <name>` resolves by name with active-status tiebreak** (overstory-4670) — `ov group status <name>` errored even when the group was visible in `ov group list`, forcing operators to grep for the UUID. New `resolveGroup` with ID-wins / single-name-match / active-tiebreak precedence; throws `GroupError` listing matching IDs when ambiguity remains. CLI arguments relabeled `<group-id-or-name>`.
+- **`ov status` labels mail-unread scope** (overstory-cf1e) — `ov status`, `ov mail check`, and `ov mail list --unread` reported unread mail with three different scopes (per-agent, per-agent + read-marking, system-wide). Operators read disagreeing counts as a stale-cache bug. Scopes are intentional; only labels were ambiguous. `ov status` now prints `Mail: N unread (to <agent>)` and exposes `unreadMailScope` in JSON.
+
+### Testing
+
+- 4213 tests across 133 files (9935 `expect()` calls) — up from 4101 / 133 / 9620 in 0.10.2
+- New tests in `src/agents/turn-runner.test.ts` for the per-event stall watchdog, contract-violation surfacing, runner-synthesized `worker_died`, and resume-mismatch event paths
+- Expanded coverage in `src/sessions/store.test.ts` for `tryTransitionState` matrix and `tmux_session` clearing on terminal transitions
+- New tests in `src/watchdog/daemon.test.ts` and `src/watchdog/health.test.ts` for `notifyParentOnDeath`, spawn-per-turn health evaluation, and `checkRunCompletion` zombie handling
+- New tests in `src/commands/group.test.ts`, `src/commands/mail.test.ts`, `src/commands/nudge.test.ts`, `src/commands/dashboard.test.ts`, `src/commands/status.test.ts`, `src/commands/stop.test.ts`, and `src/commands/sling.test.ts` for the recovery, name-resolution, and labeling fixes above
+- New `src/doctor/consistency.test.ts` cases for the `orphan-spawns` check
+
+## [0.10.2] - 2026-04-30
+
+### Added
+
+#### Spawn-per-turn engine for headless Claude task workers (Phase 1–3)
+- **`src/agents/turn-runner.ts`** — `runTurn(opts)` drives a single user turn end-to-end: acquires the per-agent lock, re-reads `SessionStore` for fresh `claudeSessionId`, builds argv with `resumeSessionId`, spawns `claude` with a real stdin pipe (not a FIFO), drains `runtime.parseEvents`, captures `session_id`, tees events into `events.db`, snapshots `mail.db` for `worker_done` detection, applies state transitions (`booting → working`, `completed` when terminal mail observed), handles abort with `SIGTERM → SIGKILL` escalation, and releases the lock on every exit path (overstory-7b8c).
+- **`src/agents/turn-lock.ts`** — per-agent serialization with in-process `Promise` mutex plus a cross-process SQLite-backed lease at `.overstory/turn-locks.db`. Stale leases (dead PID) are stolen on next acquire.
+- **`src/agents/turn-runner-dispatch.ts`** — shared `buildRunTurnOptsFactory` and `isSpawnPerTurnAgent` helpers consumed by both `serve.ts` and `nudge.ts` so spawn-per-turn dispatch lives in one place.
+- **`src/agents/capabilities.ts`** — `isTaskScopedCapability()`, `terminalMailTypesFor()`, and `completionMailTypeFor()` define the canonical set of task-scoped capabilities and their terminal mail contracts. The dynamic overlay generator and runtime now derive the terminal `--type` from this single source of truth.
+- **Phase 3 generalization (overstory-2cf9)** — capability gate in dispatch swaps the builder-only check for `isTaskScopedCapability()`, routing builder, scout, reviewer, merger, and lead through the spawn-per-turn engine. The `claudeSpawnPerTurn` config flag is removed (no longer opt-in); legacy long-lived FIFO infrastructure (`headless-stdin.ts`, `headless-finalize.ts`, `watch-exit.ts`) is deleted.
+- **`ov sling` first user turn** is now driven through `runTurn` instead of spawning a long-lived headless process; subsequent turns are driven by `ov serve` (mail injection loop) and `ov nudge`.
+- **`ClaudeRuntime.buildDirectSpawn` `resumeSessionId`** — Phase 1 plumbing (overstory-7b8c) wires `--resume <id>` after `--model` when the field is non-empty. The headless tailer parses `session_id` from stream-json system/result events and pins it once per lifetime via `SessionStore.updateClaudeSessionId`; observed value wins on resume mismatch with a stderr warning and `_onResumeMismatch` DI hook for tests.
+
+#### Headless-equivalent hooks system (overstory-1c32)
+- **`HooksDef.isHeadless`** flag on `ClaudeRuntime.deployConfig` — headless agents skip `settings.local.json` template hooks (SessionStart / UserPromptSubmit / PostToolUse / Stop / PreCompact) but **still receive the dynamic `PreToolUse` security guards** (path boundary, capability blocks, bash danger patterns, tracker close, lead-close gate) so destructive operations are blocked equivalently to tmux mode.
+- **`src/agents/headless-prompt.ts`** — `buildInitialHeadlessPrompt()`, `encodeUserTurn()`, and `formatMailSection()` build the first user turn (prime + mail + beacon) for headless spawns.
+- **`src/agents/headless-mail-injector.ts`** — `startTurnRunnerMailLoop()` polls `mail.db`, batches unread messages into a single user turn, awaits `runTurn`, and only marks messages read on `exitCode === 0`. Re-entrancy guard prevents overlapping spawns; throws and non-zero exits leave messages unread for the next iteration.
+- **`docs/headless-hooks-design.md`** — full design doc for the headless-equivalent hooks pipeline (overstory-1c32).
+
+#### Coordinator console + mail compose in the web UI
+- **`/coordinator` chat console** — new `ui/src/routes/coordinator/{ConsolePage,Composer,Thread,EmptyState,PendingBubble,StatusPill,NewRunDialog,api}.tsx` providing a chat-style operator surface for the persistent coordinator: send / ask flows, thread rendering, status pill, slash-command popover with explicit dismissal, and a "start new run" affordance for stopped coordinators (overstory-82b4 / overstory-08a3 / overstory-0d64).
+- **`/api/coordinator/*` REST endpoints** — `state`, `send`, `ask`, `check-complete`, `start`, `stop` under `src/commands/serve/coordinator-actions.ts`. All write paths route through the headless connection registry and reject `409` when the active coordinator is tmux-only (overstory-82b4).
+- **Mail compose, reply, and per-row delete in the UI** — `ui/src/routes/mail/Composer.tsx` plus mail compose REST API in `src/commands/serve/mail-actions.ts` (overstory-2740).
+- **UI polish foundations** (overstory-d108) — `command-palette`, `connection-status`, `theme-toggle`, shadcn `command` / `dialog` / `dropdown-menu` / `sonner` primitives, `use-auto-scroll` / `use-scroll-fade` hooks, theme provider + toast helper, and `ws-status` integration into the app shell.
+- **os-eco forest branding** (overstory-29da) — `ui/src/index.css` adopts forest primary/accent/ring tokens with semantic `--success` / `--warning` colors; `ui/src/lib/brand.ts` exposes `TOOL_BRAND` + `toolHex`/`toolRgb` helpers; new stacked-bars `Logo.tsx`, `favicon.svg`, and `apple-touch-icon.png` ship in `ui/public/`.
+
+#### `ov serve` build pipeline + `--dev` HMR proxy
+- **Auto-build UI in production** — `src/commands/serve/build.ts` `ensureUiBuild()` runs `bun install` (when `node_modules` missing) and `bun run build` whenever `ui/dist/index.html` is absent or older than any tracked source/config under `ui/`. `runServe` invokes it before binding the port unless `--dev` or the `_skipAutoBuild` test hook is set.
+- **`--dev` / `--dev-port` flags** — `src/commands/serve/dev.ts` spawns `ui/dev-server.ts` (Bun HMR with `/api`+`/ws` proxy back to the main port) and threads its `stop()` into the graceful-shutdown chain. `ui/package.json` `dev` script now points at `./dev-server.ts` so HMR runs through the proxy script.
+
+#### Watchdog: atomic PID lock + multi-daemon recovery (overstory-8ef6)
+- **`acquirePidLock()`** in `src/utils/pid.ts` uses the write-temp-then-link pattern for true atomic PID-file acquisition. `fs.open(..., 'wx')` alone is insufficient: the file appears at the lock path before `writeFile` completes, letting a racing reader reclaim mid-write. `link()` is the proper atomic primitive — the lock path appears with full content already present.
+- **Foreground `ov watch`** acquires the lock atomically and refuses on contested lock instead of trampling. **Background mode** keeps the friendly pre-check and adds a post-spawn atomic acquire; if a racing writer wins, the just-spawned child is `SIGTERM`'d.
+- **`ov watch --kill-others`** flag for explicit recovery from pre-fix multi-daemon state. Polls for killed PIDs to be reaped before reclaiming the PID file so the immediate self-start does not race a still-alive zombie.
+- **`findRunningWatchdogProcesses()`** in `src/utils/process-scan.ts` scans `ps` for live `ov watch` daemons.
+- **`ov doctor --category watchdog`** gains a multi-daemon check (fixable): flags any case with > 1 live `ov watch` and points at `--kill-others`.
+
+#### Headless RuntimeConnection scaffold (overstory-63d5 / overstory-1f66 / overstory-32cd)
+- **`HeadlessClaudeConnection`** in `src/runtimes/headless-connection.ts` wraps a `Bun.Subprocess` stdin/PID into the `RuntimeConnection` interface: stdin write → `sendPrompt`/`followUp`, `kill(pid, 0)` → `getState`, `SIGTERM`+`SIGKILL` → `abort`. `registerHeadlessConnection()` factory in `src/runtimes/connections.ts`.
+- **`ov nudge` headless path** — `HeadlessClaudeConnection.nudge()` writes a stream-json user-message envelope to the agent's stdin. `nudge.ts` checks `getConnection()` first and routes headless agents through `conn.nudge()`; tmux agents fall through to `send-keys` unchanged. Debounce and `EventStore` recording apply to both paths. `NudgeableConnection` interface + `hasNudge()` type guard let `nudge.ts` detect headless support without modifying `RuntimeConnection`.
+- **Watchdog runtime-agnostic kill** — `killAgent()` prefers `conn.abort()` when a `RuntimeConnection` is registered, falling back to PID/tmux kill only if `abort()` throws. The liveness check is unified: `conn.getState()` drives `tmuxAlive` when a connection exists, falling back to `tmux.isSessionAlive()` otherwise.
+
+#### Direction & Design Docs
+- **`docs/design/containerize-swarms.md`** — design proposal for sandboxing swarm runs in containers (overstory-e2f1).
+- **`docs/headless-hooks-design.md`** — design doc for the headless-equivalent hooks system (overstory-1c32).
+- **`docs/direction-ui-and-ipc.md`** — "Operator surface" section gains a shipped-status callout now that Phase 3 and the default flip have landed (overstory-9cee).
+
+### Changed
+
+#### Headless Claude is the new default for new projects (overstory-caec / overstory-9cee)
+- **`ov init` now writes `runtime.claudeHeadlessByDefault: true`** into the freshly-generated `.overstory/config.yaml` (`src/commands/init.ts`). New projects spawn Claude agents headless out of the box; the web UI (`ov serve`, then open http://localhost:8080) is the primary operator surface and tmux is opt-in via `ov sling --no-headless` (overstory-caec).
+- **Existing projects keep tmux behavior on upgrade.** The fallback default in `resolveUseHeadless` (`src/commands/sling.ts`) remains `false`, so projects that already have a `config.yaml` without the field continue to spawn into tmux until they explicitly add `runtime.claudeHeadlessByDefault: true` (or pass `--headless` per spawn). To opt in: edit `.overstory/config.yaml` and add the field under `runtime:`, or re-run `ov init --yes` to regenerate the config from the new template.
+- **CLAUDE.md template updated** (`templates/CLAUDE.md.tmpl`) to describe the headless-default + UI-first workflow with `--no-headless` documented as the tmux escape hatch.
+- **Onboarding docs sweep** to align with the default flip (overstory-9cee):
+  - `README.md` — Quick Start now leads with `ov coordinator start && ov serve` (http://localhost:8080); architecture and runtime-adapters paragraphs invert the tmux/headless framing; `tmux` is documented as an optional install dependency for live attach.
+  - `CLAUDE.md` — Runtime Modes section reorders headless first as the shipped default for new projects, with tmux flagged as the opt-in escape hatch and the legacy-fallback behavior called out explicitly.
+  - `ov init` post-init hint and `ov coordinator start` post-start hint both point operators at `ov serve` first.
+  - `templates/CLAUDE.md.tmpl` — adds a top-level "web UI is your primary operator surface" paragraph and reframes "Checking Status" to lead with the UI before listing the CLI alternatives.
+  - `docs/direction-ui-and-ipc.md` — "Operator surface" section gains a shipped-status callout (Phase 3 + default flip both landed).
+
+#### Operator console polish (overstory-1041)
+- Standardized spacing, border weight, and typography hierarchy across the Coordinator console, Fleet, Mail, and Agent surfaces. The chosen scale is documented as a comment block in `ui/src/index.css` so future surfaces can reach for the same tokens.
+- Coordinator: `text-xl tracking-tight` headers, `max-w-4xl` thread, rounded-xl bubbles with `shadow-sm`, readable `text-xs` timestamps, composer breathing room and focus-ring polish.
+- Fleet: page max-width, uppercase `tabular-nums` summary cards, table wrapped in `rounded-xl/border-border` shell with `h-11` headers.
+
+### Fixed
+
+#### Headless agent observability + reachability
+- **`ov nudge` and mail delivery to headless agents** — `ov sling` and `ov serve` are separate processes, so the in-memory connection registry that the mail injector and nudge subscribed to was always empty in serve's process; headless agents were structurally unreachable for the entire duration of their run. Fixed by routing through the shared `RuntimeConnection` registry and (for spawn-per-turn agents) the dispatcher (overstory-41eb / overstory-1f66).
+- **PreToolUse security hooks deployed for headless Claude agents** — the original overstory-1c32 design assumed headless mode did not load `.claude/settings.local.json` PreToolUse hooks. Verified empirically that it does, so `deployHooks(headlessOnly=true)` now drops the template entries and keeps the dynamic `PreToolUse` guards (path boundary, capability blocks, bash danger, tracker close, lead close gate) for both modes (overstory-e24b).
+- **Headless agent sessions finalize on subprocess exit** — pre-Phase 3, headless mode's per-turn `Stop` hook never fired, so `SessionStore` stayed at `working` indefinitely after `ov sling` exited. Fixed via a detached `__watch-exit` polling subprocess (later subsumed by Phase 3 / overstory-2cf9, which deletes the helper now that `runTurn` owns lifecycle) (overstory-267e).
+- **Headless leads self-terminate after `sd close`** — fixed a path where headless leads stayed alive after closing their own task (overstory-6fc9).
+
+#### Spawn-per-turn correctness
+- **`worker_done` terminal contract enforced** (overstory-1a4c) — workers were sending `--type result` instead of `--type worker_done` as their terminal exit signal, leaving spawn-per-turn sessions stuck in `working` until the watchdog flipped them to `zombie`. Root cause: the dynamic overlay (`src/agents/overlay.ts` and `templates/overlay.md.tmpl`) injected `--type result` as the per-task completion instruction in three places, overriding the `worker_done` guidance in the base agent `.md` prompts. Two-part fix: (A) backstop in `capabilities.ts` so `terminalMailTypesFor()` accepts both `worker_done` and `result` for builder/scout/reviewer/lead — safe because the runner also requires `cleanResult` (Claude exited cleanly at end-of-turn); (B) tightened prompts so the dynamic overlay derives the terminal `--type` from `capabilities.ts` via `completionMailTypeFor()`, with all base agent docs updated to use `worker_done` (or `merged` for merger).
+- **`runTurn` cleanup-contract violations are diagnosable** (overstory-4af3) — silent catches around `SessionStore` writes and `turn.pid` I/O hid the original symptom (`turn.pid` leaked + `lastActivity` frozen at `startedAt`). Per-turn `RunnerLogger` now writes to `<turnLogDir>/runner.log` + `process.stderr` with a `[turn-runner:level]` prefix; explicit contract assertions (`existsSync(turn.pid)` after `unlink`, `updateSessionLastActivity` returning `false`) surface loudly instead of disappearing.
+
+#### UI
+- **Coordinator slash menu hidden by default** — empty input was treated as "slash-only", so the hint menu rendered on mount and required a click-off to dismiss before typing.
+- **Slash-command popover dismissal** — explicit dismissal in the composer prevents stuck popover state.
+
+#### Tests
+- **`log.test.ts` `--stdin` subprocess isolation** (overstory-6830) — subprocesses no longer inherit the parent shell's `OVERSTORY_PROJECT_ROOT`, so the suite is robust to the environment-injection added in 0.9.4.
+
+### Testing
+
+- 4101 tests across 133 files (9620 `expect()` calls)
+- New: `src/agents/turn-runner.test.ts` (959 lines), `src/agents/turn-lock.test.ts` (181 lines), `src/agents/turn-runner-dispatch.test.ts` (182 lines) — spawn-per-turn engine coverage
+- New: `src/agents/headless-mail-injector.test.ts`, `src/agents/headless-prompt.test.ts`, `src/agents/capabilities.test.ts`
+- New: `src/runtimes/headless-connection.test.ts` (264 lines), expanded `src/runtimes/connections.test.ts` and `src/runtimes/claude.test.ts`
+- New: `src/commands/serve/build.test.ts` (188 lines), `src/commands/serve/dev.test.ts` (168 lines), `src/commands/serve/coordinator-actions.test.ts` (339 lines), `src/commands/serve/mail-actions.test.ts` (312 lines), expanded `src/commands/serve/rest.test.ts`
+- New: `src/commands/coordinator.test.ts` (127 lines), `src/commands/dashboard.test.ts` (mixed-swarm and headless-dead-with-tmux-list regressions), expanded `src/commands/nudge.test.ts` (307 lines), `src/commands/watch.test.ts`
+- New: `src/utils/process-scan.test.ts`, expanded `src/utils/pid.test.ts` (atomic acquire, link-based primitive)
+- New: `src/watchdog/daemon.test.ts` expansion (363 lines — runtime-agnostic abort path), `src/worktree/process.test.ts`
+- New: `src/events/tailer.test.ts` (235 lines — session_id capture, resume mismatch handling)
+
+## [0.10.1] - 2026-04-28
+
+### Added
+
+#### `ov serve` HTTP Surface
+- **`ov serve [--port <n>] [--host <addr>]`** — new top-level command (`src/commands/serve.ts`) backed by `Bun.serve` that exposes `/healthz`, REST handlers under `/api/*`, a `/ws` WebSocket upgrade, and SPA static fallback to `ui/dist/`. Designed as the operator surface for the new web UI; defaults to `127.0.0.1:8080` (overstory-ba9c)
+- **Extensible route registry** — `registerApiHandler(handler)` and `registerWsHandler(handler)` let downstream streams register REST and WebSocket handlers without touching `serve.ts`. First non-null API handler wins; only one WS handler may be active at a time. `_resetHandlers()` exported for test isolation
+- **`createServeServer(opts, deps)`** — dependency-injectable factory used by tests to control lifecycle directly without binding to process signals; `deps._restDeps` accepts `false` to skip REST registration
+- **CLI command count: 37 → 38** (new `ov serve`)
+
+#### REST Endpoints over Existing Stores
+- **`src/commands/serve/rest.ts`** — read-only REST surface over `EventStore`, `MailStore`, `SessionStore`, and `RunStore` with no new persistence (overstory-9e8b)
+- **Endpoints** — `GET /api/runs`, `GET /api/runs/:id`, `GET /api/agents`, `GET /api/agents/:name`, `GET /api/events` (filters: `?agent`, `?run`, `?since`, `?cursor`), `GET /api/mail`, `GET /api/mail/:id`, `POST /api/mail/:id/read`
+- **Cursor pagination** — base64url-encoded `{ts, id}` cursors for all list endpoints; `limit` capped at 500. Invalid cursors return `400` via `ValidationError`
+- **`apiJson(data, init?)` / `apiError(message, status)`** in `src/json.ts` — HTTP envelope helpers (`{ success, command: "serve", data, nextCursor? }`) matching the existing `jsonOutput` / `jsonError` envelope shape
+- **Path-traversal guard** in `src/commands/serve/static.ts` — rejects requests escaping `ui/dist/` via decoded `..`/absolute-path tricks
+- **`/healthz` envelope** — now returns `{ uptimeMs, version }` via `apiJson`; `503` for missing `ui/dist` is also a JSON envelope
+
+#### WebSocket Broadcaster
+- **`src/commands/serve/ws.ts`** — `installBroadcaster()` subscribes to `EventStore` writes and `MailStore` inserts, multicasting to per-room socket sets registered via `registerWsHandler` (overstory-22ac)
+- **Per-run / per-agent rooms** — clients connect to `/ws?run=<id>`, `/ws?agent=<name>`, or `/ws?mail=true`; `getUpgradeData()` rejects connections with no recognized query parameter (`400`); each socket is added to the matching `rooms` map and removed on close
+- **Outbound frame schema** — `{ type: "event" | "mail" | "agent_state", ts, payload }`; assistant text events are coalesced in 250 ms windows into a `{ batched: true, events: [...] }` envelope to keep UI render rates manageable
+
+#### `ov doctor --category serve`
+- **`src/doctor/serve.ts`** — new doctor category validating `ui/dist/index.html` presence and probing `127.0.0.1:8080` non-blockingly. Warns on missing build / unreachable port; passes on healthy state. Wired into `ALL_CHECKS` in `src/commands/doctor.ts`; `DoctorCategory` union extended with `"serve"`
+- **Doctor check categories: 12 → 13**
+
+#### Web UI: Fleet, Mail, Live Timeline
+- **Fleet view (`/`)** — `ui/src/routes/Home.tsx` replaced with a real fleet dashboard: `RunPicker`, `SummaryCards`, `AgentTable` polling `/api/runs` and `/api/agents` at 5 s via TanStack Query; row click navigates to `/agents/:name` (overstory-6c4f)
+- **Mail inbox (`/mail`)** — new `ui/src/routes/Mail.tsx` with `ResizablePanelGroup` layout (`ThreadList` + `MessageDetail`), `FilterChips` (unread toggle, from/to agent selects), JSON payload viewer, thread reply rendering, and `useMailSocket` hook subscribing to `/ws?mail=true` (overstory-0ddb)
+- **Per-agent live timeline (`/agents/:name`)** — `ui/src/routes/AgentDetail.tsx` + `agent/EventRow.tsx` stream `/ws?agent=<name>` events into a chronological feed (overstory-fc04)
+- **REST API client** — `ui/src/lib/api.ts` typed fetchers for runs, agents, events, and mail; `ui/src/lib/ws.ts` reusable WebSocket hook with reconnect + room scoping
+- **shadcn primitives** — added `ui/src/components/ui/{table,resizable}.tsx` and `react-resizable-panels` dep; `@biomejs/biome` devDep + `lint` script added to `ui/package.json`
+
+#### Direction Doc
+- **`docs/direction-ui-and-ipc.md`** — new "Operator surface" section commits to the UI as primary operator surface with tmux as opt-in (`--no-headless`); documents the rationale (one mental model, honest fidelity, broken pane-steering) and gates the default flip on Phase 3 landing (overstory-caec, overstory-9cee)
+
+### Fixed
+
+- **UI sidebar `/agents` link removed** — the link pointed to a route that was never registered, so clicking it showed the 404 fallback. The Fleet view at `/` already lists agents
+- **Biome lint/format issues** in serve scaffold — sorted named exports alphabetically to satisfy `organizeImports`; resolved leftover format violations
+
+### Testing
+
+- 3881 tests across 119 files (9072 `expect()` calls)
+- New: `src/commands/serve.test.ts` (171 lines — `createServeServer` lifecycle, `/healthz`, handler registry, SPA fallback, port validation)
+- New: `src/commands/serve/rest.test.ts` (787 lines — every endpoint, cursor pagination, filters, `400`/`404`/`503` paths, path traversal)
+- New: `src/commands/serve/ws.test.ts` (361 lines — room scoping, mail upgrade, broadcaster wiring, text batching window)
+- New: `src/doctor/serve.test.ts` (95 lines — `ui/dist` presence, `index.html` check, port-probe pass/warn)
+
+## [0.10.0] - 2026-04-28
+
+### Added
+
+#### Headless Claude Code Execution
+- **`buildDirectSpawn(opts)` on `ClaudeRuntime`** (`src/runtimes/claude.ts`) — returns the exact argv to launch Claude Code as a non-tmux subprocess: `-p --output-format stream-json --input-format stream-json --verbose --strict-mcp-config --permission-mode bypassPermissions [--model <m>]`. Claude Code reads `.claude/CLAUDE.md` from cwd; the initial prompt is the caller's responsibility (overstory-46ad)
+- **`async *parseEvents(stream, opts)` on `ClaudeRuntime`** — parses NDJSON stream-json stdout into typed `AgentEvent` objects (`assistant_message`, `tool_use`, `tool_result`, `status`, `result`). Adjacent assistant text deltas are coalesced into a single `assistant_message` per batch with configurable `flushIntervalMs` (default 500ms) and `flushSizeBytes` (default 4096). Skips malformed lines and unknown message types
+- **Eager `session_id` pinning** — `parseEvents` now invokes `opts.onSessionId` synchronously on the first event carrying a non-empty `sessionId`. New `claudeSessionId` field on `AgentSession` and `claude_session_id` column on the sessions table (with `migrateAddClaudeSessionId` migration), populated via the new `SessionStore.updateClaudeSessionId(agentName, sessionId)` API (overstory-2916)
+- **Text-event batching** — assistant text deltas batch on a timer, size cap, any non-text event, or stream end — whichever comes first. Caller errors in `onSessionId` are swallowed so a buggy consumer cannot crash the parser (overstory-d854)
+- **`ov sling --headless` / `--no-headless` flag** — per-spawn override for the headless path on Claude Code agents. `--headless` is rejected with a `ValidationError` for runtimes without `buildDirectSpawn` (Pi, Codex, Cursor) and is a no-op for runtimes that statically declare `headless: true` (Sapling) (overstory-268b)
+- **`runtime.claudeHeadlessByDefault` config knob** — flips the project-wide default to headless for Claude Code; explicit per-spawn flags still win
+- **`resolveUseHeadless(runtime, flag, config)`** in `src/commands/sling.ts` — single source of truth for the headless decision with explicit precedence: static `runtime.headless` → flag → config knob → tmux default
+
+#### Merge-Ready Enforcement Gate
+- **`buildLeadCloseGateScript()`** in `src/agents/hooks-deployer.ts` — PreToolUse guard that blocks `sd close <task-id>` / `bd close <task-id>` when a lead tries to close its own task without first sending the required `merge_ready` mail to the coordinator. Counts merge_ready outgoing vs worker_done incoming via `ov mail list --json` and grep, requiring ≥ 1 merge_ready and ≥ 1 merge_ready per worker_done (overstory-3899)
+- **Branch-merged ancestor check** — gate also verifies the lead's worktree HEAD is reachable from the merge target (`session-branch.txt` > `main`) via `git merge-base --is-ancestor`. Fails open when worktree path is unset or the target ref is missing locally; otherwise blocks with a descriptive reason instructing the lead to wait for the coordinator to merge (overstory-da9b)
+- **`agents/lead.md` updated** — new `MISSING_MERGE_READY_BEFORE_CLOSE` named failure documents the gate and recovery path. Lead now uses YAML frontmatter and may run `{{TRACKER_CLI}} create` directly (worktree-issue restriction lifted)
+
+#### Concurrent Merge Race Prevention
+- **`src/merge/lock.ts`** — sentinel-file lock at `.overstory/merge-{sanitized-target}.lock` prevents parallel `ov merge` runs against the same canonical branch from producing transient false-conflict reports. Atomic creation via `writeFileSync(..., { flag: "wx" })`, holder PID checked on collision: live → fail fast, dead → take over
+- **`MergeLockHandle`, `mergeLockPath()`, `sanitizeBranchForFilename()`** exported helpers; lock is wired into `mergeCommand` with try/finally release (overstory-9610)
+
+#### UI Scaffold
+- **`ui/`** — new web UI package scaffolded with React 19 + Tailwind v4 + shadcn/ui components (`Layout`, `Home`, `badge`, `card`, `scroll-area`, `tabs`)
+- **Bun-native bundler** — `ui/build.ts` replaces Vite for both dev and production builds; tighter integration with the rest of the Bun-only toolchain
+- **`docs/direction-ui-and-ipc.md`** — direction document outlining UI architecture and IPC plans
+
+### Fixed
+
+- **`ov sling` startup failures now mark the agent as `zombie`** rather than `completed` so the watchdog detects them. `completed` is a terminal success state the watchdog skips entirely (overstory-c40e)
+- **Lead does not auto-complete on per-turn `Stop` hook** — leads now stay alive across turns instead of being torn down on each `Stop` event
+- **`ov doctor` exit-code race eliminated** — `process.exitCode` is no longer set asynchronously inside `doctorCommand`, removing a window where parallel test commands inherited a stale failing exit code
+- **`bun test` clears `process.exitCode` to 0 in `afterEach`** — prevents a single failure from leaking a non-zero exit code through the rest of the suite
+- **Test isolation for `OVERSTORY_PROJECT_ROOT`** — `bun test` no longer inherits an external `OVERSTORY_PROJECT_ROOT` from the parent shell, which previously corrupted multi-DB tests (overstory-6d42)
+- **`agents/coordinator.md` merge step** — wording realigned with the new `merge_ready` contract: coordinators must process `merge_ready` mails before closing tasks (overstory-ad45)
+
+### Changed
+
+- **`agents/lead.md` rewritten** — adopts YAML frontmatter (`name: lead`), simplifies dispatch override handling, lifts the worktree-create-issue restriction, and removes the duplicate role-compression block (kept in overlay generation)
+- **Mulch onboarding refreshed to v2** — `CLAUDE.md` mulch section updated to reflect the v2 record/learn/sync workflow
+- **Biome config cleanup** — `chore(lint)` flattens nested config and resolves leftover format/keys violations
+- **Maintenance cadence documented** — `CONTRIBUTING.md` now states the part-time review cadence (2-week PR batches, 30-day inactivity close)
+
+### Testing
+
+- 3815 tests across 115 files (8907 `expect()` calls)
+- New: `src/merge/lock.test.ts` (149 lines — sentinel acquire/release, stale-PID takeover, branch-name sanitization)
+- New: `src/runtimes/__fixtures__/claude-stream-fixture.ts` (canonical stream-json fixture for parser tests)
+- New: `src/test-setup.ts` + `src/test-setup.test.ts` (shared global test setup; `OVERSTORY_PROJECT_ROOT` isolation; `process.exitCode` reset)
+- Expanded: `src/runtimes/claude.test.ts` (+668 lines — `buildDirectSpawn`, `parseEvents`, text batching, eager session_id pinning, error swallowing)
+- Expanded: `src/agents/hooks-deployer.test.ts` (+505 lines — `buildLeadCloseGateScript` merge_ready / worker_done counting, ancestor checks, fail-open paths)
+- Expanded: `src/commands/merge.test.ts` (+113 lines — concurrent merge lock acquisition, stale-lock takeover, error path cleanup)
+- Expanded: `src/commands/sling.test.ts` (+54 lines — `resolveUseHeadless` precedence, `--headless` validation, headless spawn path)
+- Expanded: `src/sessions/store.test.ts` (+40 lines — `claude_session_id` column migration, update API)
+- Expanded: `src/mail/store.test.ts`, `src/commands/log.test.ts`, `src/commands/mail.test.ts`, `src/commands/stop.test.ts`, `src/watchdog/daemon.test.ts`
+
+## [0.9.4] - 2026-04-07
+
+### Fixed
+
+#### Submodule Cascade
+- **`resolveProjectRoot()` env var + walk-up detection** in `src/config.ts` — now checks `OVERSTORY_PROJECT_ROOT` env var (priority 2) and walks up from worktree paths (priority 3) before falling through to `git rev-parse`. Fixes silent multi-DB split where slung agents in nested git submodules wrote to a different `.overstory/` than the host project (overstory-5804)
+- **`OVERSTORY_PROJECT_ROOT` injected into spawned agent env** — `ov sling` now adds the canonical project root to all three agent env dicts (headless `directEnv`, tmux `buildSpawnCommand` env, tmux `createSession` env) so child agents always inherit the correct root
+- **`ov worktree clean` live-children guard** — `handleClean()` now calls `checkLiveChildren()` before removing each worktree. Live nested sessions block removal unless `--force` is passed, which cascade-SIGTERMs them. New `blockedByChildren` field added to JSON output and human summary (overstory-329a)
+
+#### Tmux Session Name Sanitization
+- **Project names containing dots** (e.g., `consulting.jayminwest.com`) caused tmux to interpret the dots as `session.window.pane` separators in `-t` target strings, breaking all pane lookups after session creation
+- **`sanitizeTmuxName()`** added to `src/worktree/tmux.ts` — replaces dots and colons with underscores, applied at all 6 tmux name construction sites (`clean.ts`, `coordinator.ts`, `monitor.ts`, `sling.ts`, `supervisor.ts`, `doctor/consistency.ts`)
+
+### Testing
+
+- 3708 tests across 113 files (8656 `expect()` calls)
+- Expanded: `src/commands/worktree.test.ts` (+322 lines — live-children guard, cascade SIGTERM, `blockedByChildren` JSON output)
+- Expanded: `src/config.test.ts` (+78 lines — `OVERSTORY_PROJECT_ROOT` env var resolution, worktree walk-up)
+- Expanded: `src/commands/sling.test.ts` (+12 lines — env var injection across all three spawn paths)
+- Expanded: `src/worktree/tmux.test.ts` (+36 lines — `sanitizeTmuxName()` for dots and colons)
+
 ## [0.9.3] - 2026-03-23
 
 ### Added
@@ -1703,7 +2044,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Biome configuration for formatting and linting
 - TypeScript strict mode with `noUncheckedIndexedAccess`
 
-[Unreleased]: https://github.com/jayminwest/overstory/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/jayminwest/overstory/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/jayminwest/overstory/compare/v0.10.3...v0.11.0
+[0.10.3]: https://github.com/jayminwest/overstory/compare/v0.10.2...v0.10.3
+[0.10.2]: https://github.com/jayminwest/overstory/compare/v0.10.1...v0.10.2
+[0.10.1]: https://github.com/jayminwest/overstory/compare/v0.10.0...v0.10.1
+[0.10.0]: https://github.com/jayminwest/overstory/compare/v0.9.4...v0.10.0
+[0.9.4]: https://github.com/jayminwest/overstory/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/jayminwest/overstory/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/jayminwest/overstory/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/jayminwest/overstory/compare/v0.9.0...v0.9.1

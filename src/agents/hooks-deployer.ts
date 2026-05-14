@@ -340,6 +340,114 @@ export function getTrackerCloseGuards(): HookEntry[] {
 }
 
 /**
+ * Build a PreToolUse guard script that enforces the merge_ready gate on lead
+ * agents (overstory-3899, overstory-da9b): a lead may not run
+ * `sd/bd close $OVERSTORY_TASK_ID` unless (a) it has sent at least one
+ * `merge_ready` mail AND has sent at least one `merge_ready` per `worker_done`
+ * it has received, AND (b) the lead's branch (worktree HEAD) is reachable
+ * from the merge target (session-branch.txt > "main") via
+ * `git merge-base --is-ancestor`. (a) proves the lead reported completion;
+ * (b) proves the coordinator actually merged the work.
+ *
+ * Counts are derived by querying `ov mail list --json` and grep-counting
+ * `"id":"` occurrences in the JSON response (no jq dependency). The gate
+ * is a no-op for non-lead agents because it is only deployed to leads via
+ * `getLeadCloseGateGuards()`, but it still self-protects: the script
+ * exits early when OVERSTORY_AGENT_NAME or OVERSTORY_TASK_ID is unset.
+ * The merge-ancestor check fails open when OVERSTORY_WORKTREE_PATH is unset
+ * or the target ref cannot be resolved locally — in those cases we cannot
+ * make a definitive claim, so we don't block.
+ *
+ * Foreign-task closes are caught earlier by `buildTrackerCloseGuardScript`,
+ * so this gate only fires when the issue ID matches OVERSTORY_TASK_ID.
+ */
+export function buildLeadCloseGateScript(): string {
+	const blockNoMergeReady = JSON.stringify({
+		decision: "block",
+		reason:
+			'merge_ready gate: cannot close your task — you have not sent a merge_ready mail to coordinator. Required: ov mail send --to coordinator --subject "merge_ready: <task>" --body "<branch + files>" --type merge_ready --from $OVERSTORY_AGENT_NAME. Then retry the close.',
+	});
+	const blockUnderCount = JSON.stringify({
+		decision: "block",
+		reason:
+			"merge_ready gate: cannot close your task — merge_ready count is less than worker_done received. Send one merge_ready per worker_done before closing.",
+	});
+	const blockNotMerged = JSON.stringify({
+		decision: "block",
+		reason:
+			"merge_ready gate: cannot close your task — your branch is not yet merged into the target (session-branch.txt or main). Wait for the coordinator to merge before closing. The merge step is what makes the work real.",
+	});
+
+	const script = [
+		// Only enforce for overstory agent sessions
+		ENV_GUARD,
+		// Skip if task ID is not set (coordinator/monitor have no task)
+		'[ -z "$OVERSTORY_TASK_ID" ] && exit 0;',
+		"read -r INPUT;",
+		// Extract command value from JSON
+		'CMD=$(echo "$INPUT" | sed \'s/.*"command": *"\\([^"]*\\)".*/\\1/\');',
+		// Only inspect sd/bd close commands
+		"if ! echo \"$CMD\" | grep -qE '^\\s*(sd|bd)\\s+close\\s'; then exit 0; fi;",
+		// Extract the issue ID being closed
+		"ISSUE_ID=$(echo \"$CMD\" | sed -E 's/^[[:space:]]*(sd|bd)[[:space:]]+close[[:space:]]+([^ ]+).*/\\2/');",
+		// Only gate when the lead is closing its own task. Foreign closes are blocked by buildTrackerCloseGuardScript.
+		'[ "$ISSUE_ID" != "$OVERSTORY_TASK_ID" ] && exit 0;',
+		// Count merge_ready mails sent by this agent
+		'MR=$(ov mail list --json --from "$OVERSTORY_AGENT_NAME" --type merge_ready 2>/dev/null | grep -o \'"id":"\' | wc -l | tr -d \' \');',
+		// Count worker_done mails received by this agent
+		'WD=$(ov mail list --json --to "$OVERSTORY_AGENT_NAME" --type worker_done 2>/dev/null | grep -o \'"id":"\' | wc -l | tr -d \' \');',
+		// Default to 0 if the count failed for any reason.
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a JS template
+		"MR=${MR:-0}; WD=${WD:-0};",
+		// Block if no merge_ready was ever sent
+		'if [ "$MR" -eq 0 ]; then',
+		`  echo '${escapeForSingleQuotedShell(blockNoMergeReady)}';`,
+		"  exit 0;",
+		"fi;",
+		// Block if not enough merge_ready for the worker_done count
+		'if [ "$MR" -lt "$WD" ]; then',
+		`  echo '${escapeForSingleQuotedShell(blockUnderCount)}';`,
+		"  exit 0;",
+		"fi;",
+		// Verify the lead's branch is actually merged into the target (overstory-da9b).
+		// merge_ready alone doesn't prove the work landed — the coordinator may still be
+		// verifying or the merge may have failed.
+		// Skip if worktree path is missing (test envs etc.) — fail open.
+		'[ -z "$OVERSTORY_WORKTREE_PATH" ] && exit 0;',
+		// Resolve target branch: $OVERSTORY_PROJECT_ROOT/.overstory/session-branch.txt > "main"
+		'TARGET="";',
+		'if [ -n "$OVERSTORY_PROJECT_ROOT" ] && [ -f "$OVERSTORY_PROJECT_ROOT/.overstory/session-branch.txt" ]; then',
+		'  TARGET=$(tr -d "[:space:]" < "$OVERSTORY_PROJECT_ROOT/.overstory/session-branch.txt" 2>/dev/null);',
+		"fi;",
+		'[ -z "$TARGET" ] && TARGET=main;',
+		// If the target ref doesn't exist locally, we can't verify — fail open.
+		'if ! git -C "$OVERSTORY_WORKTREE_PATH" rev-parse --verify "$TARGET" >/dev/null 2>&1; then exit 0; fi;',
+		// Block if HEAD is not yet an ancestor of the target.
+		'if ! git -C "$OVERSTORY_WORKTREE_PATH" merge-base --is-ancestor HEAD "$TARGET" >/dev/null 2>&1; then',
+		`  echo '${escapeForSingleQuotedShell(blockNotMerged)}';`,
+		"  exit 0;",
+		"fi;",
+	].join(" ");
+	return script;
+}
+
+/**
+ * Generate the lead-only PreToolUse guard that gates `sd/bd close <own-task>`
+ * on merge_ready emission. Wraps `buildLeadCloseGateScript` with the standard
+ * PATH_PREFIX so `ov` resolves under Claude Code's minimal hook PATH.
+ *
+ * Only deployed to lead agents (see getCapabilityGuards).
+ */
+export function getLeadCloseGateGuards(): HookEntry[] {
+	return [
+		{
+			matcher: "Bash",
+			hooks: [{ type: "command", command: `${PATH_PREFIX} ${buildLeadCloseGateScript()}` }],
+		},
+	];
+}
+
+/**
  * Capabilities that are allowed to modify files via Bash commands.
  * These get the Bash path boundary guard instead of a blanket file-modification block.
  */
@@ -507,6 +615,13 @@ export function getCapabilityGuards(capability: string, qualityGates?: QualityGa
 		guards.push(...getBashPathBoundaryGuards());
 	}
 
+	// Lead agents get the merge_ready gate on sd/bd close (overstory-3899).
+	// Blocks closing the lead's own task unless at least one merge_ready mail
+	// has been sent and the count covers all worker_done received.
+	if (capability === "lead") {
+		guards.push(...getLeadCloseGateGuards());
+	}
+
 	return guards;
 }
 
@@ -538,9 +653,23 @@ export function isOverstoryHookEntry(entry: HookEntry): boolean {
  * Overstory hooks are placed before user hooks per event type so security
  * guards run first.
  *
+ * In `headlessOnly` mode, only PreToolUse hooks are deployed (overstory-e24b).
+ * Headless Claude Code (`-p --output-format stream-json`) DOES dispatch hooks
+ * from settings.local.json, so PreToolUse security guards (path boundary,
+ * capability blocks, bash danger patterns, tracker close, lead close gate)
+ * are required to keep parity with tmux mode. The other hook types are dropped
+ * because they have headless equivalents already wired up:
+ *  - SessionStart  → buildInitialHeadlessPrompt() in sling.ts
+ *  - UserPromptSubmit → mail injection loop owned by `ov serve`
+ *  - PostToolUse → stream-json parser captures tool_use/tool_result
+ *  - Stop → stream-json parser captures the `result` event
+ *  - PreCompact → deferred (tracked separately)
+ *
  * @param worktreePath - Absolute path to the agent's git worktree (or project root)
  * @param agentName - The unique name of the agent
  * @param capability - Agent capability (builder, scout, reviewer, lead, merger)
+ * @param qualityGates - Quality gates whose commands are whitelisted as safe Bash prefixes
+ * @param headlessOnly - When true, deploy only PreToolUse entries (overstory-e24b)
  * @throws {AgentError} If the template is not found or the write fails
  */
 export async function deployHooks(
@@ -548,6 +677,7 @@ export async function deployHooks(
 	agentName: string,
 	capability = "builder",
 	qualityGates?: QualityGate[],
+	headlessOnly = false,
 ): Promise<void> {
 	const templatePath = getTemplatePath();
 	const file = Bun.file(templatePath);
@@ -577,6 +707,17 @@ export async function deployHooks(
 
 	// Parse the base config from the template
 	const config = JSON.parse(content) as { hooks: Record<string, HookEntry[]> };
+
+	// Headless mode: drop all template-derived hook entries.
+	// Under spawn-per-turn (Phase 3, overstory-2cf9), the turn-runner provides
+	// the user prompt and emits its own observability events for every turn;
+	// the template's SessionStart/UserPromptSubmit/PostToolUse/Stop/PreCompact
+	// hooks would either double-deliver mail (UserPromptSubmit re-injects on top
+	// of the runner's prompt) or duplicate session_end / per-tool events.
+	// Only the dynamic PreToolUse security guards added below are retained.
+	if (headlessOnly) {
+		config.hooks = {};
+	}
 
 	// Extend PATH in all template hook commands.
 	// Claude Code invokes hooks with PATH=/usr/bin:/bin:/usr/sbin:/sbin — ~/.bun/bin

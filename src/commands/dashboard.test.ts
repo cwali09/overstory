@@ -295,6 +295,7 @@ function makeDashboardData(
 			worktrees: [],
 			tmuxSessions: [],
 			unreadMailCount: 0,
+			unreadMailScope: "orchestrator",
 			mergeQueueCount: 0,
 			recentMetricsCount: 0,
 		},
@@ -447,6 +448,7 @@ describe("renderAgentPanel", () => {
 				worktrees: [],
 				tmuxSessions: [], // no tmux sessions
 				unreadMailCount: 0,
+				unreadMailScope: "orchestrator",
 				mergeQueueCount: 0,
 				recentMetricsCount: 0,
 			},
@@ -487,6 +489,7 @@ describe("renderAgentPanel", () => {
 				worktrees: [],
 				tmuxSessions: [],
 				unreadMailCount: 0,
+				unreadMailScope: "orchestrator",
 				mergeQueueCount: 0,
 				recentMetricsCount: 0,
 			},
@@ -494,6 +497,191 @@ describe("renderAgentPanel", () => {
 		const out = renderAgentPanel(data, 100, 12, 3);
 		expect(out).toContain("x");
 		expect(out).toContain("dead-headless");
+	});
+
+	test("renders mixed tmux + headless agents in same frame with correct liveness", () => {
+		const data = {
+			...makeDashboardData({}),
+			status: {
+				currentRunId: null,
+				agents: [
+					{
+						id: "sess-tmux-1",
+						agentName: "pane-agent",
+						capability: "builder",
+						worktreePath: "/tmp/wt/pane-agent",
+						branchName: "overstory/pane-agent/task-t1",
+						taskId: "task-t1",
+						tmuxSession: "overstory-pane-agent",
+						state: "working" as const,
+						pid: 99999,
+						parentAgent: null,
+						depth: 0,
+						runId: null,
+						startedAt: new Date(Date.now() - 10_000).toISOString(),
+						lastActivity: new Date().toISOString(),
+						escalationLevel: 0,
+						stalledSince: null,
+						transcriptPath: null,
+					},
+					{
+						id: "sess-headless-1",
+						agentName: "live-headless",
+						capability: "builder",
+						worktreePath: "/tmp/wt/live-headless",
+						branchName: "overstory/live-headless/task-h1",
+						taskId: "task-h1",
+						tmuxSession: "", // headless
+						state: "working" as const,
+						pid: process.pid, // own PID — guaranteed alive
+						parentAgent: null,
+						depth: 0,
+						runId: null,
+						startedAt: new Date(Date.now() - 10_000).toISOString(),
+						lastActivity: new Date().toISOString(),
+						escalationLevel: 0,
+						stalledSince: null,
+						transcriptPath: null,
+					},
+				],
+				worktrees: [],
+				tmuxSessions: [{ name: "overstory-pane-agent", pid: 99998 }],
+				unreadMailCount: 0,
+				unreadMailScope: "orchestrator",
+				mergeQueueCount: 0,
+				recentMetricsCount: 0,
+			},
+		};
+		const out = renderAgentPanel(data, 100, 12, 3);
+		expect(out).toContain("pane-agent");
+		expect(out).toContain("live-headless");
+		const aliveMarkers = (out.match(/>/g) ?? []).length;
+		expect(aliveMarkers).toBeGreaterThanOrEqual(2);
+		expect(out).not.toContain("x");
+	});
+
+	test("spawn-per-turn worker (no tmux, no pid) renders alive when state is non-terminal (overstory-7a34)", () => {
+		// Repro: freshly slung headless lead has tmuxSession='' and pid=null.
+		// Previously fell into the tmux path → never matched → red "x" while
+		// ov feed showed live tool events from the same agent.
+		const data = {
+			...makeDashboardData({}),
+			status: {
+				currentRunId: null,
+				agents: [
+					{
+						id: "sess-spt-1",
+						agentName: "freshly-slung",
+						capability: "lead",
+						worktreePath: "/tmp/wt/freshly-slung",
+						branchName: "overstory/freshly-slung/task-l1",
+						taskId: "task-l1",
+						tmuxSession: "", // headless
+						state: "working" as const,
+						pid: null, // spawn-per-turn: no persistent process between turns
+						parentAgent: null,
+						depth: 0,
+						runId: null,
+						startedAt: new Date(Date.now() - 5_000).toISOString(),
+						lastActivity: new Date().toISOString(),
+						escalationLevel: 0,
+						stalledSince: null,
+						transcriptPath: null,
+					},
+				],
+				worktrees: [],
+				tmuxSessions: [],
+				unreadMailCount: 0,
+				unreadMailScope: "orchestrator",
+				mergeQueueCount: 0,
+				recentMetricsCount: 0,
+			},
+		};
+		const out = renderAgentPanel(data, 100, 12, 3);
+		expect(out).toContain("freshly-slung");
+		// Green ">" — agent is logically alive between turns
+		expect(out).toContain(">");
+		// No red marker should be present (name 'freshly-slung' has no 'x')
+		expect(out).not.toContain("x");
+	});
+
+	test("spawn-per-turn worker in zombie state renders dead marker (overstory-7a34)", () => {
+		const data = {
+			...makeDashboardData({}),
+			status: {
+				currentRunId: null,
+				agents: [
+					{
+						id: "sess-spt-2",
+						agentName: "abandoned-spt",
+						capability: "builder",
+						worktreePath: "/tmp/wt/abandoned-spt",
+						branchName: "overstory/abandoned-spt/task-a1",
+						taskId: "task-a1",
+						tmuxSession: "",
+						state: "zombie" as const,
+						pid: null,
+						parentAgent: null,
+						depth: 0,
+						runId: null,
+						startedAt: new Date(Date.now() - 600_000).toISOString(),
+						lastActivity: new Date(Date.now() - 600_000).toISOString(),
+						escalationLevel: 0,
+						stalledSince: null,
+						transcriptPath: null,
+					},
+				],
+				worktrees: [],
+				tmuxSessions: [],
+				unreadMailCount: 0,
+				unreadMailScope: "orchestrator",
+				mergeQueueCount: 0,
+				recentMetricsCount: 0,
+			},
+		};
+		const out = renderAgentPanel(data, 100, 12, 3);
+		expect(out).toContain("abandoned-spt");
+		expect(out).toContain("x");
+	});
+
+	test("headless agent renders dead marker when tmux session list is non-empty", () => {
+		const deadPid = 2_147_483_647;
+		const data = {
+			...makeDashboardData({}),
+			status: {
+				currentRunId: null,
+				agents: [
+					{
+						id: "sess-dead-headless-1",
+						agentName: "gone-headless",
+						capability: "builder",
+						worktreePath: "/tmp/wt/gone-headless",
+						branchName: "overstory/gone-headless/task-g1",
+						taskId: "task-g1",
+						tmuxSession: "", // headless
+						state: "working" as const,
+						pid: deadPid,
+						parentAgent: null,
+						depth: 0,
+						runId: null,
+						startedAt: new Date(Date.now() - 10_000).toISOString(),
+						lastActivity: new Date().toISOString(),
+						escalationLevel: 0,
+						stalledSince: null,
+						transcriptPath: null,
+					},
+				],
+				worktrees: [],
+				tmuxSessions: [{ name: "overstory-other-tmux", pid: 11111 }],
+				unreadMailCount: 0,
+				unreadMailScope: "orchestrator",
+				mergeQueueCount: 0,
+				recentMetricsCount: 0,
+			},
+		};
+		const out = renderAgentPanel(data, 100, 12, 3);
+		expect(out).toContain("x");
+		expect(out).toContain("gone-headless");
 	});
 });
 

@@ -19,10 +19,16 @@ import { mkdir, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEventStore } from "../events/store.ts";
-import { createSessionStore } from "../sessions/store.ts";
+import { createMailStore } from "../mail/store.ts";
+import { createRunStore, createSessionStore } from "../sessions/store.ts";
 import { cleanupTempDir } from "../test-helpers.ts";
-import type { AgentSession, HealthCheck, StoredEvent } from "../types.ts";
-import { buildCompletionMessage, runDaemonTick, startDaemon } from "./daemon.ts";
+import type { AgentSession, HealthCheck, StoredEvent, WorkerDiedPayload } from "../types.ts";
+import {
+	buildCompletionMessage,
+	type RunIdWarnState,
+	runDaemonTick,
+	startDaemon,
+} from "./daemon.ts";
 
 // === Test constants ===
 
@@ -48,6 +54,34 @@ function writeSessionsToStore(root: string, sessions: AgentSession[]): void {
 		store.upsert(session);
 	}
 	store.close();
+}
+
+/**
+ * Mark a run as active: write current-run.txt AND insert a row in the runs
+ * table (sessions.db). The watchdog now validates the id against the runs
+ * table before running the run-completion check (overstory-87bf), so tests
+ * must seed both surfaces to mirror production reality.
+ */
+async function setActiveRun(root: string, runId: string): Promise<void> {
+	await Bun.write(join(root, ".overstory", "current-run.txt"), runId);
+	const runStore = createRunStore(join(root, ".overstory", "sessions.db"));
+	try {
+		runStore.createRun({
+			id: runId,
+			startedAt: new Date().toISOString(),
+			coordinatorSessionId: null,
+			status: "active",
+		});
+	} catch {
+		// Row may already exist (re-seeding within one test) — non-fatal.
+	} finally {
+		runStore.close();
+	}
+}
+
+/** Build a fresh, isolated RunIdWarnState for tests (overstory-87bf). */
+function freshRunIdWarnState(): RunIdWarnState {
+	return { missingFileWarned: false, unknownIds: new Set() };
 }
 
 /** Read sessions from the SessionStore (sessions.db) at the given root. */
@@ -495,6 +529,123 @@ describe("daemon tick", () => {
 		// Escalation is reset after termination
 		expect(reloaded[0]?.escalationLevel).toBe(0);
 		expect(reloaded[0]?.stalledSince).toBeNull();
+	});
+
+	// Regression tests for overstory-74ce: killAgent() must never call
+	// tmux.killSession("") for headless agents — an empty `-t` argument is
+	// prefix-matched and would wildcard-kill the entire overstory tmux server.
+
+	test("spawn-per-turn agent at level 3 termination does NOT call tmux.killSession", async () => {
+		const nudgeIntervalMs = 60_000;
+		const stalledSince = new Date(Date.now() - 4 * nudgeIntervalMs).toISOString();
+		const staleActivity = new Date(Date.now() - THRESHOLDS.staleThresholdMs * 2).toISOString();
+
+		// Spawn-per-turn worker between turns: tmuxSession === "" AND pid === null.
+		// Before the fix, killAgent fell through to tmux.killSession("") which
+		// prefix-matches every session in the overstory tmux server.
+		const session = makeSession({
+			agentName: "spawn-per-turn-doomed",
+			tmuxSession: "",
+			pid: null,
+			state: "stalled",
+			lastActivity: staleActivity,
+			escalationLevel: 2,
+			stalledSince,
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		// No tmux sessions registered — emulates production where the spawn-per-turn
+		// agent has no named session.
+		const tmuxMock = tmuxWithLiveness({});
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			nudgeIntervalMs,
+			tier1Enabled: false,
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_nudge: nudgeTracker().nudge,
+			_eventStore: null,
+			_recordFailure: async () => {},
+			_getConnection: () => undefined,
+			_removeConnection: () => {},
+			_tailerRegistry: new Map(),
+			_findLatestStdoutLog: async () => null,
+		});
+
+		// Critical assertion: no wildcard kill attempt. tmuxMock.killed must be empty.
+		expect(tmuxMock.killed).toHaveLength(0);
+
+		// The session is still transitioned to zombie — termination semantics are preserved,
+		// just without the wildcard tmux kill.
+		const reloaded = readSessionsFromStore(tempRoot);
+		expect(reloaded[0]?.state).toBe("zombie");
+		expect(reloaded[0]?.escalationLevel).toBe(0);
+		expect(reloaded[0]?.stalledSince).toBeNull();
+	});
+
+	test("long-lived headless agent at level 3 termination kills pid tree, not tmux", async () => {
+		const nudgeIntervalMs = 60_000;
+		const stalledSince = new Date(Date.now() - 4 * nudgeIntervalMs).toISOString();
+		const staleActivity = new Date(Date.now() - THRESHOLDS.staleThresholdMs * 2).toISOString();
+
+		// Long-lived headless capability (e.g. coordinator/orchestrator/monitor):
+		// tmuxSession === "" AND pid !== null. The PID tree should be killed; tmux
+		// must not be touched.
+		const session = makeSession({
+			agentName: "headless-long-lived-doomed",
+			tmuxSession: "",
+			pid: process.pid, // alive PID — health eval won't short-circuit to direct terminate
+			state: "stalled",
+			lastActivity: staleActivity,
+			escalationLevel: 2,
+			stalledSince,
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		const killedPids: number[] = [];
+		const procMock = {
+			isAlive: (pid: number) => {
+				try {
+					process.kill(pid, 0);
+					return true;
+				} catch {
+					return false;
+				}
+			},
+			killTree: async (pid: number) => {
+				killedPids.push(pid);
+			},
+		};
+
+		const tmuxMock = tmuxWithLiveness({});
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			nudgeIntervalMs,
+			tier1Enabled: false,
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_nudge: nudgeTracker().nudge,
+			_process: procMock,
+			_eventStore: null,
+			_recordFailure: async () => {},
+			_getConnection: () => undefined,
+			_removeConnection: () => {},
+			_tailerRegistry: new Map(),
+			_findLatestStdoutLog: async () => null,
+		});
+
+		// PID tree was killed; tmux.killSession was never called.
+		expect(killedPids).toContain(process.pid);
+		expect(tmuxMock.killed).toHaveLength(0);
+
+		const reloaded = readSessionsFromStore(tempRoot);
+		expect(reloaded[0]?.state).toBe("zombie");
 	});
 
 	test("triage retry sends nudge with recovery message", async () => {
@@ -1084,7 +1235,7 @@ describe("daemon event recording", () => {
 
 		// Write a current-run.txt
 		const runId = "run-2026-02-13T10-00-00-000Z";
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const eventsDbPath = join(tempRoot, ".overstory", "events.db");
 		const eventStore = createEventStore(eventsDbPath);
@@ -1421,7 +1572,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const nudgeMock = nudgeTracker();
 
@@ -1467,7 +1618,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const nudgeMock = nudgeTracker();
 
@@ -1509,7 +1660,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 		// Pre-write dedup marker
 		await Bun.write(join(tempRoot, ".overstory", "run-complete-notified.txt"), runId);
 
@@ -1613,7 +1764,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const nudgeMock = nudgeTracker();
 
@@ -1659,7 +1810,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const nudgeMock = nudgeTracker();
 
@@ -1701,7 +1852,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const eventsDbPath = join(tempRoot, ".overstory", "events.db");
 		const eventStore = createEventStore(eventsDbPath);
@@ -1759,7 +1910,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		await runDaemonTick({
 			root: tempRoot,
@@ -1800,7 +1951,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const nudgeMock = nudgeTracker();
 
@@ -1846,7 +1997,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const nudgeMock = nudgeTracker();
 
@@ -1881,7 +2032,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const nudgeMock = nudgeTracker();
 
@@ -1916,7 +2067,7 @@ describe("run completion detection", () => {
 		];
 
 		writeSessionsToStore(tempRoot, sessions);
-		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+		await setActiveRun(tempRoot, runId);
 
 		const eventsDbPath = join(tempRoot, ".overstory", "events.db");
 		const eventStore = createEventStore(eventsDbPath);
@@ -1949,6 +2100,349 @@ describe("run completion detection", () => {
 		} finally {
 			store.close();
 		}
+	});
+
+	// overstory-e130: a run that mixes `completed` and `zombie` workers must
+	// still notify the coordinator. Before the fix, the every-completed predicate
+	// stranded the coordinator forever whenever the watchdog killed any worker.
+	test("nudges coordinator when workers are a mix of completed and zombie", async () => {
+		const sessions = [
+			makeSession({
+				id: "s1",
+				agentName: "builder-one",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-one",
+				state: "completed",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+			makeSession({
+				id: "s2",
+				agentName: "builder-two",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-two",
+				state: "zombie",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+		];
+
+		writeSessionsToStore(tempRoot, sessions);
+		await setActiveRun(tempRoot, runId);
+
+		const nudgeMock = nudgeTracker();
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			_tmux: tmuxAllAlive(),
+			_triage: triageAlways("extend"),
+			_nudge: nudgeMock.nudge,
+			_eventStore: null,
+		});
+
+		const coordinatorNudges = nudgeMock.calls.filter(
+			(c) => c.agentName === "coordinator" && c.message.includes("WATCHDOG"),
+		);
+		expect(coordinatorNudges).toHaveLength(1);
+		expect(coordinatorNudges[0]?.message).toContain("have terminated");
+		expect(coordinatorNudges[0]?.message).toContain("(1 completed, 1 zombie)");
+	});
+
+	test("nudges coordinator when every worker is zombie", async () => {
+		const sessions = [
+			makeSession({
+				id: "s1",
+				agentName: "builder-one",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-one",
+				state: "zombie",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+			makeSession({
+				id: "s2",
+				agentName: "builder-two",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-two",
+				state: "zombie",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+		];
+
+		writeSessionsToStore(tempRoot, sessions);
+		await setActiveRun(tempRoot, runId);
+
+		const nudgeMock = nudgeTracker();
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			_tmux: tmuxAllAlive(),
+			_triage: triageAlways("extend"),
+			_nudge: nudgeMock.nudge,
+			_eventStore: null,
+		});
+
+		const coordinatorNudges = nudgeMock.calls.filter(
+			(c) => c.agentName === "coordinator" && c.message.includes("WATCHDOG"),
+		);
+		expect(coordinatorNudges).toHaveLength(1);
+		expect(coordinatorNudges[0]?.message).toContain("(0 completed, 2 zombie)");
+	});
+
+	test("does not nudge when a working worker remains alongside a zombie", async () => {
+		const sessions = [
+			makeSession({
+				id: "s1",
+				agentName: "builder-one",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-one",
+				state: "zombie",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+			makeSession({
+				id: "s2",
+				agentName: "builder-two",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-two",
+				state: "working",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+		];
+
+		writeSessionsToStore(tempRoot, sessions);
+		await setActiveRun(tempRoot, runId);
+
+		const nudgeMock = nudgeTracker();
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			_tmux: tmuxAllAlive(),
+			_triage: triageAlways("extend"),
+			_nudge: nudgeMock.nudge,
+			_eventStore: null,
+		});
+
+		const coordinatorNudges = nudgeMock.calls.filter(
+			(c) => c.agentName === "coordinator" && c.message.includes("WATCHDOG"),
+		);
+		expect(coordinatorNudges).toHaveLength(0);
+	});
+
+	test("run_complete event with zombies records zombieAgents and warn level", async () => {
+		const sessions = [
+			makeSession({
+				id: "s1",
+				agentName: "builder-one",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-one",
+				state: "completed",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+			makeSession({
+				id: "s2",
+				agentName: "builder-two",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-two",
+				state: "zombie",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+		];
+
+		writeSessionsToStore(tempRoot, sessions);
+		await setActiveRun(tempRoot, runId);
+
+		const eventsDbPath = join(tempRoot, ".overstory", "events.db");
+		const eventStore = createEventStore(eventsDbPath);
+
+		try {
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_nudge: nudgeTracker().nudge,
+				_eventStore: eventStore,
+			});
+		} finally {
+			eventStore.close();
+		}
+
+		const store = createEventStore(eventsDbPath);
+		try {
+			const events = store.getTimeline({ since: "2000-01-01T00:00:00Z" });
+			const runCompleteEvent = events.find((e) => {
+				if (!e.data) return false;
+				const data = JSON.parse(e.data) as Record<string, unknown>;
+				return data.type === "run_complete";
+			});
+			expect(runCompleteEvent).toBeDefined();
+			expect(runCompleteEvent?.level).toBe("warn");
+			const data = JSON.parse(runCompleteEvent?.data ?? "{}") as Record<string, unknown>;
+			expect(data.completedAgents).toEqual(["builder-one"]);
+			expect(data.zombieAgents).toEqual(["builder-two"]);
+			expect(data.workerCount).toBe(2);
+		} finally {
+			store.close();
+		}
+	});
+
+	test("missing current-run.txt: warns once, skips run-completion check (overstory-87bf)", async () => {
+		const sessions = [
+			makeSession({
+				id: "s1",
+				agentName: "builder-one",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-one",
+				state: "completed",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+			makeSession({
+				id: "s2",
+				agentName: "builder-two",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-two",
+				state: "completed",
+				runId,
+				lastActivity: new Date().toISOString(),
+			}),
+		];
+
+		writeSessionsToStore(tempRoot, sessions);
+		// Deliberately do NOT call setActiveRun — current-run.txt absent.
+
+		const nudgeMock = nudgeTracker();
+		const warnState = freshRunIdWarnState();
+
+		const stderrWrites: string[] = [];
+		const originalStderrWrite = process.stderr.write.bind(process.stderr);
+		process.stderr.write = ((chunk: unknown, ...rest: unknown[]) => {
+			stderrWrites.push(typeof chunk === "string" ? chunk : String(chunk));
+			return originalStderrWrite(chunk as string, ...(rest as []));
+		}) as typeof process.stderr.write;
+
+		try {
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_nudge: nudgeMock.nudge,
+				_eventStore: null,
+				_runIdWarnState: warnState,
+			});
+
+			// Tick again to confirm the warning dedupes for the same cause.
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_nudge: nudgeMock.nudge,
+				_eventStore: null,
+				_runIdWarnState: warnState,
+			});
+		} finally {
+			process.stderr.write = originalStderrWrite;
+		}
+
+		// Run-completion skip is observable: no coordinator nudge was sent.
+		const coordinatorNudges = nudgeMock.calls.filter(
+			(c) => c.agentName === "coordinator" && c.message.includes("WATCHDOG"),
+		);
+		expect(coordinatorNudges).toHaveLength(0);
+
+		// Warning logged exactly once across the two ticks.
+		expect(warnState.missingFileWarned).toBe(true);
+		const missingWarnings = stderrWrites.filter((w) =>
+			w.includes("[WATCHDOG] current-run.txt missing"),
+		);
+		expect(missingWarnings).toHaveLength(1);
+	});
+
+	test("stale current-run.txt id (no row in runs table): warns once per id, skips check (overstory-87bf)", async () => {
+		const staleId = "run-stale-2026-01-01T00-00-00-000Z";
+		const sessions = [
+			makeSession({
+				id: "s1",
+				agentName: "builder-one",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-one",
+				state: "completed",
+				runId: staleId,
+				lastActivity: new Date().toISOString(),
+			}),
+			makeSession({
+				id: "s2",
+				agentName: "builder-two",
+				capability: "builder",
+				tmuxSession: "overstory-agent-fake-builder-two",
+				state: "completed",
+				runId: staleId,
+				lastActivity: new Date().toISOString(),
+			}),
+		];
+
+		writeSessionsToStore(tempRoot, sessions);
+		// Write current-run.txt but DO NOT seed the runs table — the lookup
+		// will return null, exercising the stale-id branch.
+		await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), staleId);
+
+		const nudgeMock = nudgeTracker();
+		const warnState = freshRunIdWarnState();
+
+		const stderrWrites: string[] = [];
+		const originalStderrWrite = process.stderr.write.bind(process.stderr);
+		process.stderr.write = ((chunk: unknown, ...rest: unknown[]) => {
+			stderrWrites.push(typeof chunk === "string" ? chunk : String(chunk));
+			return originalStderrWrite(chunk as string, ...(rest as []));
+		}) as typeof process.stderr.write;
+
+		try {
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_nudge: nudgeMock.nudge,
+				_eventStore: null,
+				_runIdWarnState: warnState,
+			});
+
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_nudge: nudgeMock.nudge,
+				_eventStore: null,
+				_runIdWarnState: warnState,
+			});
+		} finally {
+			process.stderr.write = originalStderrWrite;
+		}
+
+		// Run-completion skip is observable: no coordinator nudge.
+		const coordinatorNudges = nudgeMock.calls.filter(
+			(c) => c.agentName === "coordinator" && c.message.includes("WATCHDOG"),
+		);
+		expect(coordinatorNudges).toHaveLength(0);
+
+		// Stale-id was recorded once, missing-file path was NOT triggered.
+		expect(warnState.unknownIds.has(staleId)).toBe(true);
+		expect(warnState.missingFileWarned).toBe(false);
+		const staleWarnings = stderrWrites.filter((w) =>
+			w.includes(`points to unknown run "${staleId}"`),
+		);
+		expect(staleWarnings).toHaveLength(1);
 	});
 });
 
@@ -2024,6 +2518,56 @@ describe("buildCompletionMessage", () => {
 		];
 		const msg = buildCompletionMessage(sessions, testRunId);
 		expect(msg).toContain("3");
+	});
+
+	// overstory-e130: zombie workers must surface in the message so the coordinator
+	// reads "have terminated (...)" instead of being misled into "have completed".
+	test("mix of completed and zombie workers → 'have terminated' with completed/zombie qualifier", () => {
+		const sessions = [
+			makeSession({ capability: "builder", agentName: "builder-1", state: "completed" }),
+			makeSession({ capability: "builder", agentName: "builder-2", state: "zombie" }),
+			makeSession({ capability: "builder", agentName: "builder-3", state: "completed" }),
+		];
+		const msg = buildCompletionMessage(sessions, testRunId);
+		expect(msg).toContain("have terminated");
+		expect(msg).toContain("(2 completed, 1 zombie)");
+		expect(msg).not.toContain("have completed");
+		// Capability-specific suffix is preserved
+		expect(msg).toContain("Awaiting lead verification");
+	});
+
+	test("all-zombie batch → '(0 completed, N zombie)' qualifier", () => {
+		const sessions = [
+			makeSession({ capability: "scout", agentName: "scout-1", state: "zombie" }),
+			makeSession({ capability: "scout", agentName: "scout-2", state: "zombie" }),
+		];
+		const msg = buildCompletionMessage(sessions, testRunId);
+		expect(msg).toContain("have terminated");
+		expect(msg).toContain("(0 completed, 2 zombie)");
+		expect(msg).toContain("Ready for next phase");
+	});
+
+	test("mixed-capability batch with zombies includes both qualifier and capability breakdown", () => {
+		const sessions = [
+			makeSession({ capability: "scout", agentName: "scout-1", state: "completed" }),
+			makeSession({ capability: "builder", agentName: "builder-1", state: "zombie" }),
+		];
+		const msg = buildCompletionMessage(sessions, testRunId);
+		expect(msg).toContain("have terminated");
+		expect(msg).toContain("(1 completed, 1 zombie)");
+		expect(msg).toContain("(builder, scout)");
+		expect(msg).toContain("Ready for next steps");
+	});
+
+	test("all-completed batch keeps existing 'have completed' phrasing (no zombie qualifier)", () => {
+		const sessions = [
+			makeSession({ capability: "builder", agentName: "builder-1", state: "completed" }),
+			makeSession({ capability: "builder", agentName: "builder-2", state: "completed" }),
+		];
+		const msg = buildCompletionMessage(sessions, testRunId);
+		expect(msg).toContain("have completed");
+		expect(msg).not.toContain("have terminated");
+		expect(msg).not.toContain("zombie");
 	});
 });
 
@@ -2282,6 +2826,78 @@ describe("headless agent stale detection via events.db (Bug 2)", () => {
 			eventStore.close();
 		}
 	});
+
+	test("spawn-per-turn worker (pid=null) is NOT flagged zombie when actively emitting events (overstory-7a34)", async () => {
+		// Repro: ov sling --capability lead → freshly slung headless lead has
+		// tmuxSession='' AND pid=null (no persistent process between turns).
+		// Previously the daemon's event-based liveness fallback was gated by
+		// `pid !== null`, so spawn-per-turn workers' lastActivity was never
+		// refreshed from events.db and they would flip to stalled / zombie
+		// despite ov feed showing live tool activity.
+		const staleActivity = new Date(Date.now() - THRESHOLDS.staleThresholdMs * 2).toISOString();
+
+		const session = makeSession({
+			agentName: "spawn-per-turn-lead",
+			capability: "lead",
+			tmuxSession: "", // headless
+			pid: null, // spawn-per-turn: no persistent process between turns
+			state: "working",
+			lastActivity: staleActivity, // stale — would flip without event fallback
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		const eventsDbPath = join(tempRoot, ".overstory", "events.db");
+		const eventStore = createEventStore(eventsDbPath);
+
+		try {
+			// Insert a recent tool event for this agent (matches ov feed activity)
+			eventStore.insert({
+				runId: null,
+				agentName: "spawn-per-turn-lead",
+				sessionId: null,
+				eventType: "tool_end",
+				toolName: "Edit",
+				toolArgs: null,
+				toolDurationMs: 50,
+				level: "info",
+				data: null,
+			});
+
+			const checks: HealthCheck[] = [];
+
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				onHealthCheck: (c) => checks.push(c),
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_process: { isAlive: () => true, killTree: async () => {} },
+				_eventStore: eventStore,
+				_recordFailure: async () => {},
+				_getConnection: () => undefined,
+				_removeConnection: () => {},
+				_tailerRegistry: new Map(),
+				_findLatestStdoutLog: async () => null,
+			});
+
+			// lastActivity refreshed from events.db → spawn-per-turn evaluation
+			// path keeps the agent active (action=none), NOT zombie. The
+			// healthy classification reports `between_turns` (overstory-3087)
+			// for spawn-per-turn workers; the legacy `working` row stays at
+			// `working` on disk because the matrix does not list `working` as
+			// a predecessor of `between_turns` and the CAS rejects the write
+			// (the substate cycle is reserved for the turn-runner).
+			expect(checks).toHaveLength(1);
+			expect(checks[0]?.action).toBe("none");
+			expect(checks[0]?.state).toBe("between_turns");
+
+			const reloaded = readSessionsFromStore(tempRoot);
+			expect(reloaded[0]?.state).toBe("working");
+		} finally {
+			eventStore.close();
+		}
+	});
 });
 
 // ============================================================
@@ -2310,7 +2926,7 @@ describe("startDaemon() stop() cleans up tailer registry", () => {
 					agentName: "agent-one",
 					logPath: "/fake/one/stdout.log",
 					stop: () => {
-						stopped["tailer1"] = true;
+						stopped.tailer1 = true;
 					},
 				},
 			],
@@ -2320,7 +2936,7 @@ describe("startDaemon() stop() cleans up tailer registry", () => {
 					agentName: "agent-two",
 					logPath: "/fake/two/stdout.log",
 					stop: () => {
-						stopped["tailer2"] = true;
+						stopped.tailer2 = true;
 					},
 				},
 			],
@@ -2350,8 +2966,8 @@ describe("startDaemon() stop() cleans up tailer registry", () => {
 
 		daemon.stop();
 
-		expect(stopped["tailer1"]).toBe(true);
-		expect(stopped["tailer2"]).toBe(true);
+		expect(stopped.tailer1).toBe(true);
+		expect(stopped.tailer2).toBe(true);
 		expect(registry.size).toBe(0);
 	});
 });
@@ -2486,5 +3102,620 @@ describe("triage concurrency limit (_maxTriagePerTick)", () => {
 
 		// Only 2 of the 4 sessions should have triggered triage
 		expect(triageCallCount).toBe(2);
+	});
+});
+
+// ============================================================
+// RuntimeConnection-aware kill and liveness (overstory-32cd)
+// ============================================================
+
+describe("killAgent uses RuntimeConnection.abort() when available", () => {
+	const deadPid = 999999;
+
+	function connProcessTracker(): {
+		isAlive: (pid: number) => boolean;
+		killTree: (pid: number) => Promise<void>;
+		killed: number[];
+	} {
+		const killed: number[] = [];
+		return {
+			isAlive: (pid: number) => {
+				try {
+					process.kill(pid, 0);
+					return true;
+				} catch {
+					return false;
+				}
+			},
+			killTree: async (pid: number) => {
+				killed.push(pid);
+			},
+			killed,
+		};
+	}
+
+	// Test A: killAgent uses connection.abort() when a connection is registered
+	test("Test A: abort() called for ZFC-terminated headless agent with registered connection", async () => {
+		const session = makeSession({
+			agentName: "headless-conn-agent",
+			tmuxSession: "", // headless
+			pid: deadPid, // dead PID → ZFC fires (pidAlive=false)
+			state: "working",
+			lastActivity: new Date().toISOString(),
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		let abortCount = 0;
+		const removedNames: string[] = [];
+		const proc = connProcessTracker();
+		const tmuxMock = tmuxWithLiveness({ "": true });
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_process: proc,
+			_eventStore: null,
+			_recordFailure: async () => {},
+			_getConnection: (name: string) => {
+				if (name !== "headless-conn-agent") return undefined;
+				return {
+					getState: async () => ({ status: "working" as const }),
+					sendPrompt: async () => {},
+					followUp: async () => {},
+					abort: async () => {
+						abortCount++;
+					},
+					close: () => {},
+				};
+			},
+			_removeConnection: (name: string) => {
+				removedNames.push(name);
+			},
+			_tailerRegistry: new Map(),
+			_findLatestStdoutLog: async () => null,
+			_mailStore: null,
+		});
+
+		// abort() called exactly once
+		expect(abortCount).toBe(1);
+		// killTree NOT called (abort succeeded)
+		expect(proc.killed).toHaveLength(0);
+		// removeConnection called for the agent
+		expect(removedNames).toContain("headless-conn-agent");
+	});
+
+	// Test B: killAgent falls back to killTree when conn.abort() throws
+	test("Test B: killTree called as fallback when abort() throws", async () => {
+		const session = makeSession({
+			agentName: "headless-abort-fail",
+			tmuxSession: "",
+			pid: deadPid,
+			state: "working",
+			lastActivity: new Date().toISOString(),
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		let abortCalled = false;
+		const removedNames: string[] = [];
+		const proc = connProcessTracker();
+		const tmuxMock = tmuxWithLiveness({ "": true });
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_process: proc,
+			_eventStore: null,
+			_recordFailure: async () => {},
+			_getConnection: (name: string) => {
+				if (name !== "headless-abort-fail") return undefined;
+				return {
+					getState: async () => ({ status: "working" as const }),
+					sendPrompt: async () => {},
+					followUp: async () => {},
+					abort: async () => {
+						abortCalled = true;
+						throw new Error("process already dead");
+					},
+					close: () => {},
+				};
+			},
+			_removeConnection: (name: string) => {
+				removedNames.push(name);
+			},
+			_tailerRegistry: new Map(),
+			_findLatestStdoutLog: async () => null,
+			_mailStore: null,
+		});
+
+		// abort() was attempted
+		expect(abortCalled).toBe(true);
+		// killTree called as defense-in-depth fallback
+		expect(proc.killed).toContain(deadPid);
+		// removeConnection still called (before fallback)
+		expect(removedNames).toContain("headless-abort-fail");
+	});
+
+	// Test C: killAgent uses conn.abort() for triage-terminate path (level 2 → terminate)
+	test("Test C: abort() called in triage-terminate path (level 2 → terminate verdict)", async () => {
+		const nudgeIntervalMs = 60_000;
+		// stalledSince 2.5 intervals ago → expectedLevel = floor(2.5) = 2 → triage fires
+		const stalledSince = new Date(Date.now() - 2.5 * nudgeIntervalMs).toISOString();
+		// staleActivity: 2x staleThreshold (60s) — stale but not zombie, so escalate fires
+		const staleActivity = new Date(Date.now() - THRESHOLDS.staleThresholdMs * 2).toISOString();
+
+		const session = makeSession({
+			agentName: "headless-triage-conn",
+			tmuxSession: "",
+			pid: process.pid, // alive — ZFC won't fire; escalation path triggers triage
+			state: "stalled",
+			lastActivity: staleActivity,
+			escalationLevel: 1,
+			stalledSince,
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		let abortCount = 0;
+		const removedNames: string[] = [];
+		const proc = connProcessTracker();
+		const tmuxMock = tmuxWithLiveness({ "": true });
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			nudgeIntervalMs,
+			tier1Enabled: true,
+			_tmux: tmuxMock,
+			_triage: triageAlways("terminate"),
+			_nudge: nudgeTracker().nudge,
+			_process: proc,
+			_eventStore: null,
+			_recordFailure: async () => {},
+			// getState returns "error" so lastActivity is NOT refreshed — stale condition preserved
+			_getConnection: (name: string) => {
+				if (name !== "headless-triage-conn") return undefined;
+				return {
+					getState: async () => ({ status: "error" as const }),
+					sendPrompt: async () => {},
+					followUp: async () => {},
+					abort: async () => {
+						abortCount++;
+					},
+					close: () => {},
+				};
+			},
+			_removeConnection: (name: string) => {
+				removedNames.push(name);
+			},
+			_tailerRegistry: new Map(),
+			_findLatestStdoutLog: async () => null,
+			_mailStore: null,
+		});
+
+		// abort() called via triage-terminate → killAgent path
+		expect(abortCount).toBe(1);
+		// killTree NOT called (abort succeeded)
+		expect(proc.killed).toHaveLength(0);
+		// tmux killSession NOT called (headless path only)
+		expect(tmuxMock.killed).toHaveLength(0);
+	});
+
+	// Test D: integration — watchdog terminates a hung headless agent without touching tmux
+	test("Test D: conn.abort() called, tmux.killSession and killTree NEVER called, state → zombie", async () => {
+		const session = makeSession({
+			agentName: "headless-zombie-conn",
+			tmuxSession: "",
+			pid: deadPid, // dead PID → ZFC fires
+			state: "working",
+			lastActivity: new Date(Date.now() - THRESHOLDS.zombieThresholdMs * 2).toISOString(),
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		let abortCount = 0;
+		const proc = connProcessTracker();
+		const tmuxMock = tmuxWithLiveness({ "": true });
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_process: proc,
+			_eventStore: null,
+			_recordFailure: async () => {},
+			_getConnection: (name: string) => {
+				if (name !== "headless-zombie-conn") return undefined;
+				return {
+					getState: async () => ({ status: "working" as const }),
+					sendPrompt: async () => {},
+					followUp: async () => {},
+					abort: async () => {
+						abortCount++;
+					},
+					close: () => {},
+				};
+			},
+			_removeConnection: () => {},
+			_tailerRegistry: new Map(),
+			_findLatestStdoutLog: async () => null,
+			_mailStore: null,
+		});
+
+		// abort() called
+		expect(abortCount).toBe(1);
+		// tmux.killSession NEVER called
+		expect(tmuxMock.killed).toHaveLength(0);
+		// killTree NEVER called (abort succeeded)
+		expect(proc.killed).toHaveLength(0);
+		// Agent state transitioned to zombie
+		const reloaded = readSessionsFromStore(tempRoot);
+		expect(reloaded[0]?.state).toBe("zombie");
+	});
+
+	// Test E: liveness — getState() returning error status drives the agent toward zombie
+	test("Test E: getState()=error + dead PID → tmuxAlive=false, state=zombie, terminate, abort called", async () => {
+		const session = makeSession({
+			agentName: "headless-error-conn",
+			tmuxSession: "",
+			pid: deadPid, // dead → ZFC fires: pidAlive=false
+			state: "working",
+			lastActivity: new Date().toISOString(), // fresh — time-based won't fire; ZFC does
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		let abortCount = 0;
+		const proc = connProcessTracker();
+		const checks: HealthCheck[] = [];
+		const tmuxMock = tmuxWithLiveness({ "": true });
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			onHealthCheck: (c) => checks.push(c),
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_process: proc,
+			_eventStore: null,
+			_recordFailure: async () => {},
+			_getConnection: (name: string) => {
+				if (name !== "headless-error-conn") return undefined;
+				return {
+					getState: async () => ({ status: "error" as const }),
+					sendPrompt: async () => {},
+					followUp: async () => {},
+					abort: async () => {
+						abortCount++;
+					},
+					close: () => {},
+				};
+			},
+			_removeConnection: () => {},
+			_tailerRegistry: new Map(),
+			_findLatestStdoutLog: async () => null,
+			_mailStore: null,
+		});
+
+		// Health check produced
+		expect(checks).toHaveLength(1);
+		// tmuxAlive=false because getState returned "error"
+		expect(checks[0]?.tmuxAlive).toBe(false);
+		// ZFC fires (pidAlive=false for dead PID) → zombie/terminate
+		expect(checks[0]?.state).toBe("zombie");
+		expect(checks[0]?.action).toBe("terminate");
+		// abort() called via killAgent
+		expect(abortCount).toBe(1);
+		// killTree NOT called (abort succeeded)
+		expect(proc.killed).toHaveLength(0);
+	});
+
+	// Test F: connection.getState() rejection drops the connection and falls back to tmux
+	test("Test F: getState() rejection → removeConnection called, tmux liveness used as fallback", async () => {
+		const session = makeSession({
+			agentName: "headless-reject-conn",
+			tmuxSession: "",
+			pid: process.pid, // alive
+			state: "working",
+			lastActivity: new Date().toISOString(), // fresh — no stale
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		const removedNames: string[] = [];
+		const checks: HealthCheck[] = [];
+		// tmux returns alive — used as fallback when getState rejects
+		const tmuxMock = tmuxWithLiveness({ "": true });
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			onHealthCheck: (c) => checks.push(c),
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_process: { isAlive: () => true, killTree: async () => {} },
+			_eventStore: null,
+			_recordFailure: async () => {},
+			_getConnection: (name: string) => {
+				if (name !== "headless-reject-conn") return undefined;
+				return {
+					getState: () => Promise.reject(new Error("connection error")),
+					sendPrompt: async () => {},
+					followUp: async () => {},
+					abort: async () => {},
+					close: () => {},
+				};
+			},
+			_removeConnection: (name: string) => {
+				removedNames.push(name);
+			},
+			_tailerRegistry: new Map(),
+			_findLatestStdoutLog: async () => null,
+			_mailStore: null,
+		});
+
+		// removeConnection called (connection dropped after rejection)
+		expect(removedNames).toContain("headless-reject-conn");
+		// Agent is healthy (alive PID, fresh lastActivity, tmux fallback returns alive)
+		expect(checks).toHaveLength(1);
+		expect(checks[0]?.action).toBe("none");
+	});
+});
+
+// ============================================================
+// worker_died notification (overstory-c111)
+// ============================================================
+
+describe("worker_died parent notification", () => {
+	let tempRoot: string;
+
+	beforeEach(async () => {
+		tempRoot = await createTempRoot();
+	});
+
+	afterEach(async () => {
+		await cleanupTempDir(tempRoot);
+	});
+
+	test("terminate path sends worker_died mail to parentAgent on first zombify", async () => {
+		const session = makeSession({
+			agentName: "dead-builder",
+			capability: "builder",
+			parentAgent: "lead-1",
+			tmuxSession: "overstory-dead-builder",
+			state: "working",
+			lastActivity: new Date().toISOString(),
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		const mailDb = join(tempRoot, ".overstory", "mail.db");
+		const mailStore = createMailStore(mailDb);
+
+		try {
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxWithLiveness({ "overstory-dead-builder": false }),
+				_triage: triageAlways("extend"),
+				_recordFailure: async () => {},
+				_mailStore: mailStore,
+			});
+
+			const inbox = mailStore.getUnread("lead-1");
+			expect(inbox).toHaveLength(1);
+			const msg = inbox[0];
+			expect(msg).toBeDefined();
+			if (!msg) return;
+			expect(msg.type).toBe("worker_died");
+			expect(msg.from).toBe("dead-builder");
+			expect(msg.to).toBe("lead-1");
+			expect(msg.priority).toBe("high");
+			expect(msg.payload).not.toBeNull();
+			const payload = JSON.parse(msg.payload ?? "{}") as WorkerDiedPayload;
+			expect(payload.agentName).toBe("dead-builder");
+			expect(payload.capability).toBe("builder");
+			expect(payload.terminatedBy).toBe("tier0");
+			expect(payload.reason).toBeTruthy();
+		} finally {
+			mailStore.close();
+		}
+	});
+
+	test("orphan agent (parentAgent=null) receives no notification", async () => {
+		const session = makeSession({
+			agentName: "orphan-agent",
+			parentAgent: null,
+			tmuxSession: "overstory-orphan-agent",
+			state: "working",
+			lastActivity: new Date().toISOString(),
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		const mailDb = join(tempRoot, ".overstory", "mail.db");
+		const mailStore = createMailStore(mailDb);
+
+		try {
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxWithLiveness({ "overstory-orphan-agent": false }),
+				_triage: triageAlways("extend"),
+				_recordFailure: async () => {},
+				_mailStore: mailStore,
+			});
+
+			expect(mailStore.getAll({ type: "worker_died" })).toHaveLength(0);
+		} finally {
+			mailStore.close();
+		}
+	});
+
+	test("re-tick on already-zombie session does not send a second worker_died", async () => {
+		// Subsequent ticks see the session already in `zombie`. The state matrix
+		// rejects zombie → zombie transitions, so notify is gated on `outcome.ok`.
+		const session = makeSession({
+			agentName: "re-zombie-agent",
+			parentAgent: "lead-2",
+			tmuxSession: "overstory-re-zombie-agent",
+			state: "working",
+			lastActivity: new Date().toISOString(),
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		const mailDb = join(tempRoot, ".overstory", "mail.db");
+		const mailStore = createMailStore(mailDb);
+
+		try {
+			const tickOpts = {
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxWithLiveness({ "overstory-re-zombie-agent": false }),
+				_triage: triageAlways("extend"),
+				_recordFailure: async () => {},
+				_mailStore: mailStore,
+			};
+			await runDaemonTick(tickOpts);
+			await runDaemonTick(tickOpts);
+			await runDaemonTick(tickOpts);
+
+			expect(mailStore.getAll({ to: "lead-2", type: "worker_died" })).toHaveLength(1);
+		} finally {
+			mailStore.close();
+		}
+	});
+
+	test("notifyParentOnDeath=false suppresses the synthetic mail", async () => {
+		const session = makeSession({
+			agentName: "opt-out-agent",
+			parentAgent: "lead-3",
+			tmuxSession: "overstory-opt-out-agent",
+			state: "working",
+			lastActivity: new Date().toISOString(),
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		const mailDb = join(tempRoot, ".overstory", "mail.db");
+		const mailStore = createMailStore(mailDb);
+
+		try {
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				notifyParentOnDeath: false,
+				_tmux: tmuxWithLiveness({ "overstory-opt-out-agent": false }),
+				_triage: triageAlways("extend"),
+				_recordFailure: async () => {},
+				_mailStore: mailStore,
+			});
+
+			expect(mailStore.getAll({ type: "worker_died" })).toHaveLength(0);
+			// State should still transition normally
+			const reloaded = readSessionsFromStore(tempRoot);
+			expect(reloaded[0]?.state).toBe("zombie");
+		} finally {
+			mailStore.close();
+		}
+	});
+
+	test("escalation-level-3 terminate also notifies parent with tier0 reason", async () => {
+		// Stalled agent with alive tmux: progressive escalation drives it to level 3
+		// terminate. The notify path runs through the escalation branch, not the
+		// `check.action === "terminate"` branch.
+		const stalledSince = new Date(Date.now() - 4 * 60_000).toISOString();
+		const lastActivity = new Date(Date.now() - 60_000).toISOString();
+		const session = makeSession({
+			agentName: "escalated-agent",
+			parentAgent: "coordinator",
+			tmuxSession: "overstory-escalated-agent",
+			state: "working",
+			lastActivity,
+			stalledSince,
+			escalationLevel: 3,
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		const mailDb = join(tempRoot, ".overstory", "mail.db");
+		const mailStore = createMailStore(mailDb);
+
+		try {
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				nudgeIntervalMs: 60_000,
+				_tmux: tmuxWithLiveness({ "overstory-escalated-agent": true }),
+				_triage: triageAlways("extend"),
+				_nudge: async () => ({ delivered: true }),
+				_recordFailure: async () => {},
+				_mailStore: mailStore,
+			});
+
+			const inbox = mailStore.getUnread("coordinator");
+			expect(inbox).toHaveLength(1);
+			const msg = inbox[0];
+			if (!msg) return;
+			expect(msg.type).toBe("worker_died");
+			const payload = JSON.parse(msg.payload ?? "{}") as WorkerDiedPayload;
+			expect(payload.terminatedBy).toBe("tier0");
+			expect(payload.reason).toContain("Progressive escalation");
+		} finally {
+			mailStore.close();
+		}
+	});
+
+	test("tier1 triage terminate sets terminatedBy=tier1 in payload", async () => {
+		// stalledSince must produce expectedLevel==2 from nudgeIntervalMs=60_000:
+		// floor(stalledMs / 60_000) === 2 requires 2*60_000 <= stalledMs < 3*60_000.
+		const stalledSince = new Date(Date.now() - 150_000).toISOString();
+		const lastActivity = new Date(Date.now() - 60_000).toISOString();
+		const session = makeSession({
+			agentName: "triaged-agent",
+			parentAgent: "lead-triage",
+			tmuxSession: "overstory-triaged-agent",
+			state: "working",
+			lastActivity,
+			stalledSince,
+			escalationLevel: 2,
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+
+		const mailDb = join(tempRoot, ".overstory", "mail.db");
+		const mailStore = createMailStore(mailDb);
+
+		try {
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				nudgeIntervalMs: 60_000,
+				tier1Enabled: true,
+				_tmux: tmuxWithLiveness({ "overstory-triaged-agent": true }),
+				_triage: triageAlways("terminate"),
+				_nudge: async () => ({ delivered: true }),
+				_recordFailure: async () => {},
+				_mailStore: mailStore,
+			});
+
+			const inbox = mailStore.getUnread("lead-triage");
+			expect(inbox).toHaveLength(1);
+			const msg = inbox[0];
+			if (!msg) return;
+			expect(msg.type).toBe("worker_died");
+			const payload = JSON.parse(msg.payload ?? "{}") as WorkerDiedPayload;
+			expect(payload.terminatedBy).toBe("tier1");
+			expect(payload.reason).toContain("AI triage");
+		} finally {
+			mailStore.close();
+		}
 	});
 });

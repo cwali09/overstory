@@ -12,12 +12,16 @@
  * With --clean-worktree, completed agents skip the kill step and proceed to cleanup.
  */
 
+import { unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { loadConfig } from "../config.ts";
 import { AgentError, ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
 import { printSuccess, printWarning } from "../logging/color.ts";
+import { createMailStore } from "../mail/store.ts";
 import { openSessionStore } from "../sessions/compat.ts";
+import type { MergeReadyPayload } from "../types.ts";
+import { readPidFile } from "../utils/pid.ts";
 import { removeWorktree } from "../worktree/manager.ts";
 import { isProcessAlive, isSessionAlive, killProcessTree, killSession } from "../worktree/tmux.ts";
 
@@ -47,6 +51,56 @@ export interface StopDeps {
 	_git?: {
 		deleteBranch: (repoRoot: string, branch: string) => Promise<boolean>;
 	};
+}
+
+/**
+ * Build the lead_completed nudge subject based on whether the lead actually sent
+ * merge_ready before exiting (overstory-41fe). The merge_ready close-gate
+ * (commit 3e21338) prevents leads from running `sd close` without it, but a
+ * lead can still exit (process termination, watchdog kill, manual `ov stop`)
+ * without ever having sent one. The coordinator's surfacing of this nudge
+ * needs to distinguish those two cases.
+ */
+function buildLeadCompletedSubject(agentName: string, mailDbPath: string): string {
+	let mergeReadyBranches: string[] = [];
+	let mergeReadyCount = 0;
+	try {
+		const store = createMailStore(mailDbPath);
+		try {
+			const messages = store.getAll({ from: agentName, type: "merge_ready" });
+			mergeReadyCount = messages.length;
+			for (const msg of messages) {
+				if (msg.payload === null) continue;
+				try {
+					const parsed = JSON.parse(msg.payload) as Partial<MergeReadyPayload>;
+					if (typeof parsed.branch === "string" && parsed.branch.length > 0) {
+						mergeReadyBranches.push(parsed.branch);
+					}
+				} catch {
+					// Skip messages with unparseable payloads
+				}
+			}
+		} finally {
+			store.close();
+		}
+	} catch {
+		// If the mail store can't be opened (corrupt db, permissions), fall back
+		// to the historical ambiguous phrasing rather than blocking the stop.
+		return `Lead ${agentName} completed — check mail for merge_ready/worker_done`;
+	}
+
+	if (mergeReadyCount === 0) {
+		return `Lead ${agentName} exited — no merge_ready sent, needs coordinator follow-up`;
+	}
+	// Dedupe in case a lead resent merge_ready for the same branch
+	mergeReadyBranches = Array.from(new Set(mergeReadyBranches));
+	if (mergeReadyBranches.length === 0) {
+		return `Lead ${agentName} sent ${mergeReadyCount} merge_ready (branch unknown)`;
+	}
+	if (mergeReadyBranches.length === 1) {
+		return `Lead ${agentName} sent merge_ready for branch ${mergeReadyBranches[0]}`;
+	}
+	return `Lead ${agentName} sent ${mergeReadyBranches.length} merge_ready (branches: ${mergeReadyBranches.join(", ")})`;
 }
 
 /** Delete a git branch (best-effort, non-fatal). */
@@ -115,19 +169,34 @@ export async function stopCommand(
 		}
 
 		const isZombie = session.state === "zombie";
-		const isHeadless = session.tmuxSession === "" && session.pid !== null;
+		// Headless task-scoped agents (Phase 3 spawn-per-turn): tmuxSession is ""
+		// and session.pid is null between turns. The live PID for an in-flight
+		// turn is published at .overstory/agents/<name>/turn.pid. Sapling RPC
+		// agents still use session.pid for their long-lived process.
+		const isHeadless = session.tmuxSession === "";
+		const turnPidPath = join(overstoryDir, "agents", agentName, "turn.pid");
 
 		let tmuxKilled = false;
 		let pidKilled = false;
 
 		// Skip kill operations for already-completed agents (process/tmux already gone)
 		if (!isAlreadyCompleted) {
-			if (isHeadless && session.pid !== null) {
-				// Headless agent: kill via process tree instead of tmux
-				const alive = proc.isAlive(session.pid);
-				if (alive) {
-					await proc.killTree(session.pid);
+			if (isHeadless) {
+				// Prefer the per-turn PID file (Phase 3) — this catches an in-flight
+				// claude turn for any task-scoped capability. Fall back to the
+				// session row's pid for legacy/long-lived headless runtimes (Sapling).
+				const turnPid = await readPidFile(turnPidPath);
+				const targetPid = turnPid ?? session.pid;
+				if (targetPid !== null && proc.isAlive(targetPid)) {
+					await proc.killTree(targetPid);
 					pidKilled = true;
+				}
+				// Reap the turn.pid file so a subsequent ov stop / mail injector
+				// doesn't see a stale entry. Idempotent.
+				try {
+					await unlink(turnPidPath);
+				} catch {
+					// already gone — non-fatal
 				}
 			} else {
 				// TUI agent: kill via tmux session
@@ -138,9 +207,39 @@ export async function stopCommand(
 				}
 			}
 
-			// Mark session as completed
-			store.updateState(agentName, "completed");
+			// Mark session as completed via the guarded transition. `completed` is
+			// reachable from every non-completed state (including zombie, so `ov
+			// stop` can promote a watchdog-flagged zombie to a clean completion),
+			// so the only way this rejects is if state is already `completed` —
+			// which is the no-op we want anyway. Race-safe under overstory-a993.
+			store.tryTransitionState(agentName, "completed");
 			store.updateLastActivity(agentName);
+
+			// Auto-nudge coordinator when a lead truly completes so it wakes up
+			// to process merge_ready / worker_done messages without waiting for
+			// user input. Fires from `ov stop` (real completion signal) rather
+			// than the per-turn Stop hook, which was spamming the coordinator
+			// (overstory-49a7).
+			if (session.capability === "lead") {
+				try {
+					const mailDbPath = join(overstoryDir, "mail.db");
+					const subject = buildLeadCompletedSubject(agentName, mailDbPath);
+					const nudgesDir = join(overstoryDir, "pending-nudges");
+					const { mkdir } = await import("node:fs/promises");
+					await mkdir(nudgesDir, { recursive: true });
+					const markerPath = join(nudgesDir, "coordinator.json");
+					const marker = {
+						from: agentName,
+						reason: "lead_completed",
+						subject,
+						messageId: `auto-nudge-${agentName}-${Date.now()}`,
+						createdAt: new Date().toISOString(),
+					};
+					await Bun.write(markerPath, `${JSON.stringify(marker, null, "\t")}\n`);
+				} catch {
+					// Non-fatal: nudge failure should not break stop
+				}
+			}
 		}
 
 		// Optionally remove worktree and branch (best-effort, non-fatal)

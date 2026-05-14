@@ -633,8 +633,55 @@ describe("logCommand", () => {
 		});
 	});
 
-	test("session-end writes pending-nudge marker for coordinator when lead completes", async () => {
-		// Create sessions.db with a lead agent
+	test("session-end does NOT transition lead to completed (persistent agent)", async () => {
+		// Regression test for overstory-49a7:
+		// The lead's Stop hook fires every turn (interactive Claude Code), not just at
+		// true session end. session-end must NOT mark leads completed, or they vanish
+		// from getActive() after their first turn while their tmux is still alive.
+		const dbPath = join(tempDir, ".overstory", "sessions.db");
+		const session: AgentSession = {
+			id: "session-lead",
+			agentName: "lead-alpha",
+			capability: "lead",
+			worktreePath: tempDir,
+			branchName: "lead-alpha-branch",
+			taskId: "bead-lead-001",
+			tmuxSession: "overstory-lead-alpha",
+			state: "working",
+			pid: 33333,
+			parentAgent: null,
+			depth: 0,
+			runId: null,
+			startedAt: new Date().toISOString(),
+			lastActivity: new Date(Date.now() - 60_000).toISOString(),
+			escalationLevel: 0,
+			stalledSince: null,
+			transcriptPath: null,
+		};
+		const store = createSessionStore(dbPath);
+		store.upsert(session);
+		store.close();
+
+		await logCommand(["session-end", "--agent", "lead-alpha"]);
+
+		// Lead should remain 'working', not transition to 'completed'
+		const readStore = createSessionStore(dbPath);
+		const updatedSession = readStore.getByName("lead-alpha");
+		readStore.close();
+
+		expect(updatedSession).toBeDefined();
+		expect(updatedSession?.state).toBe("working");
+		// But lastActivity should be updated
+		expect(new Date(updatedSession?.lastActivity ?? "").getTime()).toBeGreaterThan(
+			new Date(session.lastActivity).getTime(),
+		);
+	});
+
+	test("session-end does NOT write pending-nudge marker for leads (moved to ov stop)", async () => {
+		// Regression test for overstory-49a7:
+		// The lead_completed nudge used to fire from the per-turn Stop hook, spamming
+		// the coordinator with false completion signals every turn. It is now emitted
+		// only by `ov stop <lead>` (the real completion signal).
 		const dbPath = join(tempDir, ".overstory", "sessions.db");
 		const session: AgentSession = {
 			id: "session-lead",
@@ -661,17 +708,10 @@ describe("logCommand", () => {
 
 		await logCommand(["session-end", "--agent", "lead-alpha"]);
 
-		// Verify the pending-nudge marker was written for the coordinator
+		// No pending-nudge marker should be written from session-end
 		const markerPath = join(tempDir, ".overstory", "pending-nudges", "coordinator.json");
 		const markerFile = Bun.file(markerPath);
-		expect(await markerFile.exists()).toBe(true);
-
-		const marker = JSON.parse(await markerFile.text());
-		expect(marker.from).toBe("lead-alpha");
-		expect(marker.reason).toBe("lead_completed");
-		expect(marker.subject).toContain("lead-alpha");
-		expect(marker.messageId).toContain("auto-nudge-lead-alpha-");
-		expect(marker.createdAt).toBeDefined();
+		expect(await markerFile.exists()).toBe(false);
 	});
 
 	test("session-end does NOT write pending-nudge marker for non-lead agents", async () => {
@@ -1259,6 +1299,81 @@ describe("logCommand", () => {
 		expect(mail?.body).toContain("10 tool calls");
 		expect(mail?.body).toContain("pattern"); // At least 1 pattern insight
 	});
+
+	test("threads outcomeStatus into per-domain reference and per-insight records", async () => {
+		const learnResult: MulchLearnResult = {
+			success: true,
+			command: "mulch learn",
+			changedFiles: ["src/foo.ts"],
+			suggestedDomains: ["typescript"],
+			unmatchedFiles: [],
+		};
+		const { client, recordCalls } = createFakeMulchClient(learnResult);
+		const mailDbPath = join(tempDir, ".overstory", "auto-record-outcome.db");
+
+		// Seed events so analyzer emits at least one insight (10+ tool calls).
+		const eventsDbPath = join(tempDir, ".overstory", "events.db");
+		const eventStore = createEventStore(eventsDbPath);
+		const sessionStartedAt = new Date(Date.now() - 60_000).toISOString();
+		for (let i = 0; i < 10; i++) {
+			eventStore.insert({
+				runId: null,
+				agentName: "outcome-agent",
+				sessionId: "sess-outcome",
+				eventType: "tool_start",
+				toolName: "Read",
+				toolArgs: JSON.stringify({ file_path: `/src/file${i}.ts` }),
+				toolDurationMs: null,
+				level: "info",
+				data: JSON.stringify({ summary: `read: /src/file${i}.ts` }),
+			});
+		}
+		eventStore.close();
+
+		await autoRecordExpertise({
+			mulchClient: client,
+			agentName: "outcome-agent",
+			capability: "builder",
+			taskId: "bead-outcome",
+			mailDbPath,
+			parentAgent: "parent-agent",
+			projectRoot: tempDir,
+			sessionStartedAt,
+			outcomeStatus: "partial",
+		});
+
+		expect(recordCalls.length).toBeGreaterThanOrEqual(2);
+		for (const call of recordCalls) {
+			expect(call.options.outcomeStatus).toBe("partial");
+			expect(call.options.outcomeAgent).toBe("outcome-agent");
+		}
+	});
+
+	test("omits outcomeStatus when caller does not supply one", async () => {
+		const learnResult: MulchLearnResult = {
+			success: true,
+			command: "mulch learn",
+			changedFiles: ["src/foo.ts"],
+			suggestedDomains: ["typescript"],
+			unmatchedFiles: [],
+		};
+		const { client, recordCalls } = createFakeMulchClient(learnResult);
+		const mailDbPath = join(tempDir, ".overstory", "auto-record-no-outcome.db");
+
+		await autoRecordExpertise({
+			mulchClient: client,
+			agentName: "no-outcome-agent",
+			capability: "builder",
+			taskId: null,
+			mailDbPath,
+			parentAgent: null,
+			projectRoot: tempDir,
+			sessionStartedAt: new Date().toISOString(),
+		});
+
+		expect(recordCalls).toHaveLength(1);
+		expect(recordCalls[0]?.options.outcomeStatus).toBeUndefined();
+	});
 });
 
 /**
@@ -1312,6 +1427,10 @@ try {
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
+			// Pin project root to tempDir. Without this, a subprocess started from
+			// inside an `ov sling`-spawned worktree inherits OVERSTORY_PROJECT_ROOT
+			// pointing at the parent project, and writes events to prod's events.db.
+			env: { ...process.env, OVERSTORY_PROJECT_ROOT: tempDir },
 		});
 
 		// Write the JSON payload to stdin and close
@@ -1501,6 +1620,7 @@ try {
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
+			env: { ...process.env, OVERSTORY_PROJECT_ROOT: tempDir },
 		});
 
 		// Write empty string and close immediately
@@ -1733,5 +1853,61 @@ describe("appendOutcomeToAppliedRecords", () => {
 			projectRoot: tempDir,
 		});
 		expect(count).toBe(0);
+	});
+
+	test("uses supplied outcomeStatus when provided", async () => {
+		const agentDir = join(tempDir, ".overstory", "agents", "test-agent");
+		await mkdir(agentDir, { recursive: true });
+		await Bun.write(
+			join(agentDir, "applied-records.json"),
+			JSON.stringify({
+				taskId: "bead-outcome",
+				agentName: "test-agent",
+				capability: "builder",
+				records: [{ id: "mx-aaa111", domain: "agents" }],
+			}),
+		);
+
+		const { client, appendOutcomeCalls } = makeOutcomeClient();
+		await appendOutcomeToAppliedRecords({
+			mulchClient: client,
+			agentName: "test-agent",
+			capability: "builder",
+			taskId: "bead-outcome",
+			projectRoot: tempDir,
+			outcomeStatus: "failure",
+		});
+
+		expect(appendOutcomeCalls).toHaveLength(1);
+		expect(appendOutcomeCalls[0]?.outcome).toMatchObject({ status: "failure" });
+		expect(appendOutcomeCalls[0]?.outcome.notes).toContain("Quality gates: failure");
+	});
+
+	test("falls back to 'success' when outcomeStatus is undefined (backward compat)", async () => {
+		const agentDir = join(tempDir, ".overstory", "agents", "test-agent");
+		await mkdir(agentDir, { recursive: true });
+		await Bun.write(
+			join(agentDir, "applied-records.json"),
+			JSON.stringify({
+				taskId: "bead-default",
+				agentName: "test-agent",
+				capability: "builder",
+				records: [{ id: "mx-bbb222", domain: "agents" }],
+			}),
+		);
+
+		const { client, appendOutcomeCalls } = makeOutcomeClient();
+		await appendOutcomeToAppliedRecords({
+			mulchClient: client,
+			agentName: "test-agent",
+			capability: "builder",
+			taskId: "bead-default",
+			projectRoot: tempDir,
+		});
+
+		expect(appendOutcomeCalls).toHaveLength(1);
+		expect(appendOutcomeCalls[0]?.outcome.status).toBe("success");
+		// No "Quality gates:" annotation when caller didn't provide outcomeStatus
+		expect(appendOutcomeCalls[0]?.outcome.notes).not.toContain("Quality gates:");
 	});
 });

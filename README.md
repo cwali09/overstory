@@ -6,13 +6,15 @@ Multi-agent orchestration for AI coding agents.
 [![CI](https://github.com/jayminwest/overstory/actions/workflows/ci.yml/badge.svg)](https://github.com/jayminwest/overstory/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Overstory turns a single coding session into a multi-agent team by spawning worker agents in git worktrees via tmux, coordinating them through a custom SQLite mail system, and merging their work back with tiered conflict resolution. A pluggable `AgentRuntime` interface lets you swap between 11 runtimes — Claude Code, [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Aider](https://aider.chat), [Goose](https://github.com/block/goose), [Amp](https://amp.dev), or your own adapter.
+Overstory turns a single coding session into a multi-agent team by spawning worker agents in isolated git worktrees, coordinating them through a custom SQLite mail system, and merging their work back with tiered conflict resolution. New projects spawn Claude agents headless and surface them through a web UI (`ov serve`); `tmux attach` is the opt-in escape hatch for live steering. A pluggable `AgentRuntime` interface lets you swap between 11 runtimes — Claude Code, [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Aider](https://aider.chat), [Goose](https://github.com/block/goose), [Amp](https://amp.dev), or your own adapter.
 
 > **Warning: Agent swarms are not a universal solution.** Do not deploy Overstory without understanding the risks of multi-agent orchestration — compounding error rates, cost amplification, debugging complexity, and merge conflicts are the normal case, not edge cases. Read [STEELMAN.md](STEELMAN.md) for a full risk analysis and the [Agentic Engineering Book](https://github.com/jayminwest/agentic-engineering-book) ([web version](https://jayminwest.com/agentic-engineering-book)) before using this tool in production.
 
+> **Maintenance status.** Overstory is maintained part-time. PRs are reviewed in roughly 2-week batches; PRs inactive for 30+ days are closed (reopen anytime). For features larger than ~200 lines, open an issue or discussion first. See [CONTRIBUTING.md](CONTRIBUTING.md#review-cadence).
+
 ## Install
 
-Requires [Bun](https://bun.sh) v1.0+, git, and tmux. At least one supported agent runtime must be installed:
+Requires [Bun](https://bun.sh) v1.0+ and git. `tmux` is optional — only needed if you want to spawn workers with `--no-headless` or attach to a coordinator/worker pane directly. At least one supported agent runtime must be installed:
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude` CLI)
 - [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) (`pi` CLI)
@@ -62,20 +64,29 @@ ov hooks install
 # Start a coordinator (persistent orchestrator)
 ov coordinator start
 
-# Or spawn individual worker agents
+# Open the web UI — primary operator surface for the swarm
+ov serve   # then open http://localhost:7321
+```
+
+`ov serve` is where you watch the fleet, read the mail bus, and inspect
+per-agent timelines. New projects spawn Claude workers headless by default,
+so the UI sees them with full structured-event fidelity.
+
+Other common commands:
+
+```bash
+# Spawn an individual worker agent (coordinator usually does this for you)
 ov sling <task-id> --capability builder --name my-builder
 
-# Check agent status
+# Force a worker into tmux when you want to attach mid-session
+ov sling <task-id> --capability builder --name my-builder --no-headless
+tmux attach -t ov-my-builder
+
+# Inspect state from the CLI (also visible in the UI)
 ov status
-
-# Live dashboard for monitoring the fleet
-ov dashboard
-
-# Nudge a stalled agent
-ov nudge <agent-name>
-
-# Check mail from agents
+ov dashboard          # live TUI alternative to the web UI
 ov mail check --inject
+ov nudge <agent-name> # send a follow-up to a stalled agent
 ```
 
 ## Commands
@@ -87,7 +98,7 @@ Every command supports `--json` where noted. Global flags: `-q`/`--quiet`, `--ti
 | Command | Description |
 |---------|-------------|
 | `ov init` | Initialize `.overstory/` and bootstrap os-eco tools (`--yes`, `--name`, `--tools`, `--skip-mulch`, `--skip-seeds`, `--skip-canopy`, `--skip-onboard`, `--json`) |
-| `ov sling <task-id>` | Spawn a worker agent (`--capability`, `--name`, `--spec`, `--files`, `--parent`, `--depth`, `--skip-scout`, `--skip-review`, `--max-agents`, `--dispatch-max-agents`, `--skip-task-check`, `--no-scout-check`, `--runtime`, `--base-branch`, `--profile`, `--json`) |
+| `ov sling <task-id>` | Spawn a worker agent (`--capability`, `--name`, `--spec`, `--files`, `--parent`, `--depth`, `--skip-scout`, `--skip-review`, `--max-agents`, `--dispatch-max-agents`, `--skip-task-check`, `--no-scout-check`, `--runtime`, `--base-branch`, `--profile`, `--headless`, `--no-headless`, `--recover`, `--json`) |
 | `ov stop <agent-name>` | Terminate a running agent (`--clean-worktree`, `--json`) |
 | `ov prime` | Load context for orchestrator/agent (`--agent`, `--compact`) |
 | `ov spec write <task-id>` | Write a task specification (`--body`) |
@@ -174,7 +185,8 @@ Every command supports `--json` where noted. Global flags: `-q`/`--quiet`, `--ti
 | `ov monitor status` | Show monitor state |
 | `ov log <event>` | Log a hook event (`--agent`) |
 | `ov clean` | Clean up worktrees, sessions, artifacts (`--completed`, `--all`, `--run`) |
-| `ov doctor` | Run health checks on overstory setup — 12 categories (`--category`, `--fix`, `--json`) |
+| `ov doctor` | Run health checks on overstory setup — 13 categories (`--category`, `--fix`, `--json`) |
+| `ov serve` | HTTP + WebSocket surface for the web UI (`--port`, `--host`, `--json`) |
 | `ov ecosystem` | Show os-eco tool versions and health (`--json`) |
 | `ov upgrade` | Upgrade overstory to latest npm version (`--check`, `--all`, `--json`) |
 | `ov agents discover` | Discover agents by capability/state/parent (`--capability`, `--state`, `--parent`, `--json`) |
@@ -182,11 +194,13 @@ Every command supports `--json` where noted. Global flags: `-q`/`--quiet`, `--ti
 
 ## Architecture
 
-Overstory uses instruction overlays and tool-call guards to turn agent sessions into orchestrated workers. Each agent runs in an isolated git worktree via tmux. Inter-agent messaging is handled by a custom SQLite mail system (WAL mode, ~1-5ms per query) with typed protocol messages and broadcast support. A FIFO merge queue with 4-tier conflict resolution merges agent branches back to canonical. A tiered watchdog system (Tier 0 mechanical daemon, Tier 1 AI-assisted triage, Tier 2 monitor agent) ensures fleet health. See [CLAUDE.md](CLAUDE.md) for full technical details.
+Overstory uses instruction overlays and tool-call guards to turn agent sessions into orchestrated workers. Each agent runs in an isolated git worktree; new projects spawn Claude workers as headless subprocesses (stream-json over stdout) and surface them through `ov serve`'s web UI, with tmux available as an opt-in for live attach. Inter-agent messaging is handled by a custom SQLite mail system (WAL mode, ~1-5ms per query) with typed protocol messages and broadcast support. A FIFO merge queue with 4-tier conflict resolution merges agent branches back to canonical. A tiered watchdog system (Tier 0 mechanical daemon, Tier 1 AI-assisted triage, Tier 2 monitor agent) ensures fleet health. See [CLAUDE.md](CLAUDE.md) for full technical details.
 
 ### Runtime Adapters
 
 Overstory is runtime-agnostic. The `AgentRuntime` interface (`src/runtimes/types.ts`) defines the contract — each adapter handles spawning, config deployment, guard enforcement, readiness detection, and transcript parsing for its runtime. Set the default in `config.yaml` or override per-agent with `ov sling --runtime <name>`.
+
+Claude Code agents can run in **headless mode** (the default for new projects — `-p --output-format stream-json` subprocess, NDJSON events parsed by `ClaudeRuntime.parseEvents`, surfaced through `ov serve`'s web UI) or **tmux mode** (escape hatch for live attach — operator can `tmux attach` to watch and steer mid-session). `ov init` writes `runtime.claudeHeadlessByDefault: true` for new projects; legacy projects upgrading from earlier overstory versions keep tmux until they edit config. Override per-spawn with `ov sling --no-headless` (force tmux) or `--headless` (force headless). Sapling is statically headless; Pi, Codex, and Cursor have no `buildDirectSpawn` and reject `--headless`.
 
 | Runtime | CLI | Guard Mechanism | Stability |
 |---------|-----|-----------------|-----------|
@@ -249,7 +263,7 @@ overstory/
     config.ts                     Config loader + validation
     errors.ts                     Custom error types
     json.ts                       Standardized JSON envelope helpers
-    commands/                     One file per CLI subcommand (37 commands)
+    commands/                     One file per CLI subcommand (38 commands)
       agents.ts                   Agent discovery and querying
       coordinator.ts              Persistent orchestrator lifecycle
       supervisor.ts               Team lead management [DEPRECATED]
@@ -272,7 +286,7 @@ overstory/
       run.ts                      Orchestration run lifecycle
       trace.ts                    Agent/task timeline viewing
       clean.ts                    Worktree/session cleanup
-      doctor.ts                   Health check runner (12 check modules)
+      doctor.ts                   Health check runner (13 check modules)
       inspect.ts                  Deep per-agent inspection
       spec.ts                     Task spec management
       errors.ts                   Aggregated error view
@@ -286,6 +300,8 @@ overstory/
       discover.ts                 Brownfield codebase discovery via coordinator-driven scout swarm
       orchestrator.ts             Multi-repo coordination (PersistentAgentSpec)
       completions.ts              Shell completion generation (bash/zsh/fish)
+      serve.ts                    HTTP + WebSocket surface for the web UI
+      serve/                      REST handlers, WebSocket broadcaster, static SPA fallback
     canopy/
       client.ts                   Canopy client (prompt rendering, listing, emission)
     agents/                       Agent lifecycle management
@@ -297,15 +313,17 @@ overstory/
       hooks-deployer.ts           Deploy hooks + tool enforcement
       copilot-hooks-deployer.ts   Deploy hooks config to Copilot worktrees
       guard-rules.ts              Shared guard constants (tool lists, bash patterns)
+      mail-poll-detect.ts         Bash mail-poll pattern detector (runtime backstop)
+      scope-detect.ts             Soft FILE_SCOPE violation detection (builder/merger)
     worktree/                     Git worktree + tmux management
     mail/                         SQLite mail system (typed protocol, broadcast)
-    merge/                        FIFO queue + conflict resolution
+    merge/                        FIFO queue + conflict resolution + sentinel-file lock + dry-run prediction
     watchdog/                     Tiered health monitoring (daemon, triage, health)
     logging/                      Multi-format logger + sanitizer + reporter + color control + shared theme/format
     metrics/                      SQLite metrics + pricing + transcript parsing
-    doctor/                       Health check modules (12 checks)
+    doctor/                       Health check modules (13 checks)
     utils/                        Shared utilities (bin, fs, pid, time, version)
-    insights/                     Session insight analyzer for auto-expertise
+    insights/                     Session insight analyzer + quality-gate runner (success/partial/failure)
     runtimes/                     AgentRuntime abstraction (registry + adapters: Claude, Pi, Copilot, Codex, Gemini, Sapling, OpenCode, Cursor, Aider, Goose, Amp)
     tracker/                      Pluggable task tracker (beads + seeds backends)
     mulch/                        mulch client (programmatic API + CLI wrapper)
@@ -355,6 +373,21 @@ models:
 | `authTokenEnv` | string | Gateway only | Env var name holding auth token |
 
 ## Troubleshooting
+
+### Recovering a dead lead (or any agent that exited mid-task)
+
+If a lead exits without sending `merge_ready` (process termination, watchdog kill, manual `ov stop`) and the task was already closed, both `ov nudge` and `ov sling` would normally refuse to re-engage:
+
+- `ov nudge <name>` reports `No active session for agent "..." (state: completed)`. The agent's process is gone, so there's nothing to send keystrokes to.
+- `ov sling <task-id> --capability lead` reports `Task "..." is not workable (status: closed)`.
+
+To re-dispatch a fresh lead against the same task, pass `--recover`:
+
+```bash
+ov sling <task-id> --capability lead --recover --name <fresh-name>
+```
+
+`--recover` bypasses the workable-status check so the new lead can pick up where the dead one left off (the task remains closed; the new lead reads the spec and proceeds). The terminal-state nudge error itself includes a copy-paste hint to this exact form.
 
 ### Coordinator died during startup
 

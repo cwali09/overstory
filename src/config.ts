@@ -90,6 +90,7 @@ export const DEFAULT_CONFIG: OverstoryConfig = {
 		rpcTimeoutMs: 5_000, // 5 seconds for RPC getState() calls
 		triageTimeoutMs: 30_000, // 30 seconds for Tier 1 AI triage calls
 		maxEscalationLevel: 3, // Maximum escalation level before termination
+		notifyParentOnDeath: true, // Send worker_died mail to parent when watchdog terminates a child
 	},
 	coordinator: {
 		exitTriggers: {
@@ -633,6 +634,16 @@ function validateConfig(config: OverstoryConfig): void {
 		}
 	}
 
+	if (
+		config.watchdog.notifyParentOnDeath !== undefined &&
+		typeof config.watchdog.notifyParentOnDeath !== "boolean"
+	) {
+		throw new ValidationError("watchdog.notifyParentOnDeath must be a boolean", {
+			field: "watchdog.notifyParentOnDeath",
+			value: config.watchdog.notifyParentOnDeath,
+		});
+	}
+
 	// mulch.primeFormat must be one of the valid options
 	const validFormats = ["markdown", "xml", "json"] as const;
 	if (!validFormats.includes(config.mulch.primeFormat as (typeof validFormats)[number])) {
@@ -774,6 +785,18 @@ function validateConfig(config: OverstoryConfig): void {
 		}
 	}
 
+	// runtime.claudeHeadlessByDefault: must be a boolean if present
+	if (
+		config.runtime?.claudeHeadlessByDefault !== undefined &&
+		typeof config.runtime.claudeHeadlessByDefault !== "boolean"
+	) {
+		process.stderr.write(
+			`[overstory] WARNING: runtime.claudeHeadlessByDefault must be a boolean. Got: ${typeof config
+				.runtime.claudeHeadlessByDefault}. Ignoring.\n`,
+		);
+		config.runtime.claudeHeadlessByDefault = undefined;
+	}
+
 	if (config.runtime?.capabilities) {
 		for (const [cap, runtimeName] of Object.entries(config.runtime.capabilities)) {
 			if (runtimeName !== undefined && (typeof runtimeName !== "string" || runtimeName === "")) {
@@ -905,7 +928,26 @@ export async function resolveProjectRoot(startDir: string): Promise<string> {
 
 	const { existsSync } = require("node:fs") as typeof import("node:fs");
 
-	// Check git worktree FIRST. When running from an agent worktree
+	// Check OVERSTORY_PROJECT_ROOT env var. Zero-heuristic — injected by ov sling
+	// into agent environments so submodule topology doesn't matter.
+	const envRoot = process.env.OVERSTORY_PROJECT_ROOT;
+	if (envRoot && envRoot.length > 0) {
+		return envRoot;
+	}
+
+	// Walk-up worktree-path detection. Topology-independent submodule fix:
+	// if startDir contains /.overstory/worktrees/ as a path segment, the
+	// substring before it is the project root — verify with config.yaml.
+	const WT_SEGMENT = `/${OVERSTORY_DIR}/worktrees/`;
+	const idx = startDir.indexOf(WT_SEGMENT);
+	if (idx > 0) {
+		const parentRoot = startDir.slice(0, idx);
+		if (existsSync(join(parentRoot, OVERSTORY_DIR, CONFIG_FILENAME))) {
+			return parentRoot;
+		}
+	}
+
+	// Check git worktree. When running from an agent worktree
 	// (e.g., .overstory/worktrees/{name}/), the worktree may contain
 	// tracked copies of .overstory/config.yaml. We must resolve to the
 	// main repository root so runtime state (mail.db, metrics.db, etc.)

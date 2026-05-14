@@ -9,7 +9,9 @@ import { estimateCost } from "../metrics/pricing.ts";
 import { parseTranscriptUsage } from "../metrics/transcript.ts";
 import type { ResolvedModel } from "../types.ts";
 import type {
+	AgentEvent,
 	AgentRuntime,
+	DirectSpawnOpts,
 	HooksDef,
 	OverlayContent,
 	ReadyState,
@@ -126,7 +128,22 @@ export class ClaudeRuntime implements AgentRuntime {
 			await Bun.write(claudeMdPath, overlay.content);
 		}
 
-		await deployHooks(hooks.worktreePath, hooks.agentName, hooks.capability, hooks.qualityGates);
+		// Always deploy hooks — headless Claude Code DOES dispatch settings.local.json
+		// PreToolUse hooks (verified empirically against `claude -p --output-format stream-json`).
+		// The original design (overstory-1c32 / docs/headless-hooks-design.md Q6) wrongly assumed
+		// hooks don't fire in headless mode and skipped deployment, leaving headless agents with
+		// none of the destructive-command guards. overstory-e24b reverses that: in headless mode
+		// we deploy a settings.local.json containing only PreToolUse security guards (path boundary,
+		// capability blocks, bash danger patterns, tracker close, lead close gate). The other
+		// hook types are dropped because they have headless equivalents already wired up
+		// (initial stdin prompt, serve mail injection loop, stream-json event capture).
+		await deployHooks(
+			hooks.worktreePath,
+			hooks.agentName,
+			hooks.capability,
+			hooks.qualityGates,
+			hooks.isHeadless ?? false,
+		);
 	}
 
 	/**
@@ -215,6 +232,311 @@ export class ClaudeRuntime implements AgentRuntime {
 			};
 		} catch {
 			return null;
+		}
+	}
+
+	/**
+	 * Build the argv array for Bun.spawn() to launch a Claude Code agent in headless mode.
+	 *
+	 * Returns the exact flags Multica uses for headless Claude Code sessions:
+	 * `-p --output-format stream-json --input-format stream-json --verbose
+	 * --strict-mcp-config --permission-mode bypassPermissions [--model <m>]`
+	 *
+	 * Claude Code reads `.claude/CLAUDE.md` from cwd automatically — do NOT
+	 * pass `--append-system-prompt` or consume `opts.instructionPath`.
+	 * The initial stdin prompt is the caller's responsibility.
+	 *
+	 * @param opts - Direct spawn options; only `model` is consumed
+	 * @returns Argv array for Bun.spawn — do not shell-interpolate
+	 */
+	buildDirectSpawn(opts: DirectSpawnOpts): string[] {
+		const argv = [
+			"claude",
+			"-p",
+			"--output-format",
+			"stream-json",
+			"--input-format",
+			"stream-json",
+			"--verbose",
+			"--strict-mcp-config",
+			"--permission-mode",
+			"bypassPermissions",
+		];
+		if (opts.model !== undefined) {
+			argv.push("--model", opts.model);
+		}
+		// Phase 1 (overstory-b835): emit --resume on follow-up spawns. Mirrors
+		// multica/server/pkg/agent/claude.go:434 (positional). Empty string and
+		// null are treated as "no resume" — only non-empty strings activate it.
+		if (typeof opts.resumeSessionId === "string" && opts.resumeSessionId.length > 0) {
+			argv.push("--resume", opts.resumeSessionId);
+		}
+		return argv;
+	}
+
+	/**
+	 * Parse stream-json stdout from a Claude Code headless subprocess into typed AgentEvent objects.
+	 *
+	 * Reads the ReadableStream from Bun.spawn() stdout, buffers partial lines,
+	 * and yields a typed AgentEvent for each complete JSON line. Malformed lines
+	 * and unknown message types are silently skipped.
+	 *
+	 * Adjacent assistant_text deltas are coalesced into a single assistant_message
+	 * event using a batching window. The batch flushes on timer expiry, size cap,
+	 * any non-text event, or stream end — whichever comes first.
+	 *
+	 * Event mapping (Claude stream-json → AgentEvent):
+	 * - assistant/text     → buffered; emitted as one assistant_message per batch
+	 * - assistant/tool_use → { type: "tool_use", callId, name, input }
+	 * - assistant/thinking → (skipped)
+	 * - user/tool_result   → { type: "tool_result", toolUseId, content }
+	 * - system             → { type: "status", sessionId, subtype }
+	 * - result             → { type: "result", sessionId, result, isError, durationMs, numTurns }
+	 *
+	 * @param stream - ReadableStream<Uint8Array> from Bun.spawn stdout
+	 * @param opts - Optional hooks and tuning:
+	 *   - `onSessionId` is invoked once, synchronously, on the first event that carries a
+	 *     non-empty `sessionId`. Consumer errors are swallowed so they cannot crash the parser.
+	 *   - `flushIntervalMs` — Max ms to buffer text before emitting (default 500).
+	 *   - `flushSizeBytes` — Max UTF-8 byte size of a text batch (default 4096).
+	 * @yields Parsed AgentEvent objects in emission order
+	 */
+	async *parseEvents(
+		stream: ReadableStream<Uint8Array>,
+		opts?: {
+			onSessionId?: (sessionId: string) => void;
+			flushIntervalMs?: number;
+			flushSizeBytes?: number;
+		},
+	): AsyncIterable<AgentEvent> {
+		const flushIntervalMs = opts?.flushIntervalMs ?? 500;
+		const flushSizeBytes = opts?.flushSizeBytes ?? 4096;
+
+		const reader = stream.getReader();
+		const decoder = new TextDecoder();
+		let buffer = "";
+		let sessionIdPinned = false;
+
+		// Batch state for adjacent assistant_text deltas.
+		let pendingText: string[] = [];
+		let pendingByteSize = 0;
+		let pendingStartTs: string | null = null;
+		let pendingModel: string | undefined;
+		let pendingUsage: unknown;
+
+		// Returns batched assistant_message event and resets state; null when buffer is empty.
+		const flushText = (): AgentEvent | null => {
+			if (pendingText.length === 0) return null;
+			const text = pendingText.join("");
+			const event: AgentEvent = {
+				type: "assistant_message",
+				timestamp: pendingStartTs ?? new Date().toISOString(),
+				text,
+			};
+			if (pendingModel !== undefined) event.model = pendingModel;
+			if (pendingUsage !== undefined) event.usage = pendingUsage;
+			pendingText = [];
+			pendingByteSize = 0;
+			pendingStartTs = null;
+			pendingModel = undefined;
+			pendingUsage = undefined;
+			return event;
+		};
+
+		// Sync generator: parses one JSON line, yielding AgentEvents in order.
+		// Mutates batch state via closure — do not call concurrently.
+		function* processLine(line: string): Generator<AgentEvent> {
+			const trimmed = line.trim();
+			if (!trimmed) return;
+
+			let msg: Record<string, unknown>;
+			try {
+				msg = JSON.parse(trimmed) as Record<string, unknown>;
+			} catch {
+				return;
+			}
+
+			const timestamp = new Date().toISOString();
+
+			if (msg.type === "assistant") {
+				const message =
+					typeof msg.message === "object" && msg.message !== null
+						? (msg.message as Record<string, unknown>)
+						: null;
+				if (!message) return;
+				const content = Array.isArray(message.content) ? message.content : [];
+				const model = typeof message.model === "string" ? message.model : undefined;
+				const usage = message.usage !== undefined ? message.usage : undefined;
+
+				for (const block of content) {
+					if (typeof block !== "object" || block === null) continue;
+					const b = block as Record<string, unknown>;
+					if (b.type === "text") {
+						const text = typeof b.text === "string" ? b.text : String(b.text);
+						const textByteSize = new TextEncoder().encode(text).byteLength;
+
+						// Size-cap: if appending would exceed cap and buffer is non-empty, flush first.
+						if (pendingByteSize > 0 && pendingByteSize + textByteSize > flushSizeBytes) {
+							const ev = flushText();
+							if (ev) yield ev;
+						}
+
+						// Record the start-of-batch timestamp on the first fragment.
+						if (pendingByteSize === 0) pendingStartTs = timestamp;
+
+						pendingText.push(text);
+						pendingByteSize += textByteSize;
+						// Latest contributing message wins for model/usage.
+						if (model !== undefined) pendingModel = model;
+						if (usage !== undefined) pendingUsage = usage;
+
+						// Immediate flush when a single fragment meets or exceeds the size cap.
+						if (pendingByteSize >= flushSizeBytes) {
+							const ev = flushText();
+							if (ev) yield ev;
+						}
+					} else if (b.type === "tool_use") {
+						// Non-text block: flush pending text first to preserve in-order delivery.
+						const ev = flushText();
+						if (ev) yield ev;
+						yield {
+							type: "tool_use",
+							timestamp,
+							callId: b.id,
+							name: b.name,
+							input: b.input,
+						};
+					}
+					// thinking and other block types → skip
+				}
+			} else if (msg.type === "user") {
+				const message =
+					typeof msg.message === "object" && msg.message !== null
+						? (msg.message as Record<string, unknown>)
+						: null;
+				if (!message) return;
+				const content = Array.isArray(message.content) ? message.content : [];
+
+				const flushEv = flushText();
+				if (flushEv) yield flushEv;
+
+				for (const block of content) {
+					if (typeof block !== "object" || block === null) continue;
+					const b = block as Record<string, unknown>;
+					if (b.type === "tool_result") {
+						yield {
+							type: "tool_result",
+							timestamp,
+							toolUseId: b.tool_use_id,
+							content: b.content,
+						};
+					}
+				}
+			} else if (msg.type === "system") {
+				const flushEv = flushText();
+				if (flushEv) yield flushEv;
+				yield { type: "status", timestamp, sessionId: msg.session_id, subtype: msg.subtype };
+			} else if (msg.type === "result") {
+				const flushEv = flushText();
+				if (flushEv) yield flushEv;
+				yield {
+					type: "result",
+					timestamp,
+					sessionId: msg.session_id,
+					result: msg.result,
+					isError: msg.is_error,
+					durationMs: msg.duration_ms,
+					numTurns: msg.num_turns,
+				};
+			}
+		}
+
+		const maybePinSession = (event: AgentEvent): void => {
+			if (sessionIdPinned || !opts?.onSessionId) return;
+			const sid = event.sessionId;
+			if (typeof sid !== "string" || sid.length === 0) return;
+			sessionIdPinned = true;
+			try {
+				opts.onSessionId(sid);
+			} catch {
+				// Consumer errors must not crash the parser.
+			}
+		};
+
+		try {
+			// Use the inferred return type of reader.read() to stay compatible with
+			// both the standard Web Streams API and Bun's slightly divergent typings.
+			type ReadResult = Awaited<ReturnType<typeof reader.read>>;
+			type Race = { kind: "read"; result: ReadResult } | { kind: "timeout" };
+
+			let readPromise = reader.read();
+
+			while (true) {
+				if (pendingText.length > 0 && pendingStartTs !== null) {
+					// Race the next read chunk against the flush timer.
+					const elapsed = Date.now() - new Date(pendingStartTs).getTime();
+					const remaining = Math.max(0, flushIntervalMs - elapsed);
+
+					let timerId: ReturnType<typeof setTimeout> | undefined;
+					const wrappedRead: Promise<Race> = readPromise.then((result) => ({
+						kind: "read" as const,
+						result,
+					}));
+					const wrappedTimer = new Promise<Race>((resolve) => {
+						timerId = setTimeout(() => resolve({ kind: "timeout" }), remaining);
+					});
+
+					const winner = await Promise.race([wrappedRead, wrappedTimer]);
+					if (timerId !== undefined) clearTimeout(timerId);
+
+					if (winner.kind === "timeout") {
+						const ev = flushText();
+						if (ev) yield ev;
+						continue; // readPromise still in flight — re-enter loop without refreshing
+					}
+
+					const result = winner.result;
+					if (result.done) break;
+					buffer += decoder.decode(result.value, { stream: true });
+					const lines = buffer.split("\n");
+					buffer = lines.pop() ?? "";
+					for (const line of lines) {
+						for (const event of processLine(line)) {
+							maybePinSession(event);
+							yield event;
+						}
+					}
+					readPromise = reader.read();
+				} else {
+					const result = await readPromise;
+					if (result.done) break;
+					buffer += decoder.decode(result.value, { stream: true });
+					const lines = buffer.split("\n");
+					// Last element is either empty or an incomplete line — keep in buffer.
+					buffer = lines.pop() ?? "";
+					for (const line of lines) {
+						for (const event of processLine(line)) {
+							maybePinSession(event);
+							yield event;
+						}
+					}
+					readPromise = reader.read();
+				}
+			}
+
+			// Flush remaining buffer on clean stream end (no trailing newline).
+			if (buffer.trim()) {
+				for (const event of processLine(buffer)) {
+					maybePinSession(event);
+					yield event;
+				}
+			}
+
+			// Drain any remaining buffered text after the read loop exits.
+			const finalEv = flushText();
+			if (finalEv) yield finalEv;
+		} finally {
+			reader.releaseLock();
 		}
 	}
 

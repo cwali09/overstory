@@ -103,6 +103,67 @@ describe("evaluateHealth", () => {
 		expect(check.reconciliationNote).toBeNull();
 	});
 
+	// --- ZFC Rule 1 fallback: tmux dead + stale lastActivity → completed ---
+
+	test("ZFC fallback: tmux dead + stale lastActivity (working) → complete (missed signal)", () => {
+		const staleActivity = new Date(Date.now() - 60_000).toISOString();
+		const session = makeSession({ state: "working", lastActivity: staleActivity });
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("completed");
+		expect(check.action).toBe("complete");
+		expect(check.tmuxAlive).toBe(false);
+		expect(check.processAlive).toBe(false);
+		expect(check.reconciliationNote).toContain("missed session-end signal");
+	});
+
+	test("ZFC fallback: tmux dead + stale lastActivity (stalled) → complete (missed signal)", () => {
+		const staleActivity = new Date(Date.now() - 90_000).toISOString();
+		const session = makeSession({ state: "stalled", lastActivity: staleActivity });
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("completed");
+		expect(check.action).toBe("complete");
+	});
+
+	test("ZFC: tmux dead + recent lastActivity → still zombie (true crash)", () => {
+		const recentActivity = new Date(Date.now() - 1_000).toISOString();
+		const session = makeSession({ state: "working", lastActivity: recentActivity });
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("zombie");
+		expect(check.action).toBe("terminate");
+	});
+
+	test("ZFC fallback (headless): pid dead + stale lastActivity → complete", () => {
+		const staleActivity = new Date(Date.now() - 60_000).toISOString();
+		const session = makeSession({
+			state: "working",
+			tmuxSession: "",
+			pid: DEAD_PID,
+			lastActivity: staleActivity,
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("completed");
+		expect(check.action).toBe("complete");
+		expect(check.reconciliationNote).toContain("missed session-end signal");
+	});
+
+	test("ZFC (headless): pid dead + recent lastActivity → still zombie", () => {
+		const recentActivity = new Date(Date.now() - 1_000).toISOString();
+		const session = makeSession({
+			state: "working",
+			tmuxSession: "",
+			pid: DEAD_PID,
+			lastActivity: recentActivity,
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("zombie");
+		expect(check.action).toBe("terminate");
+	});
+
 	// --- ZFC Rule 2: tmux alive + sessions.json says zombie → investigate ---
 
 	test("ZFC: tmux alive + sessions.json says zombie → investigate (don't auto-kill)", () => {
@@ -432,6 +493,162 @@ describe("headless agents (tmuxSession empty, PID-based lifecycle)", () => {
 	});
 });
 
+// === Spawn-per-turn workers (tmuxSession === '' && pid === null) ===
+
+describe("spawn-per-turn workers (overstory-7a34)", () => {
+	// Spawn-per-turn workers (builder/scout/reviewer/lead/merger under the
+	// headless default) have no persistent process between turns. The previous
+	// "headless" branch only matched pid !== null, so these sessions fell into
+	// the TUI/tmux path where tmuxAlive=false → ZFC Rule 1 → zombie within
+	// seconds of sling, despite being actively executing tools (overstory-7a34).
+
+	test("freshly slung spawn-per-turn lead (booting, no pid, no tmux) → between_turns (overstory-3087)", () => {
+		// Spec change: spawn-per-turn workers report `between_turns` instead
+		// of `working` for the healthy classification, including the booting
+		// → healthy transition. The turn-runner authoritatively writes
+		// `in_turn` once the first parser event of a turn arrives.
+		const session = makeSession({
+			tmuxSession: "",
+			pid: null,
+			capability: "lead",
+			state: "booting",
+			lastActivity: new Date().toISOString(),
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("between_turns");
+		expect(check.action).toBe("none");
+		expect(check.reconciliationNote).toBeNull();
+	});
+
+	test("legacy spawn-per-turn worker still at 'working' is reported as between_turns (overstory-3087)", () => {
+		// A row that predates the substate split (state=working) gets
+		// reclassified to `between_turns` by the watchdog's healthy-state
+		// reporter. transitionState then promotes the row forward (working
+		// and between_turns share rank 1 in STATE_ORDER, so the actual
+		// promotion happens via tryTransitionState elsewhere — here we just
+		// verify the check itself reports the new substate).
+		const session = makeSession({
+			tmuxSession: "",
+			pid: null,
+			capability: "builder",
+			state: "working",
+			lastActivity: new Date(Date.now() - 5_000).toISOString(),
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("between_turns");
+		expect(check.action).toBe("none");
+	});
+
+	test("spawn-per-turn worker between turns (recent activity) → between_turns, NOT zombie (overstory-3087)", () => {
+		// Repro of overstory-7a34: ov sling --capability lead any-task; within
+		// ~30s ov dashboard previously showed state='zombie' while ov feed
+		// showed live tool calls. The healthy classification now lands
+		// between_turns; the test still verifies that recent activity does
+		// not trigger zombie classification.
+		const session = makeSession({
+			tmuxSession: "",
+			pid: null,
+			capability: "lead",
+			state: "working",
+			lastActivity: new Date().toISOString(),
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("between_turns");
+		expect(check.action).toBe("none");
+	});
+
+	test("spawn-per-turn worker with stale activity → stalled", () => {
+		const session = makeSession({
+			tmuxSession: "",
+			pid: null,
+			capability: "builder",
+			state: "working",
+			lastActivity: new Date(Date.now() - 60_000).toISOString(),
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("stalled");
+		expect(check.action).toBe("escalate");
+	});
+
+	test("spawn-per-turn worker with zombie-level staleness → zombie, terminate", () => {
+		const session = makeSession({
+			tmuxSession: "",
+			pid: null,
+			capability: "builder",
+			state: "working",
+			lastActivity: new Date(Date.now() - 200_000).toISOString(),
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("zombie");
+		expect(check.action).toBe("terminate");
+	});
+
+	test("spawn-per-turn worker that already completed → skips monitoring", () => {
+		const session = makeSession({
+			tmuxSession: "",
+			pid: null,
+			capability: "builder",
+			state: "completed",
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("completed");
+		expect(check.action).toBe("none");
+	});
+
+	test("preserves in_turn for healthy spawn-per-turn worker (overstory-3087)", () => {
+		// A spawn-per-turn worker the turn-runner has marked in_turn must
+		// have its state preserved by the health evaluation when activity is
+		// recent — otherwise the watchdog would stomp the substate back to
+		// `working` and the UI would lose the distinction between mid-turn
+		// and idling.
+		const session = makeSession({
+			tmuxSession: "",
+			pid: null,
+			capability: "builder",
+			state: "in_turn",
+			lastActivity: new Date().toISOString(),
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("in_turn");
+		expect(check.action).toBe("none");
+	});
+
+	test("preserves between_turns for healthy spawn-per-turn worker (overstory-3087)", () => {
+		const session = makeSession({
+			tmuxSession: "",
+			pid: null,
+			capability: "builder",
+			state: "between_turns",
+			lastActivity: new Date().toISOString(),
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("between_turns");
+		expect(check.action).toBe("none");
+	});
+
+	test("escalates an in_turn worker with stale activity to stalled (overstory-3087)", () => {
+		const session = makeSession({
+			tmuxSession: "",
+			pid: null,
+			capability: "builder",
+			state: "in_turn",
+			lastActivity: new Date(Date.now() - 60_000).toISOString(),
+		});
+		const check = evaluateHealth(session, false, THRESHOLDS);
+
+		expect(check.state).toBe("stalled");
+		expect(check.action).toBe("escalate");
+	});
+});
+
 // === transitionState ===
 
 describe("transitionState", () => {
@@ -544,5 +761,70 @@ describe("transitionState", () => {
 		// If something were at "working" and check says zombie with investigate,
 		// the state should NOT advance
 		expect(transitionState("working", check)).toBe("working");
+	});
+
+	// --- in_turn / between_turns coexist with working at the active rank (overstory-3087) ---
+
+	test("preserves in_turn when watchdog reports a healthy 'working' check", () => {
+		// The watchdog's healthy-classification check returns state=working;
+		// since in_turn shares rank 1 with working, transitionState must not
+		// advance and the spawn-per-turn substate the turn-runner wrote stays.
+		const check = {
+			state: "working" as const,
+			agentName: "a",
+			timestamp: "",
+			tmuxAlive: true,
+			pidAlive: true as boolean | null,
+			lastActivity: "",
+			processAlive: true,
+			action: "none" as const,
+			reconciliationNote: null,
+		};
+		expect(transitionState("in_turn", check)).toBe("in_turn");
+	});
+
+	test("preserves between_turns when watchdog reports a healthy 'working' check", () => {
+		const check = {
+			state: "working" as const,
+			agentName: "a",
+			timestamp: "",
+			tmuxAlive: true,
+			pidAlive: true as boolean | null,
+			lastActivity: "",
+			processAlive: true,
+			action: "none" as const,
+			reconciliationNote: null,
+		};
+		expect(transitionState("between_turns", check)).toBe("between_turns");
+	});
+
+	test("advances in_turn → stalled when the watchdog escalates", () => {
+		const check = {
+			state: "stalled" as const,
+			agentName: "a",
+			timestamp: "",
+			tmuxAlive: true,
+			pidAlive: true as boolean | null,
+			lastActivity: "",
+			processAlive: true,
+			action: "escalate" as const,
+			reconciliationNote: null,
+		};
+		expect(transitionState("in_turn", check)).toBe("stalled");
+	});
+
+	test("advances between_turns → zombie when the watchdog terminates", () => {
+		const check = {
+			state: "zombie" as const,
+			agentName: "a",
+			timestamp: "",
+			tmuxAlive: false,
+			pidAlive: false as boolean | null,
+			lastActivity: "",
+			processAlive: false,
+			action: "terminate" as const,
+			reconciliationNote: null,
+		};
+		expect(transitionState("between_turns", check)).toBe("zombie");
 	});
 });

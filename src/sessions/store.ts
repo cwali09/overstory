@@ -7,14 +7,74 @@
  */
 
 import { Database } from "bun:sqlite";
-import type { AgentSession, AgentState, InsertRun, Run, RunStatus, RunStore } from "../types.ts";
+import type {
+	AgentSession,
+	AgentState,
+	InsertRun,
+	Run,
+	RunStatus,
+	RunStore,
+	TransitionOutcome,
+} from "../types.ts";
+
+/**
+ * Allowed predecessor states for each target state, enforced by
+ * `tryTransitionState` via an atomic SQL compare-and-swap.
+ *
+ * Invariants:
+ *   - `completed` is sticky: nothing transitions out of it. The watchdog cannot
+ *     reclassify a properly-completed agent as zombie.
+ *   - `zombie` is durable except `ov stop` may promote it to `completed` for
+ *     cleanup. A turn-runner that "settles to working" after watchdog already
+ *     wrote zombie is rejected — last writer no longer wins.
+ *   - Idempotent self-transitions (e.g. `working → working`) are allowed.
+ *   - `booting` is set only by the initial `upsert` and never re-entered.
+ *   - `in_turn` and `between_turns` cycle while a spawn-per-turn worker is
+ *     alive (overstory-3087): turn-runner advances `between_turns → in_turn`
+ *     when the next batch produces its first parser event and settles back
+ *     `in_turn → between_turns` when the turn ends without a terminal mail.
+ *     Both can advance forward to `stalled`/`zombie`/`completed`. The two
+ *     paths are kept separate from the tmux/long-lived `working` rank — a
+ *     spawn-per-turn worker should not flow through `working` during normal
+ *     operation — so neither lists `working` as a predecessor.
+ *
+ * See overstory-a993 for the race symptoms this guard prevents.
+ */
+const TRANSITION_ALLOWED_FROM: Record<AgentState, readonly AgentState[]> = {
+	booting: [],
+	working: ["booting", "working", "stalled"],
+	in_turn: ["booting", "in_turn", "between_turns", "stalled"],
+	between_turns: ["in_turn", "between_turns", "stalled"],
+	stalled: ["booting", "working", "in_turn", "between_turns", "stalled"],
+	completed: ["booting", "working", "in_turn", "between_turns", "stalled", "zombie", "completed"],
+	zombie: ["booting", "working", "in_turn", "between_turns", "stalled", "zombie"],
+};
+
+/**
+ * States in which an agent's tmux session no longer exists. When a session
+ * lands in one of these, `tmux_session` is cleared to `''` so the agents-side
+ * view stops surfacing tmux session names that have been torn down.
+ *
+ * The live `tmuxSessions` array on `ov status` reflects what tmux actually
+ * reports; the stored `tmux_session` column is what the agents-side view reads.
+ * Without this clear, completed/zombie agents carry stale tmux strings forever
+ * (overstory-14c0).
+ */
+const TERMINAL_STATES: readonly AgentState[] = ["completed", "zombie"];
 
 export interface SessionStore {
 	/** Insert or update a session. Uses agent_name as the unique key. */
 	upsert(session: AgentSession): void;
 	/** Get a session by agent name, or null if not found. */
 	getByName(agentName: string): AgentSession | null;
-	/** Get all active sessions (state IN ('booting', 'working', 'stalled')). */
+	/**
+	 * Get all active sessions (state IN ('booting', 'working', 'in_turn',
+	 * 'between_turns', 'stalled')).
+	 *
+	 * `in_turn` and `between_turns` are spawn-per-turn equivalents of `working`
+	 * and must be returned by `getActive` so the watchdog and dashboards see
+	 * spawn-per-turn workers as alive (overstory-3087).
+	 */
 	getActive(): AgentSession[];
 	/** Get all sessions regardless of state. */
 	getAll(): AgentSession[];
@@ -22,14 +82,32 @@ export interface SessionStore {
 	count(): number;
 	/** Get sessions belonging to a specific run. */
 	getByRun(runId: string): AgentSession[];
-	/** Update only the state of a session. */
+	/**
+	 * Update only the state of a session.
+	 *
+	 * Unconditional override — does not validate the prev → next transition.
+	 * Reserved for forced cleanup paths (`ov clean`, `ov sling` startup failure,
+	 * supervisor/coordinator/monitor self-management). For race-prone writers
+	 * (turn-runner settle, `ov stop`, watchdog), use `tryTransitionState`.
+	 */
 	updateState(agentName: string, state: AgentState): void;
+	/**
+	 * Atomically transition a session's state, validated against the matrix in
+	 * `TRANSITION_ALLOWED_FROM`. Implemented as a single `UPDATE ... WHERE state
+	 * IN (...)` so concurrent writers cannot both succeed against the same row.
+	 *
+	 * Returns a discriminated outcome describing whether the write landed and,
+	 * on rejection, whether the row was missing or the transition was illegal.
+	 */
+	tryTransitionState(agentName: string, newState: AgentState): TransitionOutcome;
 	/** Update lastActivity to current ISO timestamp. */
 	updateLastActivity(agentName: string): void;
 	/** Update escalation level and stalled timestamp. */
 	updateEscalation(agentName: string, level: number, stalledSince: string | null): void;
 	/** Update the transcript path for a session. */
 	updateTranscriptPath(agentName: string, path: string): void;
+	/** Update the runtime-provided session_id (e.g. Claude stream-json session_id). */
+	updateClaudeSessionId(agentName: string, sessionId: string): void;
 	/** Remove a session by agent name. */
 	remove(agentName: string): void;
 	/** Purge sessions matching criteria. Returns count of deleted rows. */
@@ -58,6 +136,7 @@ interface SessionRow {
 	stalled_since: string | null;
 	transcript_path: string | null;
 	prompt_version: string | null;
+	claude_session_id: string | null;
 }
 
 /** Row shape for runs table as stored in SQLite (snake_case columns). */
@@ -80,8 +159,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   branch_name TEXT NOT NULL,
   task_id TEXT NOT NULL,
   tmux_session TEXT NOT NULL,
-  state TEXT NOT NULL DEFAULT 'booting'
-    CHECK(state IN ('booting','working','completed','stalled','zombie')),
+  state TEXT NOT NULL DEFAULT 'booting',
   pid INTEGER,
   parent_agent TEXT,
   depth INTEGER NOT NULL DEFAULT 0,
@@ -91,7 +169,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   escalation_level INTEGER NOT NULL DEFAULT 0,
   stalled_since TEXT,
   transcript_path TEXT,
-  prompt_version TEXT
+  prompt_version TEXT,
+  claude_session_id TEXT
 )`;
 
 const CREATE_INDEXES = `
@@ -135,6 +214,7 @@ function rowToSession(row: SessionRow): AgentSession {
 		stalledSince: row.stalled_since,
 		transcriptPath: row.transcript_path,
 		...(row.prompt_version !== null ? { promptVersion: row.prompt_version } : {}),
+		...(row.claude_session_id !== null ? { claudeSessionId: row.claude_session_id } : {}),
 	};
 }
 
@@ -176,6 +256,95 @@ function migrateAddPromptVersion(db: Database): void {
 }
 
 /**
+ * Migrate an existing sessions table to add the claude_session_id column.
+ * Safe to call multiple times — only adds the column if it does not exist.
+ */
+function migrateAddClaudeSessionId(db: Database): void {
+	const rows = db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
+	const existingColumns = new Set(rows.map((r) => r.name));
+	if (!existingColumns.has("claude_session_id")) {
+		db.exec("ALTER TABLE sessions ADD COLUMN claude_session_id TEXT");
+	}
+}
+
+/**
+ * Drop the inline CHECK(state IN (...)) constraint from the sessions table
+ * (overstory-3087).
+ *
+ * The CHECK was defensive — the TypeScript `AgentState` union enforces values
+ * at the writer boundary. With the spawn-per-turn substate split (`in_turn` /
+ * `between_turns`) and likely future state extensions, keeping the constraint
+ * in sync with the union via inline-CHECK rebuilds becomes a recurring tax.
+ * Drop it and rely on the type system.
+ *
+ * SQLite has no `ALTER TABLE DROP CONSTRAINT`, so we detect the old constraint
+ * via `sqlite_master.sql` (the recorded CREATE TABLE DDL), then rebuild the
+ * table inside a transaction: copy rows verbatim into a new constraint-free
+ * schema, drop the original, and rename. Indexes are dropped by the swap and
+ * re-created by the caller via CREATE_INDEXES, which is idempotent.
+ *
+ * Safe to call multiple times — short-circuits when the recorded DDL no
+ * longer contains a CHECK on `state`. Must run BEFORE indexes are created
+ * (the swap drops them) and BEFORE the column-add migrations that read
+ * `PRAGMA table_info` on the legacy table (the new table inherits any added
+ * columns via the rebuild, so the column-add migrations become idempotent).
+ */
+function migrateRelaxStateCheck(db: Database): void {
+	const row = db
+		.prepare<{ sql: string | null }, []>(
+			"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
+		)
+		.get();
+	if (!row || row.sql === null) return;
+	// Detect the inline CHECK on the `state` column. Match conservatively on
+	// the literal "CHECK(state IN" — any whitespace variant SQLite stores
+	// will still contain this substring.
+	if (!row.sql.includes("CHECK(state IN")) return;
+
+	// Discover the columns that exist on the LIVE table so the rebuild copies
+	// every column the column-add migrations have layered on. Hard-coding the
+	// column list would silently drop newer columns when this migration runs
+	// against a DB that earlier migrations have already extended.
+	const colInfo = db.prepare("PRAGMA table_info(sessions)").all() as Array<{
+		name: string;
+		type: string;
+		notnull: number;
+		dflt_value: string | null;
+		pk: number;
+	}>;
+
+	// Render each column for the new CREATE TABLE. PRIMARY KEY and UNIQUE are
+	// preserved on `id` and `agent_name` respectively to match the original
+	// schema; everything else is straight type + nullability + default.
+	const colDefs = colInfo
+		.map((c) => {
+			const parts: string[] = [c.name, c.type || "TEXT"];
+			if (c.pk === 1) parts.push("PRIMARY KEY");
+			if (c.notnull === 1) parts.push("NOT NULL");
+			if (c.dflt_value !== null) parts.push(`DEFAULT ${c.dflt_value}`);
+			if (c.name === "agent_name") parts.push("UNIQUE");
+			return `\t\t\t\t${parts.join(" ")}`;
+		})
+		.join(",\n");
+	const colNames = colInfo.map((c) => c.name).join(", ");
+
+	db.exec("BEGIN");
+	try {
+		db.exec(`CREATE TABLE sessions__new_3087 (\n${colDefs}\n\t\t\t)`);
+		db.exec(`
+			INSERT INTO sessions__new_3087 (${colNames})
+			SELECT ${colNames} FROM sessions
+		`);
+		db.exec("DROP TABLE sessions");
+		db.exec("ALTER TABLE sessions__new_3087 RENAME TO sessions");
+		db.exec("COMMIT");
+	} catch (err) {
+		db.exec("ROLLBACK");
+		throw err;
+	}
+}
+
+/**
  * Migrate an existing sessions table from bead_id to task_id column.
  * Safe to call multiple times — only renames if bead_id exists and task_id does not.
  */
@@ -206,9 +375,14 @@ export function createSessionStore(dbPath: string): SessionStore {
 	db.exec(CREATE_RUNS_TABLE);
 
 	// Migrate existing tables BEFORE creating indexes that reference new columns.
+	// `migrateRelaxStateCheck` runs FIRST so the column-add migrations that
+	// follow operate on the rebuilt table — they read PRAGMA table_info and
+	// ADD COLUMN, both of which work on the new constraint-free schema.
+	migrateRelaxStateCheck(db);
 	migrateBeadIdToTaskId(db);
 	migrateAddTranscriptPath(db);
 	migrateAddPromptVersion(db);
+	migrateAddClaudeSessionId(db);
 	migrateAddCoordinatorName(db);
 
 	// Now safe to create indexes (all columns exist).
@@ -237,18 +411,19 @@ export function createSessionStore(dbPath: string): SessionStore {
 			$stalled_since: string | null;
 			$transcript_path: string | null;
 			$prompt_version: string | null;
+			$claude_session_id: string | null;
 		}
 	>(`
 		INSERT INTO sessions
 			(id, agent_name, capability, worktree_path, branch_name, task_id,
 			 tmux_session, state, pid, parent_agent, depth, run_id,
 			 started_at, last_activity, escalation_level, stalled_since, transcript_path,
-			 prompt_version)
+			 prompt_version, claude_session_id)
 		VALUES
 			($id, $agent_name, $capability, $worktree_path, $branch_name, $task_id,
 			 $tmux_session, $state, $pid, $parent_agent, $depth, $run_id,
 			 $started_at, $last_activity, $escalation_level, $stalled_since, $transcript_path,
-			 $prompt_version)
+			 $prompt_version, $claude_session_id)
 		ON CONFLICT(agent_name) DO UPDATE SET
 			id = excluded.id,
 			capability = excluded.capability,
@@ -266,7 +441,8 @@ export function createSessionStore(dbPath: string): SessionStore {
 			escalation_level = excluded.escalation_level,
 			stalled_since = excluded.stalled_since,
 			transcript_path = excluded.transcript_path,
-			prompt_version = excluded.prompt_version
+			prompt_version = excluded.prompt_version,
+			claude_session_id = excluded.claude_session_id
 	`);
 
 	const getByNameStmt = db.prepare<SessionRow, { $agent_name: string }>(`
@@ -274,7 +450,8 @@ export function createSessionStore(dbPath: string): SessionStore {
 	`);
 
 	const getActiveStmt = db.prepare<SessionRow, Record<string, never>>(`
-		SELECT * FROM sessions WHERE state IN ('booting', 'working', 'stalled')
+		SELECT * FROM sessions
+		WHERE state IN ('booting', 'working', 'in_turn', 'between_turns', 'stalled')
 		ORDER BY started_at ASC
 	`);
 
@@ -290,9 +467,38 @@ export function createSessionStore(dbPath: string): SessionStore {
 		SELECT * FROM sessions WHERE run_id = $run_id ORDER BY started_at ASC
 	`);
 
+	// Clear tmux_session when landing in a terminal state — the tmux session
+	// has already been torn down by ov stop / watchdog / coordinator cleanup,
+	// so the stored string is stale (overstory-14c0).
+	const terminalInList = TERMINAL_STATES.map((s) => `'${s}'`).join(",");
 	const updateStateStmt = db.prepare<void, { $agent_name: string; $state: string }>(`
-		UPDATE sessions SET state = $state WHERE agent_name = $agent_name
+		UPDATE sessions
+		SET state = $state,
+		    tmux_session = CASE WHEN $state IN (${terminalInList}) THEN '' ELSE tmux_session END
+		WHERE agent_name = $agent_name
 	`);
+
+	// Per-target-state CAS statements. The IN-list values come from a static
+	// matrix we control (TRANSITION_ALLOWED_FROM), so inlining as literals is
+	// safe and lets bun:sqlite re-use the prepared plan without dynamic params.
+	const tryTransitionStmts = (() => {
+		const stmts: Partial<
+			Record<AgentState, ReturnType<typeof db.prepare<void, { $agent_name: string }>>>
+		> = {};
+		const terminalSet = new Set<AgentState>(TERMINAL_STATES);
+		for (const target of Object.keys(TRANSITION_ALLOWED_FROM) as AgentState[]) {
+			const allowed = TRANSITION_ALLOWED_FROM[target];
+			if (allowed.length === 0) continue;
+			const inList = allowed.map((s) => `'${s}'`).join(",");
+			const setClause = terminalSet.has(target)
+				? `state = '${target}', tmux_session = ''`
+				: `state = '${target}'`;
+			stmts[target] = db.prepare<void, { $agent_name: string }>(
+				`UPDATE sessions SET ${setClause} WHERE agent_name = $agent_name AND state IN (${inList})`,
+			);
+		}
+		return stmts;
+	})();
 
 	const updateLastActivityStmt = db.prepare<void, { $agent_name: string; $last_activity: string }>(`
 		UPDATE sessions SET last_activity = $last_activity WHERE agent_name = $agent_name
@@ -322,6 +528,13 @@ export function createSessionStore(dbPath: string): SessionStore {
 		UPDATE sessions SET transcript_path = $transcript_path WHERE agent_name = $agent_name
 	`);
 
+	const updateClaudeSessionIdStmt = db.prepare<
+		void,
+		{ $agent_name: string; $claude_session_id: string }
+	>(`
+		UPDATE sessions SET claude_session_id = $claude_session_id WHERE agent_name = $agent_name
+	`);
+
 	return {
 		upsert(session: AgentSession): void {
 			upsertStmt.run({
@@ -343,6 +556,7 @@ export function createSessionStore(dbPath: string): SessionStore {
 				$stalled_since: session.stalledSince,
 				$transcript_path: session.transcriptPath,
 				$prompt_version: session.promptVersion ?? null,
+				$claude_session_id: session.claudeSessionId ?? null,
 			});
 		},
 
@@ -375,6 +589,37 @@ export function createSessionStore(dbPath: string): SessionStore {
 			updateStateStmt.run({ $agent_name: agentName, $state: state });
 		},
 
+		tryTransitionState(agentName: string, newState: AgentState): TransitionOutcome {
+			// Read prev for diagnostic accuracy before the CAS. The read is racy
+			// against another writer landing first, but the CAS that follows is
+			// authoritative — `changes === 0` means the CAS rejected against
+			// whatever the row holds NOW, regardless of what we read here.
+			const before = getByNameStmt.get({ $agent_name: agentName });
+			if (before === null) {
+				return { ok: false, reason: "not_found", attempted: newState };
+			}
+			const stmt = tryTransitionStmts[newState];
+			if (stmt !== undefined) {
+				const result = stmt.run({ $agent_name: agentName });
+				if (result.changes > 0) {
+					return { ok: true, prev: before.state as AgentState, next: newState };
+				}
+			}
+			// CAS rejected (or no stmt for this target, e.g. booting). Re-read to
+			// report the state that actually blocked us — another writer may have
+			// landed between our `before` read and the CAS.
+			const after = getByNameStmt.get({ $agent_name: agentName });
+			if (after === null) {
+				return { ok: false, reason: "not_found", attempted: newState };
+			}
+			return {
+				ok: false,
+				reason: "illegal_transition",
+				prev: after.state as AgentState,
+				attempted: newState,
+			};
+		},
+
 		updateLastActivity(agentName: string): void {
 			updateLastActivityStmt.run({
 				$agent_name: agentName,
@@ -392,6 +637,10 @@ export function createSessionStore(dbPath: string): SessionStore {
 
 		updateTranscriptPath(agentName: string, path: string): void {
 			updateTranscriptPathStmt.run({ $agent_name: agentName, $transcript_path: path });
+		},
+
+		updateClaudeSessionId(agentName: string, sessionId: string): void {
+			updateClaudeSessionIdStmt.run({ $agent_name: agentName, $claude_session_id: sessionId });
 		},
 
 		remove(agentName: string): void {
@@ -473,7 +722,12 @@ export function createRunStore(dbPath: string): RunStore {
 	db.exec("PRAGMA synchronous = NORMAL");
 	db.exec("PRAGMA busy_timeout = 5000");
 
-	// Create schema (idempotent — safe if SessionStore already created these)
+	// Create schema (idempotent — safe if SessionStore already created these).
+	// `agent_count` is derived from the sessions table at read time, so the
+	// sessions table must exist when the run-read statements are prepared
+	// — even if the caller only opens a RunStore and never opens a SessionStore.
+	db.exec(CREATE_TABLE);
+	db.exec(CREATE_INDEXES);
 	db.exec(CREATE_RUNS_TABLE);
 
 	// Migrate: add coordinator_name column BEFORE creating indexes that reference it.
@@ -499,24 +753,33 @@ export function createRunStore(dbPath: string): RunStore {
 		VALUES ($id, $started_at, $completed_at, $agent_count, $coordinator_session_id, $coordinator_name, $status)
 	`);
 
+	// `agent_count` is derived from the sessions table at read time rather than
+	// read from the column. The cached column value drifted because only sling
+	// incremented it — coordinator startup never did, so for every run with a
+	// coordinator the count was off by one (overstory-8e69). Sourcing from
+	// sessions makes the count match `SELECT * FROM sessions WHERE run_id = ?`
+	// and removes the writer/reader asymmetry. The column is still written so
+	// older overstory binaries pointed at the same db can keep functioning.
+	const RUN_COLUMNS = `
+		id, started_at, completed_at,
+		(SELECT COUNT(*) FROM sessions WHERE sessions.run_id = runs.id) AS agent_count,
+		coordinator_session_id, coordinator_name, status
+	`;
+
 	const getRunStmt = db.prepare<RunRow, { $id: string }>(`
-		SELECT * FROM runs WHERE id = $id
+		SELECT ${RUN_COLUMNS} FROM runs WHERE id = $id
 	`);
 
 	const getActiveRunStmt = db.prepare<RunRow, Record<string, never>>(`
-		SELECT * FROM runs WHERE status = 'active'
+		SELECT ${RUN_COLUMNS} FROM runs WHERE status = 'active'
 		ORDER BY started_at DESC
 		LIMIT 1
 	`);
 
 	const getActiveRunForCoordinatorStmt = db.prepare<RunRow, { $coordinator_name: string }>(`
-		SELECT * FROM runs WHERE status = 'active' AND coordinator_name = $coordinator_name
+		SELECT ${RUN_COLUMNS} FROM runs WHERE status = 'active' AND coordinator_name = $coordinator_name
 		ORDER BY started_at DESC
 		LIMIT 1
-	`);
-
-	const incrementAgentCountStmt = db.prepare<void, { $id: string }>(`
-		UPDATE runs SET agent_count = agent_count + 1 WHERE id = $id
 	`);
 
 	const completeRunStmt = db.prepare<
@@ -565,15 +828,15 @@ export function createRunStore(dbPath: string): RunStore {
 
 			const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 			const limitClause = opts?.limit !== undefined ? `LIMIT ${opts.limit}` : "";
-			const query = `SELECT * FROM runs ${whereClause} ORDER BY started_at DESC ${limitClause}`;
+			const query = `SELECT ${RUN_COLUMNS} FROM runs ${whereClause} ORDER BY started_at DESC ${limitClause}`;
 
 			const rows = db.prepare<RunRow, Record<string, string | number>>(query).all(params);
 			return rows.map(rowToRun);
 		},
 
-		incrementAgentCount(runId: string): void {
-			incrementAgentCountStmt.run({ $id: runId });
-		},
+		// Kept for API stability but a no-op: `agent_count` is now derived from
+		// the sessions table on every read (see RUN_COLUMNS above).
+		incrementAgentCount(_runId: string): void {},
 
 		completeRun(runId: string, status: "completed" | "failed"): void {
 			completeRunStmt.run({

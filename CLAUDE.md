@@ -1,6 +1,6 @@
 # Overstory
 
-Project-agnostic swarm system for Claude Code agent orchestration. Overstory turns a single Claude Code session into a multi-agent team by spawning worker agents in git worktrees via tmux, coordinating them through a custom SQLite mail system, and merging their work back with tiered conflict resolution.
+Project-agnostic swarm system for Claude Code agent orchestration. Overstory turns a single Claude Code session into a multi-agent team by spawning worker agents in isolated git worktrees, coordinating them through a custom SQLite mail system, and merging their work back with tiered conflict resolution. New projects ship with Claude workers headless by default — `ov serve`'s web UI is the primary operator surface, and `tmux attach` is the opt-in escape hatch for live steering.
 
 **Your Claude Code session IS the orchestrator.** There is no separate daemon. CLAUDE.md + hooks + the `ov` CLI provide everything.
 
@@ -42,6 +42,46 @@ Orchestrator (your Claude Code session)
 
 Depth limit is configurable (default 2). Prevents runaway spawning.
 
+### Runtime Modes: headless vs tmux (Claude Code)
+
+Claude Code agents can run in two modes. **Headless is the shipped default for new
+projects** (`ov init` writes `runtime.claudeHeadlessByDefault: true`); tmux is the
+escape hatch for live attach. Legacy projects on upgrade keep tmux until they
+edit their config — the resolver fallback at `src/commands/sling.ts:499` is
+unchanged.
+
+| Mode | Spawn path | I/O | Visibility | When to use |
+|------|------------|-----|------------|-------------|
+| **headless** (default, new projects) | `src/agents/turn-runner.ts` -> `Bun.spawn` per turn (spawn-per-turn for task-scoped workers); `src/worktree/process.ts` -> `Bun.spawn` for long-lived headless capabilities (coordinator/orchestrator/monitor) | NDJSON stream-json on stdout (per-turn log dir for workers; single log file for long-lived) | `ov serve` web UI (primary), `ov logs --agent <name>`, `ov feed` | Default. UI-driven swarms, CI environments, containers without tmux/DBus, structured per-tool-call event fidelity. |
+| **tmux** (opt-in escape hatch) | `src/worktree/tmux.ts` -> `tmux new-session` | Pane content (capture-pane) | `tmux attach` from operator shell | Operator wants to attach and watch / steer a single agent mid-session. Legacy projects pre-default-flip. |
+
+Under headless mode, **task-scoped workers (builder, scout, reviewer, merger,
+lead) use the spawn-per-turn engine** (overstory-2cf9 / Phase 3). There is no
+long-lived process between turns: each user turn (initial dispatch, mail batch,
+nudge) spawns a fresh claude with `--resume <session-id>` via
+`src/agents/turn-runner.ts`, writes the turn to a real stdin pipe, drains
+stream-json into `events.db`, and exits on EOF. The runner observes the
+agent's terminal mail (`worker_done` for builder/scout/reviewer/lead;
+`merged`/`merge_failed` for merger) and transitions the session to
+`completed`. Persistent capabilities (coordinator, orchestrator, monitor) keep
+their long-lived process and continue to use `src/worktree/process.ts`.
+
+Selection is per-spawn:
+
+- `ov sling --no-headless <task-id>` — force tmux for this spawn (override the new default).
+- `ov sling --headless <task-id>` — force headless (override a project still set to tmux).
+- Otherwise, the project default applies: `runtime.claudeHeadlessByDefault` in
+  `.overstory/config.yaml` controls the default (`true` for new projects). When the
+  field is absent — the case for legacy projects upgrading from earlier overstory
+  versions — the resolver falls back to tmux.
+
+The flag is a no-op for runtimes that statically declare `headless: true` (e.g. Sapling).
+Passing `--headless` with a runtime that has no `buildDirectSpawn` (Codex, Pi, Cursor) is
+rejected with a `ValidationError`.
+
+Both modes write to the same `EventStore` and `SessionStore`, so `ov status`,
+`ov dashboard`, `ov inspect`, and `ov feed` work identically across both.
+
 ### Messaging: Custom SQLite Mail
 
 Purpose-built messaging via `bun:sqlite` in `.overstory/mail.db`. WAL mode for concurrent access from multiple agents. ~1-5ms per query. Independent of beads (which is too slow for high-frequency polling).
@@ -51,7 +91,7 @@ Purpose-built messaging via `bun:sqlite` in `.overstory/mail.db`. WAL mode for c
 ```
 overstory/                        # This repo (the overstory tool itself)
   src/
-    index.ts                      # CLI entry point (Commander.js program, 37 commands)
+    index.ts                      # CLI entry point (Commander.js program, 38 commands)
     types.ts                      # ALL shared types and interfaces
     config.ts                     # Config loader + defaults + validation
     errors.ts                     # Custom error types (extend OverstoryError)
@@ -93,6 +133,8 @@ overstory/                        # This repo (the overstory tool itself)
       discover.ts                 # ov discover (brownfield codebase discovery)
       orchestrator.ts             # ov orchestrator (multi-repo coordination)
       completions.ts              # ov --completions (shell completions)
+      serve.ts                    # ov serve (HTTP + WebSocket surface for the UI)
+      serve/                      # REST handlers (rest.ts), WebSocket broadcaster (ws.ts), static SPA fallback (static.ts)
     canopy/
       client.ts                   # Canopy client (prompt rendering, listing, emission)
     agents/                       # Agent lifecycle management
@@ -104,6 +146,8 @@ overstory/                        # This repo (the overstory tool itself)
       guard-rules.ts              # Shared guard constants (tool lists, bash patterns)
       lifecycle.ts                # Session handoff (checkpoint/resume/complete)
       checkpoint.ts               # Session checkpoint save/load/clear
+      mail-poll-detect.ts         # Bash mail-poll pattern detector (runtime backstop)
+      scope-detect.ts             # Soft FILE_SCOPE violation detection (builder/merger)
     worktree/
       manager.ts                  # Create/list/cleanup git worktrees via Bun.spawn
       tmux.ts                     # Tmux session management via Bun.spawn
@@ -117,6 +161,7 @@ overstory/                        # This repo (the overstory tool itself)
       tailer.ts                   # NDJSON event tailer for headless agent stdout logs
     insights/
       analyzer.ts                 # Session insight analyzer for auto-expertise
+      quality-gates.ts            # Run quality gates at session-end -> success/partial/failure
     tracker/
       types.ts                    # TrackerClient interface, TrackerIssue, TrackerBackend
       factory.ts                  # createTrackerClient(), resolveBackend(), trackerCliName()
@@ -147,6 +192,8 @@ overstory/                        # This repo (the overstory tool itself)
     merge/
       queue.ts                    # FIFO merge queue
       resolver.ts                 # Tiered conflict resolution (4 tiers)
+      lock.ts                     # Sentinel-file lock (prevents concurrent ov merge against same target)
+      predict.ts                  # Side-effect-free conflict prediction for ov merge --dry-run
     watchdog/
       daemon.ts                   # Tier 0: mechanical process monitoring
       triage.ts                   # Tier 1: AI-assisted failure classification
@@ -164,7 +211,7 @@ overstory/                        # This repo (the overstory tool itself)
       pricing.ts                  # Runtime-agnostic pricing + cost estimation
       transcript.ts               # Claude Code transcript JSONL parser
     doctor/                       # Modular health check system
-      *.ts                        # 12 check categories (see `ov doctor --help`)
+      *.ts                        # 13 check categories (see `ov doctor --help`)
     utils/
       bin.ts                      # Resolve overstory binary for re-launch
       fs.ts                       # Filesystem cleanup (SQLite wipe, JSON reset, directory clear)
@@ -294,6 +341,7 @@ ov sling <task-id>              Spawn a worker agent
   --name <name>                          Unique agent name (auto-generated if omitted)
   --spec <path>                          Path to task spec file
   --files <f1,f2,...>                    Exclusive file scope (comma-separated)
+  --siblings <names>                     Parallel sibling agent names (renders rebase-before-merge_ready guidance)
   --parent <agent-name>                  Parent (for hierarchy tracking)
   --depth <n>                            Current hierarchy depth (default: 0)
   --skip-scout                           Skip scout phase (passed to lead overlay)
@@ -306,6 +354,8 @@ ov sling <task-id>              Spawn a worker agent
   --runtime <name>                       Runtime adapter (default: config or claude)
   --base-branch <branch>                 Base branch for worktree creation (default: current HEAD)
   --profile <name>                       Named profile for canopy prompt overlay
+  --headless                             Force headless (non-tmux) spawn for runtimes with buildDirectSpawn (Claude Code)
+  --no-headless                          Force tmux spawn (overrides runtime.claudeHeadlessByDefault)
   --json                                 JSON output
 
 ov discover                      Discover a brownfield codebase via coordinator-driven scout swarm
@@ -429,7 +479,7 @@ ov merge                         Merge agent branches into canonical
   --branch <name>                        Specific branch
   --all                                  All completed branches
   --into <branch>                        Target branch (default: session-branch.txt > canonicalBranch)
-  --dry-run                              Check for conflicts only
+  --dry-run                              Check for conflicts only (predicts resolution tier + conflict files)
   --json                                 JSON output
 ```
 
@@ -438,9 +488,9 @@ ov merge                         Merge agent branches into canonical
 ```
 ov group <sub>                  Batch coordination
   create '<name>' <id1> [id2...]         Create a new task group
-  status [group-id]                      Show progress for one or all groups
-  add <group-id> <id1> [id2...]          Add issues to a group
-  remove <group-id> <id1> [id2...]       Remove issues from a group
+  status [group-id-or-name]              Show progress for one or all groups
+  add <group-id-or-name> <id1> [id2...]  Add issues to a group
+  remove <group-id-or-name> <id1> [...]  Remove issues from a group
   list                                   List all groups (summary)
   --json  --skip-validation              JSON output / skip beads checks
 ```
@@ -551,7 +601,7 @@ ov doctor                        Run health checks on overstory setup
   --json                                 JSON output
   Categories: dependencies, config, structure, databases,
               consistency, agents, merge, logs, version,
-              ecosystem, providers, watchdog
+              ecosystem, providers, watchdog, serve
 
 ov ecosystem                     Show os-eco tool versions and health
   --json                                 JSON output
@@ -568,6 +618,13 @@ ov clean                         Wipe runtime state (nuclear cleanup)
   --logs  --worktrees  --branches        Individual resource cleanup
   --agents  --specs                      Individual state cleanup
   --json                                 JSON output
+
+ov serve                         HTTP + WebSocket surface for the web UI
+  --port <n>                             Port (default: 7321)
+  --host <addr>                          Bind host (default: 127.0.0.1)
+  --json                                 JSON output
+  Routes: /healthz, /api/runs, /api/agents, /api/events, /api/mail,
+          /ws (per-run/per-agent/mail rooms), SPA fallback to ui/dist
 ```
 
 ## Testing
@@ -669,43 +726,54 @@ Work is NOT complete until `git push` succeeds.
 
 <!-- mulch:start -->
 ## Project Expertise (Mulch)
-<!-- mulch-onboard-v:1 -->
+<!-- mulch-onboard-v:3 -->
 
 This project uses [Mulch](https://github.com/jayminwest/mulch) for structured expertise management.
 
 **At the start of every session**, run:
 ```bash
-mulch prime
+ml prime
 ```
 
-This injects project-specific conventions, patterns, decisions, and other learnings into your context.
-Use `mulch prime --files src/foo.ts` to load only records relevant to specific files.
+Injects project-specific conventions, patterns, decisions, failures, references, and guides into
+your context. Run `ml prime --files src/foo.ts` before editing a file to load only records
+relevant to that path (per-file framing, classification age, and confirmation scores included).
 
-**Before completing your task**, review your work for insights worth preserving — conventions discovered,
-patterns applied, failures encountered, or decisions made — and record them:
+For monolith projects where dumping every record wastes context, set
+`prime.default_mode: manifest` in `.mulch/mulch.config.yaml` (or pass `--manifest`) to emit a
+quick reference + domain index. Agents then scope-load with `ml prime <domain>` or
+`ml prime --files <path>`.
+
+**Before completing your task**, record insights worth preserving — conventions discovered,
+patterns applied, failures encountered, or decisions made:
 ```bash
-mulch record <domain> --type <convention|pattern|failure|decision|reference|guide> --description "..."
+ml record <domain> --type <convention|pattern|failure|decision|reference|guide> --description "..."
 ```
 
-Link evidence when available: `--evidence-commit <sha>`, `--evidence-bead <id>`
+Evidence auto-populates from git (current commit + changed files). Link explicitly with
+`--evidence-seeds <id>` / `--evidence-gh <id>` / `--evidence-linear <id>` / `--evidence-bead <id>`,
+`--evidence-commit <sha>`, or `--relates-to <mx-id>`. Upserts of named records merge outcomes
+instead of replacing them; validation failures print a copy-paste retry hint with missing fields
+pre-filled.
 
-Run `mulch status` to check domain health and entry counts.
-Run `mulch --help` for full usage.
-Mulch write commands use file locking and atomic writes — multiple agents can safely record to the same domain concurrently.
+Run `ml status` for domain health, `ml doctor` to check record integrity (add `--fix` to strip
+broken file anchors), `ml --help` for the full command list. Write commands use file locking and
+atomic writes, so multiple agents can record concurrently. Expertise survives `git worktree`
+cleanup — `.mulch/` resolves to the main repo.
 
 ### Before You Finish
 
-1. Discover what to record:
+1. Discover what to record (shows changed files and suggests domains):
    ```bash
-   mulch learn
+   ml learn
    ```
 2. Store insights from this work session:
    ```bash
-   mulch record <domain> --type <convention|pattern|failure|decision|reference|guide> --description "..."
+   ml record <domain> --type <convention|pattern|failure|decision|reference|guide> --description "..."
    ```
 3. Validate and commit:
    ```bash
-   mulch sync
+   ml sync
    ```
 <!-- mulch:end -->
 
